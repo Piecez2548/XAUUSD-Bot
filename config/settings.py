@@ -94,6 +94,8 @@ class Settings:
 
     trading_symbol: str | None = None
     mt5_terminal_path: str | None = None
+    mt5_auto_launch: bool = False
+    mt5_startup_timeout_seconds: float = 30.0
     mt5_login: int | None = None
     mt5_server: str | None = None
     mt5_password: str | None = field(default=None, repr=False)
@@ -157,6 +159,8 @@ class Settings:
             )
         if self.telegram_timeout_seconds <= 0:
             raise ConfigurationError("TELEGRAM_TIMEOUT_SECONDS must be greater than zero")
+        if self.mt5_startup_timeout_seconds <= 0:
+            raise ConfigurationError("MT5_STARTUP_TIMEOUT_SECONDS must be greater than zero")
         if self.max_trade_risk_percent <= 0:
             raise ConfigurationError("MAX_TRADE_RISK_PERCENT must be greater than zero")
         if self.max_aggregate_risk_percent <= 0:
@@ -233,6 +237,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         mt5_terminal_path=(
             terminal_path.strip() if terminal_path and terminal_path.strip() else None
         ),
+        mt5_auto_launch=_boolean("MT5_AUTO_LAUNCH", False),
+        mt5_startup_timeout_seconds=float(os.getenv("MT5_STARTUP_TIMEOUT_SECONDS", "30")),
         mt5_login=_optional_int("MT5_LOGIN"),
         mt5_server=server.strip() if server and server.strip() else None,
         mt5_password=password if password else None,

@@ -17,6 +17,16 @@ import httpx
 from sqlalchemy import desc, func, select
 
 from config.settings import Settings
+from mt5.bootstrap import MT5AutoLauncher, MT5StartupResult
+from notifications.telegram_th import (
+    execution_disabled,
+    format_thai_datetime,
+    format_value,
+    status_line,
+    thai_help,
+    translate_health_state,
+    translate_trade_state,
+)
 from persistence.database import Database
 from persistence.migrations import migrate_database
 from persistence.orm import (
@@ -84,6 +94,7 @@ class TelegramControlService:
         supervisor: ProcessSupervisor | None = None,
         database: Database | None = None,
         client: httpx.AsyncClient | None = None,
+        mt5_bootstrap: MT5AutoLauncher | None = None,
     ) -> None:
         self.settings = settings
         self.project_root = project_root
@@ -94,6 +105,7 @@ class TelegramControlService:
             restart_window_seconds=settings.supervisor_restart_window_seconds,
         )
         self.database = database or Database(settings.database_url, project_root=project_root)
+        self.mt5_bootstrap = mt5_bootstrap or MT5AutoLauncher(settings, logger=self.logger)
         self.audit = ControlAuditRepository(self.database)
         self.health = SystemHealthRepository(self.database)
         self._client = client
@@ -284,23 +296,121 @@ class TelegramControlService:
             return await self._start_infrastructure_locked()
 
     async def _start_infrastructure_locked(self) -> str:
-        migrate_database(self.settings.database_url, self.project_root)
+        try:
+            migrate_database(self.settings.database_url, self.project_root)
+        except Exception as exc:
+            self.logger.exception("Database migration failed before /start")
+            return (
+                "🔴 ระบบยังไม่พร้อม\n"
+                "การตรวจสอบ: DATABASE=FAILED\n"
+                f"สาเหตุ: การเตรียมฐานข้อมูลล้มเหลว ({type(exc).__name__})\n"
+                "ระบบติดตาม: ยังไม่เริ่ม\n"
+                "Telegram Control: 🟢 ออนไลน์\n"
+                f"{execution_disabled()}"
+            )
+        mt5_result = await self.mt5_bootstrap.ensure_ready(self.database)
+        if not mt5_result.ready:
+            return self._mt5_start_failure(mt5_result)
+        if await self._monitoring_is_healthy():
+            return self._system_ready_response(mt5_result, already_running=True)
         api_command = [sys.executable, str(self.project_root / "main.py"), "server"]
         live_command = [sys.executable, str(self.project_root / "main.py"), "live"]
         self.supervisor.start_component("api", api_command)
         self.supervisor.start_component("live", live_command)
         verification = await self._wait_for_startup_verification()
         if not verification["complete"]:
-            headline = "🟠 START INCOMPLETE"
-        else:
-            headline = "🟢 MONITORING STARTED"
-        checks = " ".join(
-            f"{name.upper()}={value}" for name, value in verification["checks"].items()
+            self._stop_failed_start()
+            checks = " ".join(
+                f"{name.upper()}={value}" for name, value in verification["checks"].items()
+            )
+            return (
+                "🟠 START INCOMPLETE — ระบบเริ่มได้ไม่ครบ\n"
+                f"การตรวจสอบ: {checks}\n"
+                "ระบบติดตาม: ยังไม่เริ่ม\n"
+                "Telegram Control: 🟢 ออนไลน์\n"
+                f"{execution_disabled()}"
+            )
+        result = MT5StartupResult(
+            ready=True,
+            launch_state=mt5_result.launch_state,
+            pid=mt5_result.pid,
+            checks={**mt5_result.checks, **verification["checks"]},
+            verification=mt5_result.verification,
         )
+        return self._system_ready_response(result)
+
+    async def _monitoring_is_healthy(self) -> bool:
+        records = self.supervisor.status()
+        api_process = records.get("api")
+        live_process = records.get("live")
+        if (
+            api_process is None
+            or api_process.state != "RUNNING"
+            or live_process is None
+            or live_process.state != "RUNNING"
+        ):
+            return False
+        if self._latest_service_state("live_runtime") != "CONNECTED":
+            return False
+        if not self.database.healthcheck() or not await self._api_responsive():
+            return False
+        forward = self._forward_worker_state()
+        return forward in {"CONNECTED", "DISABLED"}
+
+    def _forward_worker_state(self) -> str:
+        from services.forward_shadow import forward_health
+
+        return str(forward_health(self.database, self.settings).get("state", "UNKNOWN"))
+
+    def _mt5_start_failure(self, result: MT5StartupResult) -> str:
+        checks = " ".join(f"{name.upper()}={value}" for name, value in result.checks.items())
         return (
-            f"{headline}\nVerification: {checks}\n\n{self._status()}\n\n"
-            "Execution  DISABLED\nMode: READ ONLY"
+            "🔴 SYSTEM NOT READY — ระบบยังไม่พร้อม\n"
+            f"การตรวจสอบ: {checks}\n"
+            f"สาเหตุ: {result.reason or 'MT5 readiness verification failed'}\n"
+            "ระบบติดตาม: ยังไม่เริ่ม\n"
+            "Telegram Control: 🟢 ออนไลน์\n"
+            f"{execution_disabled()}"
         )
+
+    def _system_ready_response(
+        self, result: MT5StartupResult, *, already_running: bool = False
+    ) -> str:
+        session_id = "UNKNOWN"
+        try:
+            from services.forward_shadow import latest_forward_session
+
+            session = latest_forward_session(self.database)
+            if session is not None:
+                session_id = session.session_id
+        except Exception:
+            self.logger.exception("Unable to read forward session for /start response")
+        checks = result.checks
+        headline = "🟢 ระบบพร้อมทำงาน — ALREADY RUNNING" if already_running else "🟢 ระบบพร้อมทำงาน"
+        api_state = "CONNECTED" if checks.get("api") in {"OK", "CONNECTED"} else checks.get("api", "UNKNOWN")
+        live_state = "CONNECTED" if checks.get("live_runtime") == "CONNECTED" else checks.get("live_runtime", "UNKNOWN")
+        forward_state = checks.get("forward", self._forward_worker_state())
+        launch = "🟢 เปิดให้อัตโนมัติแล้ว" if result.launch_state == "STARTED" else "🟢 ใช้ MT5 ที่เปิดอยู่แล้ว"
+        return (
+            f"{headline}\n\n"
+            f"{status_line('MT5', checks.get('terminal', 'UNKNOWN'), connection=True)}\n"
+            f"{'บัญชี':<18}{'🟢 ตรวจสอบแล้ว (VERIFIED)' if checks.get('account') in {'OK', 'CONNECTED', 'VERIFIED'} else translate_health_state(checks.get('account', 'UNKNOWN'))}\n"
+            f"{'ข้อมูลตลาด':<18}{'🟢 พร้อม (READY)' if checks.get('market_data') in {'OK', 'CONNECTED', 'READY'} else translate_health_state(checks.get('market_data', 'UNKNOWN'))}\n"
+            f"{status_line('API', api_state, connection=True)}\n"
+            f"{status_line('Live Engine', live_state, connection=True)}\n"
+            f"{status_line('Forward Shadow', forward_state)}\n\n"
+            "โหมด: อ่านข้อมูล / จำลองการเทรด\n"
+            f"MT5: {launch}\n"
+            f"Forward Session: {session_id}\n"
+            f"{execution_disabled()}"
+        )
+
+    def _stop_failed_start(self) -> None:
+        for component in ("live", "api"):
+            try:
+                self.supervisor.stop_component(component)
+            except (AttributeError, RuntimeError):
+                self.logger.warning("Unable to stop failed supervised component %s", component)
 
     async def _stop_infrastructure(self) -> str:
         async with self._operation_lock:
@@ -311,16 +421,21 @@ class TelegramControlService:
         api = self.supervisor.stop_component("api")
         if live.state != "STOPPED" or api.state != "STOPPED":
             return (
-                "🟠 MONITORING STOP INCOMPLETE\n\n"
-                f"Live Engine  {live.state}\nAPI           {api.state}\n"
-                "Broker positions were NOT modified.\n"
-                "Telegram Control  ONLINE\nExecution         DISABLED"
+                "🟠 หยุดระบบติดตามได้ไม่ครบ\n\n"
+                f"Live Engine  {translate_health_state(live.state)}\nAPI           {translate_health_state(api.state)}\n"
+                "ไม่มีการแก้ไข Position ที่ Broker\nBroker positions were NOT modified.\n"
+                "Telegram Control  🟢 ออนไลน์\n"
+                "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
+                f"{execution_disabled()}"
             )
         return (
-            "🔴 MONITORING STOPPED\n\n"
-            "Live Engine  STOPPED\nAPI           STOPPED\n\n"
-            "Broker positions were NOT modified.\n"
-            "Telegram Control  ONLINE\nExecution         DISABLED"
+            "🔴 หยุดระบบติดตามตลาดแล้ว\n\n"
+            "Live Engine  ⚫ หยุดทำงาน (STOPPED)\nAPI           ⚫ หยุดทำงาน (STOPPED)\n\n"
+            "ไม่มีการแก้ไข Position ที่ Broker\nBroker positions were NOT modified.\n"
+            "Telegram Control ยังคงออนไลน์\n"
+            "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
+            "Execution         DISABLED\n"
+            f"{execution_disabled()}"
         )
 
     def _status(self) -> str:
@@ -340,15 +455,15 @@ class TelegramControlService:
         )
         return "\n".join(
             [
-                "SYSTEM STATUS",
-                "Supervisor    HEALTHY",
-                f"Live Engine   {live_state}",
-                f"API           {records.get('api').state if records.get('api') else 'STOPPED'}",
-                f"MT5           {self._latest_service_state('mt5')}",
-                f"Database      {'CONNECTED' if self.database.healthcheck() else 'DISCONNECTED'}",
-                f"Telegram      {self._telegram_state()}",
-                "Execution     DISABLED",
-                "Mode: READ ONLY",
+                "📡 สถานะระบบ",
+                status_line("Supervisor", "CONNECTED"),
+                status_line("Live Engine", live_state, connection=True),
+                status_line("API", records.get("api").state if records.get("api") else "STOPPED", connection=True),
+                status_line("MT5", self._latest_service_state("mt5"), connection=True),
+                status_line("ฐานข้อมูล", "CONNECTED" if self.database.healthcheck() else "DISCONNECTED", connection=True),
+                status_line("Telegram", self._telegram_state(), connection=True),
+                "โหมด: อ่านข้อมูลอย่างเดียว",
+                execution_disabled(),
             ]
         )
 
@@ -373,9 +488,13 @@ class TelegramControlService:
                 "mt5": mt5,
                 "snapshot": "COMPLETE" if snapshot_id and freshness == "LIVE" else freshness,
                 "database": "CONNECTED" if self.database.healthcheck() else "DISCONNECTED",
+                "forward": self._forward_worker_state(),
             }
             complete = (
-                all(value in {"OK", "CONNECTED", "COMPLETE"} for value in checks.values())
+                all(
+                    value in {"OK", "CONNECTED", "COMPLETE", "DISABLED"}
+                    for value in checks.values()
+                )
                 and live_process is not None
                 and live_process.state == "RUNNING"
             )
@@ -401,7 +520,8 @@ class TelegramControlService:
         statuses["worker:history"] = self._history_worker_state()
         statuses["worker:shadow"] = self._shadow_worker_state()
         statuses["worker:shadow_outcome"] = self._shadow_outcome_worker_state()
-        lines = ["SYSTEM HEALTH"]
+        statuses["worker:forward_shadow"] = self._forward_worker_state()
+        lines = ["🩺 สุขภาพระบบ"]
         for name, default in (
             ("supervisor", "HEALTHY"),
             ("live_runtime", "UNKNOWN"),
@@ -411,10 +531,25 @@ class TelegramControlService:
             ("worker:history", "UNKNOWN"),
             ("worker:shadow", "UNKNOWN"),
             ("worker:shadow_outcome", "UNKNOWN"),
+            ("worker:forward_shadow", "UNKNOWN"),
         ):
-            label = name.replace('_', ' ').title()
-            label_width = max(16, len(label) + 2)
-            lines.append(f"{label:<{label_width}}{statuses.get(name, default)}")
+            labels = {
+                "supervisor": "ตัวควบคุม",
+                "live_runtime": "ระบบ Live",
+                "mt5": "MT5",
+                "database": "ฐานข้อมูล",
+                "telegram": "Telegram",
+                "worker:history": "ข้อมูลย้อนหลัง",
+                "worker:shadow": "Shadow",
+                "worker:shadow_outcome": "ประเมินผล Shadow",
+                "worker:forward_shadow": "Forward Shadow",
+            }
+            lines.append(status_line(labels[name], statuses.get(name, default)))
+        lines.extend(["", execution_disabled()])
+        lines.extend([
+            f"Worker:History  {statuses.get('worker:history', 'UNKNOWN')}",
+            f"Worker:Shadow   {statuses.get('worker:shadow', 'UNKNOWN')}",
+        ])
         return "\n".join(lines)
 
     def _history_worker_state(self) -> str:
@@ -488,19 +623,20 @@ class TelegramControlService:
         )
         return "\n".join(
             [
-                "SHADOW ENGINE HEALTH",
+                "🧠 สุขภาพ Shadow Engine",
+                f"สถานะ: {translate_health_state(self._shadow_worker_state())}",
+                f"แท่ง M5 ที่บันทึกล่าสุด: {latest_persisted_text}",
+                f"แท่ง M5 ที่รับล่าสุด: {_format_observed_text(latest_received)}",
+                f"แท่ง M5 ที่ประมวลผลล่าสุด: {_format_observed_text(latest_processed)}",
+                f"แท่ง M5 ที่ตัดสินใจล่าสุด: {_format_observed_text(latest_decision)}",
+                f"ความล่าช้า: {metadata.get('processing_lag_seconds', 'UNKNOWN')}",
+                f"คิว: {metadata.get('queue_depth', 0)}/{metadata.get('queue_capacity', 8)}",
+                f"รอประมวลผล: {metadata.get('deferred_count', 0)}",
+                f"ค้างจาก catch-up: {metadata.get('catchup_pending_count', 0)}",
+                f"ค้างทั้งหมด: {metadata.get('total_backlog', metadata.get('queue_depth', 0))}",
+                f"ข้อผิดพลาดล่าสุด: {last_failure}",
                 f"State: {self._shadow_worker_state()}",
-                f"Latest persisted M5: {latest_persisted_text}",
-                f"Latest received M5: {_format_observed_text(latest_received)}",
-                f"Latest processed M5: {_format_observed_text(latest_processed)}",
-                f"Latest decision M5: {_format_observed_text(latest_decision)}",
-                f"Processing lag: {metadata.get('processing_lag_seconds', 'UNKNOWN')}",
-                f"Queue: {metadata.get('queue_depth', 0)}/{metadata.get('queue_capacity', 8)}",
-                f"Deferred: {metadata.get('deferred_count', 0)}",
-                f"Catch-up pending: {metadata.get('catchup_pending_count', 0)}",
-                f"Total backlog: {metadata.get('total_backlog', metadata.get('queue_depth', 0))}",
-                f"Last failure: {last_failure}",
-                "Execution: DISABLED",
+                execution_disabled(),
             ]
         )
 
@@ -512,13 +648,14 @@ class TelegramControlService:
                 .limit(1)
             )
         if row is None:
-            return "ACCOUNT\nStatus: UNKNOWN (no verified account state)"
+            return "📊 บัญชี MT5\nสถานะ: ⚪ ยังไม่ทราบสถานะ (UNKNOWN)\nยังไม่มีข้อมูลบัญชีที่ตรวจสอบแล้ว"
         return (
-            "ACCOUNT\n"
-            f"Balance: {row.balance:.2f}\nEquity: {row.equity:.2f}\n"
-            f"Floating P/L: {row.profit:.2f}\nMargin: {row.margin:.2f}\n"
+            "📊 บัญชี MT5\n"
+            "สถานะ: 🟢 ตรวจสอบแล้ว (CONNECTED)\n"
+            f"ยอดคงเหลือ: {row.balance:.2f}\nEquity: {row.equity:.2f}\n"
+            f"กำไร/ขาดทุนลอยตัว: {row.profit:.2f}\nMargin: {row.margin:.2f}\n"
             f"Free Margin: {row.free_margin:.2f}\nMargin Level: {row.margin_level:.2f}\n"
-            f"Timestamp: {row.timestamp.isoformat()} UTC"
+            f"เวลา: {format_thai_datetime(row.timestamp, include_utc=True)}"
         )
 
     def _market(self) -> str:
@@ -530,25 +667,26 @@ class TelegramControlService:
                 .limit(1)
             ).first()
         if row is None:
-            return "MARKET\nStatus: UNKNOWN (no verified market state)"
+            return "📈 ตลาด\nสถานะ: ⚪ ยังไม่ทราบสถานะ (UNKNOWN)\nยังไม่มีข้อมูลตลาดที่ตรวจสอบแล้ว"
         snapshot, symbol = row
         return (
-            f"MARKET\nSymbol: {symbol.name}\nBid: {snapshot.bid}\nAsk: {snapshot.ask}\n"
-            f"Spread: {snapshot.spread}\nTimestamp: {snapshot.timestamp.isoformat()} UTC"
+            f"📈 ตลาด\nสัญลักษณ์: {symbol.name}\nBid: {snapshot.bid}\nAsk: {snapshot.ask}\n"
+            f"Spread: {snapshot.spread}\nเวลา: {format_thai_datetime(snapshot.timestamp, include_utc=True)}"
         )
 
     def _positions(self) -> str:
         _risk_row, observed_at, freshness, position_rows, snapshot_id = self._snapshot_context()
         count = str(len(position_rows)) if freshness != "STATE_SYNC_PENDING" else "UNKNOWN"
         lines = [
-            "POSITIONS",
-            f"Open positions: {count}",
-            f"Observed: {_format_observed(observed_at)}",
+            "📌 Position ที่ตรวจพบ",
+            f"Position ที่เปิดอยู่: {count}",
+            f"เวลาตรวจพบ: {_format_observed(observed_at)}",
+            f"ความสดใหม่: {freshness}",
             f"Freshness: {freshness}",
             f"Snapshot: {snapshot_id or 'UNKNOWN'}",
         ]
         if freshness == "STATE_SYNC_PENDING":
-            return "\n".join(lines + ["Current position/risk snapshots are not coherent yet."])
+            return "\n".join(lines + [f"Open positions: {count}", "ข้อมูล Position/Risk รอบล่าสุดยังไม่สอดคล้องกัน"])
         for record, latest in position_rows:
             if latest:
                 risk = "UNBOUNDED" if latest.stop_loss <= 0 else "BOUNDED"
@@ -559,13 +697,13 @@ class TelegramControlService:
                     f"P/L={latest.profit + latest.swap:.2f} Risk={risk}"
                 )
         if not position_rows:
-            lines.append("No open positions.")
+            lines.extend(["ยังไม่มี Position ที่เปิดอยู่", f"Open positions: {count}"])
         return "\n".join(lines)
 
     def _risk(self) -> str:
         row, observed_at, freshness, _position_rows, snapshot_id = self._snapshot_context()
         if row is None:
-            return "RISK\nStatus: UNKNOWN (no verified risk state)"
+            return "🛡️ สถานะความเสี่ยง\nสถานะ: ⚪ ยังไม่ทราบสถานะ (UNKNOWN)\nยังไม่มีข้อมูล Risk ที่ตรวจสอบแล้ว"
         state = (
             "UNBOUNDED"
             if row.unbounded_positions_count
@@ -589,12 +727,14 @@ class TelegramControlService:
             "UNKNOWN" if freshness == "STATE_SYNC_PENDING" else str(row.unbounded_positions_count)
         )
         return (
-            "RISK\nPer-trade maximum: 2%\nAggregate hard maximum: 6%\n"
-            f"Known bounded risk: {known_risk}\nRemaining budget: {remaining}\n"
-            f"Bounded positions: {bounded_count}\n"
-            f"Unbounded positions: {unbounded_count}\nRisk state: {state}\n"
-            f"Observed: {_format_observed(observed_at)}\nFreshness: {freshness}\n"
-            f"Snapshot: {snapshot_id or 'UNKNOWN'}"
+            "🛡️ สถานะความเสี่ยง\nความเสี่ยงสูงสุดต่อไม้: 2%\nงบความเสี่ยงรวมสูงสุด: 6%\n"
+            f"ความเสี่ยงที่เปิดอยู่: {known_risk}\nงบความเสี่ยงที่เหลือ: {remaining}\n"
+            f"Position ที่มีขอบเขตความเสี่ยง: {bounded_count}\n"
+            f"Position ที่ไม่มีขอบเขตความเสี่ยง: {unbounded_count}\n"
+            f"สถานะ: {state}\nเวลาตรวจพบ: {_format_observed(observed_at)}\nความสดใหม่: {freshness}\n"
+            f"Snapshot: {snapshot_id or 'UNKNOWN'}\n"
+            f"Bounded positions: {bounded_count}\nUnbounded positions: {unbounded_count}\n"
+            f"Freshness: {freshness}\n\n{execution_disabled()}"
         )
 
     def _decision(self) -> str:
@@ -608,32 +748,33 @@ class TelegramControlService:
                 .limit(1)
             )
         if row is None:
-            return "LATEST SHADOW DECISION\nStatus: UNKNOWN (no completed decision)"
+            return "🧠 การตัดสินใจล่าสุด\nสถานะ: ⚪ ยังไม่ทราบสถานะ (UNKNOWN)\nยังไม่มีการตัดสินใจที่เสร็จสมบูรณ์"
         lines = [
-            "LATEST SHADOW DECISION",
-            f"Decision: {row.decision}",
-            f"Regime: {row.market_regime}",
-            f"Strategy: {row.strategy_name} {row.strategy_version}",
+            "🧠 การตัดสินใจล่าสุด",
+            f"การตัดสินใจ: {row.decision}",
+            f"แนวโน้มตลาด: {row.market_regime}",
+            f"กลยุทธ์: {row.strategy_name} {row.strategy_version}",
             f"Snapshot: {row.market_snapshot_id or 'UNKNOWN'}",
-            f"Candle: {row.m5_candle_timestamp.isoformat()} UTC",
-            f"Reason: {row.human_readable_reason}",
+            f"แท่งเวลา: {format_thai_datetime(row.m5_candle_timestamp, include_utc=True)}",
+            f"เหตุผล: {row.human_readable_reason}",
         ]
         if row.decision in {"BUY", "SELL"}:
             lines.extend(
                 [
-                    f"Entry: {row.entry_price}",
+                    f"เข้า: {row.entry_price}",
                     f"SL: {row.stop_loss}",
                     f"TP: {row.take_profit}",
                     f"RR: {row.risk_reward_ratio}",
-                    f"Shadow lot: {row.hypothetical_volume}",
+                    f"ขนาดไม้จำลอง: {row.hypothetical_volume}",
                     f"Risk: {row.approved_risk_percent}%",
                 ]
             )
         lines.extend(
             [
-                f"Risk gate: {row.risk_gate_state}",
-                "Execution: DISABLED",
+                f"Risk Gate: {row.risk_gate_state}",
+                "นี่คือการตัดสินใจจำลอง ไม่มี Order ถูกส่ง",
                 "SHADOW ONLY — NO ORDER SENT",
+                execution_disabled(),
             ]
         )
         return "\n".join(lines)
@@ -655,11 +796,12 @@ class TelegramControlService:
             )
         counts = {decision: int(count) for decision, count in rows}
         return (
-            "SHADOW SUMMARY\n"
-            f"Total decisions: {sum(counts.values())}\n"
+            "🧠 สรุประบบ Shadow\n"
+            f"การตัดสินใจทั้งหมด: {sum(counts.values())}\n"
             f"BUY: {counts.get('BUY', 0)}\nSELL: {counts.get('SELL', 0)}\n"
             f"NO_TRADE: {counts.get('NO_TRADE', 0)}\n"
-            f"Pending outcomes: {pending}\nExecution: DISABLED"
+            f"ผลลัพธ์ที่รอประเมิน: {pending}\n{execution_disabled()}\n"
+            "Execution: DISABLED"
         )
 
     def _outcome(self) -> str:
@@ -674,14 +816,15 @@ class TelegramControlService:
                 .limit(5)
             ).all()
         if not rows:
-            return "SHADOW OUTCOMES\nNo evaluated shadow outcomes yet.\nExecution: DISABLED"
-        lines = ["SHADOW OUTCOMES"]
+            return "📊 ผลลัพธ์ Shadow\nยังไม่มีผลลัพธ์ที่ประเมินแล้ว\n" + execution_disabled()
+        lines = ["📊 ผลลัพธ์ Shadow ล่าสุด"]
         for row in rows:
             value = "UNKNOWN" if row.realized_r is None else f"{row.realized_r:.3f}R"
             lines.append(
-                f"{row.decision_m5_timestamp.isoformat()} {row.side} {row.terminal_status} {value}"
+                f"{format_thai_datetime(row.decision_m5_timestamp)} {row.side} "
+                f"{translate_trade_state(row.terminal_status)} {value}"
             )
-        lines.append("Execution: DISABLED")
+        lines.append(execution_disabled())
         return "\n".join(lines)
 
     def _performance(self) -> str:
@@ -697,11 +840,11 @@ class TelegramControlService:
             )
 
         return (
-            "SHADOW PERFORMANCE\n"
-            f"Eligible: {report['eligible_trades']} Resolved: {report['resolved_sample_size']}\n"
-            f"TP: {report['tp_hits']} SL: {report['sl_hits']} Ambiguous: {report['ambiguous']} Expired: {report['expired']}\n"
-            f"Win rate: {fmt(report['win_rate'])} Average R: {fmt(report['average_r'])} Total R: {fmt(report['total_r'])}\n"
-            "Execution: DISABLED"
+            "📈 ผลงาน Shadow\n"
+            f"ไม้ที่เข้าเกณฑ์: {report['eligible_trades']}\nไม้ที่จบแล้ว: {report['resolved_sample_size']}\n"
+            f"TP: {report['tp_hits']}  SL: {report['sl_hits']}  AMBIGUOUS: {report['ambiguous']}  EXPIRED: {report['expired']}\n"
+            f"Win Rate: {fmt(report['win_rate'])}  Average R: {fmt(report['average_r'])}  Total R: {fmt(report['total_r'])}\n"
+            f"{execution_disabled()}"
         )
 
     def _outcomehealth(self) -> str:
@@ -717,7 +860,8 @@ class TelegramControlService:
             timestamp=row.timestamp if row else None,
             interval_seconds=max(15.0, self.settings.live_candle_interval_seconds * 4),
         )
-        return f"SHADOW OUTCOME HEALTH\nState: {state}\nObserved: {row.timestamp.isoformat() if row else 'UNKNOWN'}\nExecution: DISABLED"
+        observed = format_thai_datetime(row.timestamp, include_utc=True) if row else "ยังไม่มีข้อมูล"
+        return f"🩺 สุขภาพระบบประเมินผล Shadow\nสถานะ: {translate_health_state(state)}\nเวลาตรวจพบ: {observed}\n{execution_disabled()}"
 
     def _strategy(self, text: str = "/strategy") -> str:
         from services.strategy_platform import StrategyRegistry
@@ -727,35 +871,35 @@ class TelegramControlService:
         try:
             strategy = StrategyRegistry(self.settings).resolve(identifier)
         except ValueError:
-            return f"STRATEGY REJECTED\nUnknown strategy: {identifier}"
+            return f"กลยุทธ์ไม่ถูกต้อง\nไม่รู้จัก strategy: {identifier}\n{execution_disabled()}"
         return (
-            f"SHADOW STRATEGY {identifier}\n"
+            f"🧠 กฎกลยุทธ์ Shadow: {identifier}\n"
             f"Version: {strategy.metadata.strategy_version}\n"
             f"Config: {strategy.metadata.config_hash}\n"
             f"Rules: {strategy.explain()}\n"
-            "Execution: DISABLED — SHADOW ONLY"
+            f"{execution_disabled()} — SHADOW ONLY"
         )
 
     def _strategies(self) -> str:
         from services.strategy_platform import StrategyRegistry
 
         registry = StrategyRegistry(self.settings)
-        return "REGISTERED SHADOW STRATEGIES\n" + "\n".join(
+        return "🧠 กลยุทธ์ Shadow ที่มีในระบบ\n" + "\n".join(
             f"{identifier}{' (ACTIVE)' if identifier == self.settings.shadow_strategy else ''}"
             for identifier in registry.identifiers()
-        ) + "\nExecution: DISABLED"
+        ) + "\n" + execution_disabled()
 
     def _research(self) -> str:
         from services.strategy_platform import StrategyRegistry
 
         strategy = StrategyRegistry(self.settings).resolve(self.settings.shadow_strategy)
         return (
-            "ACTIVE SHADOW STRATEGY\n"
+            "🔬 กลยุทธ์ Shadow ที่ใช้งาน\n"
             f"{strategy.metadata.strategy_id}\n"
             f"Version: {strategy.metadata.strategy_version}\n"
             f"Config: {strategy.metadata.config_hash}\n"
-            "Activation policy: next closed M5 boundary\n"
-            "Execution: DISABLED"
+            "นโยบายเริ่มใช้: ขอบเขตแท่ง M5 ที่ปิดถัดไป\n"
+            f"{execution_disabled()}"
         )
 
     def _backtests(self) -> str:
@@ -763,13 +907,13 @@ class TelegramControlService:
 
         rows = list_runs(self.database, limit=8)
         if not rows:
-            return "RESEARCH BACKTESTS\nNo persisted research runs yet.\nExecution: DISABLED"
-        lines = ["RESEARCH BACKTESTS"]
+            return "🧪 Backtest งานวิจัย\nยังไม่มีงานวิจัยที่บันทึกไว้\n" + execution_disabled()
+        lines = ["🧪 Backtest งานวิจัยล่าสุด"]
         for row in rows:
             summary = row.summary_json if isinstance(row.summary_json, dict) else {}
             lines.append(f"{row.run_id[:8]} {row.status} {row.strategy_id} RR={row.parameters_json.get('rr', 'GRID')} "
                          f"BUY={summary.get('buy', 0)} SELL={summary.get('sell', 0)} NO_TRADE={summary.get('no_trade', 0)}")
-        lines.append("Execution: DISABLED")
+        lines.append(execution_disabled())
         return "\n".join(lines)
 
     def _compare(self, text: str) -> str:
@@ -777,7 +921,7 @@ class TelegramControlService:
 
         requested = text.strip().split()[1:]
         if len(requested) < 2:
-            return "COMPARE REJECTED\nUsage: /compare trend_pullback_v1 pair_zone_v1"
+            return "เปรียบเทียบไม่ได้\nวิธีใช้: /compare trend_pullback_v1 pair_zone_v1"
         aliases = {
             "trend_pullback_v1": {"trend_pullback_v1", "trend_pullback"},
             "pair_zone_v1": {"pair_zone_v1"},
@@ -786,12 +930,12 @@ class TelegramControlService:
                 if row.status == "COMPLETED" and "chronological" not in (row.run_name or "")
                 and not (row.run_name or "").endswith(("-development", "-validation", "-holdout"))
                 and row.parameters_json.get("rr") == 2.0]
-        lines = ["STRATEGY COMPARISON (RR=2.0)"]
+        lines = ["🧪 เปรียบเทียบกลยุทธ์ (RR=2.0)"]
         for identifier in requested:
             accepted = aliases.get(identifier, {identifier})
             row = next((item for item in rows if item.strategy_id in accepted), None)
             if row is None:
-                lines.append(f"{identifier}: NO PERSISTED RUN")
+                lines.append(f"{identifier}: ยังไม่มีผลวิจัยที่บันทึกไว้")
                 continue
             summary = row.summary_json if isinstance(row.summary_json, dict) else {}
             lines.append(
@@ -800,7 +944,8 @@ class TelegramControlService:
                 f"PF={summary.get('profit_factor')} win_rate={summary.get('win_rate')} "
                 f"max_DD={summary.get('max_drawdown_r')}"
             )
-        lines.append("Evidence only; no automatic winner. Execution: DISABLED")
+        lines.append("แสดงหลักฐานเท่านั้น ไม่มีการเลือกผู้ชนะอัตโนมัติ")
+        lines.append(execution_disabled())
         return "\n".join(lines)
 
     def _latest_robustness_summary(self) -> tuple[str | None, dict[str, object]]:
@@ -815,71 +960,78 @@ class TelegramControlService:
     def _robustness(self) -> str:
         robustness_id, summary = self._latest_robustness_summary()
         if robustness_id is None:
-            return "ROBUSTNESS\nNo persisted Pair Zone robustness run yet.\nExecution: DISABLED"
+            return "🧪 Robustness\nยังไม่มีผลทดสอบ Pair Zone ที่บันทึกไว้\n" + execution_disabled()
         normal = (summary.get("cost_scenarios") or {}).get("normal", {})
-        return ("ROBUSTNESS TESTS COMPLETE\n"
+        return ("🧪 ผลทดสอบ Robustness เสร็จสิ้น\nROBUSTNESS TESTS COMPLETE\n"
                 f"Run: {robustness_id[:12]}\n"
-                f"Class: {summary.get('classification', 'unknown').upper()}\n"
+                f"การจัดกลุ่ม: {summary.get('classification', 'unknown').upper()}\n"
                 f"Signals BUY={summary.get('canonical_signals', {}).get('buy', 0)} SELL={summary.get('canonical_signals', {}).get('sell', 0)}\n"
                 f"Normal cost Net R={normal.get('net_total_r')} Net DD={normal.get('net_max_drawdown_r')}\n"
-                "Frozen signals; evidence only. Execution: DISABLED")
+                "สัญญาณถูกตรึงไว้; แสดงหลักฐานเท่านั้น\n" + execution_disabled())
 
     def _costs(self) -> str:
         robustness_id, summary = self._latest_robustness_summary()
         if robustness_id is None:
-            return "COSTS\nNo persisted Pair Zone cost run yet.\nExecution: DISABLED"
+            return "🧪 ผลกระทบต้นทุน\nยังไม่มีผลทดสอบต้นทุน Pair Zone ที่บันทึกไว้\n" + execution_disabled()
         scenarios = summary.get("cost_scenarios") or {}
-        lines = ["PAIR ZONE COST SENSITIVITY"]
+        lines = ["🧪 ผลกระทบ Spread/Slippage/Cost ของ Pair Zone"]
         for name in ("zero", "normal", "elevated", "stress"):
             row = scenarios.get(name, {})
             lines.append(f"{name}: gross={row.get('gross_total_r')} net={row.get('net_total_r')} cost={row.get('cost_total_r')}")
-        lines.append("Execution: DISABLED")
+        lines.append(execution_disabled())
         return "\n".join(lines)
 
     def _stability(self) -> str:
         robustness_id, summary = self._latest_robustness_summary()
         if robustness_id is None:
-            return "STABILITY\nNo persisted Pair Zone stability run yet.\nExecution: DISABLED"
+            return "🧪 ความเสถียรตามช่วงเวลา\nยังไม่มีผลทดสอบ Pair Zone ที่บันทึกไว้\n" + execution_disabled()
         monthly = summary.get("monthly_stability_normal_cost") or {}
         sides = summary.get("buy_sell_normal_cost") or {}
-        return ("PAIR ZONE STABILITY\n"
-                f"Months: {len(monthly)}\n"
+        return ("🧪 ความเสถียรของ Pair Zone\n"
+                f"จำนวนเดือน: {len(monthly)}\n"
                 f"BUY net R={sides.get('BUY', {}).get('net_total_r')} SELL net R={sides.get('SELL', {}).get('net_total_r')}\n"
-                "Chronological frozen windows; descriptive evidence only. Execution: DISABLED")
+                "ใช้ช่วงเวลาตามลำดับจริง; แสดงหลักฐานเชิงพรรณนาเท่านั้น\n" + execution_disabled())
 
     def _forward(self) -> str:
         from services.forward_shadow import forward_performance, latest_forward_session
 
         row = latest_forward_session(self.database)
         if row is None:
-            return "FORWARD SHADOW\nNo active forward validation session.\nExecution: DISABLED"
+            return "🔭 FORWARD TEST — Pair Zone V1\nยังไม่มี Forward Validation session ที่กำลังทำงาน\n" + execution_disabled()
         performance = forward_performance(self.database, row.session_id)
         combined = performance.get("combined", {})
         return (
-            "LIVE FORWARD SHADOW\n"
-            f"Strategy: {row.strategy_id} {row.strategy_version}\n"
+            "🔭 FORWARD TEST — Pair Zone V1\n"
+            f"สถานะ: {translate_health_state(row.status)}\n"
+            f"กลยุทธ์: {row.strategy_id} {row.strategy_version}\n"
             f"Session: {row.session_id}\n"
-            f"Status: {row.status}\n"
-            f"Started: {row.started_at.isoformat()}\n"
-            f"Signals: {performance.get('signals', 0)}\n"
-            f"Open trades: {performance.get('OPEN', 0)}\n"
-            f"Resolved trades: {combined.get('resolved', 0)}\n"
-            f"Net R: {combined.get('net_total_r')}\n"
-            "Execution: DISABLED — NO REAL ORDERS"
+            f"เริ่มทดสอบ: {format_thai_datetime(row.started_at, include_utc=True)}\n"
+            f"สัญญาณทั้งหมด: {performance.get('signals', 0)}\n"
+            f"ไม้จำลองที่เปิดอยู่: {performance.get('OPEN', 0)}\n"
+            f"ไม้ที่จบแล้ว: {combined.get('resolved', 0)}\n"
+            f"ผลรวมสุทธิ: {combined.get('net_total_r')} R\n\n"
+            "นี่คือการเทรดจำลองจากข้อมูลตลาดจริง\nไม่มีการส่งคำสั่งซื้อขายไปยัง Broker\n"
+            f"{execution_disabled()}"
         )
 
     def _forwardhealth(self) -> str:
-        from services.forward_shadow import forward_health
+        from services.forward_shadow import forward_health, latest_forward_session
 
         health = forward_health(self.database, self.settings)
+        last_m5 = health.get("last_closed_m5")
+        session = latest_forward_session(self.database)
+        session_id = health.get("session_id") or (session.session_id if session else None)
+        strategy_id = health.get("strategy_id") or (session.strategy_id if session else "pair_zone_v1")
+        strategy_version = health.get("strategy_version") or (session.strategy_version if session else "")
         return (
-            "FORWARD SHADOW HEALTH\n"
-            f"State: {health.get('state')}\n"
-            f"Session: {(health.get('session_id') or 'UNKNOWN')}\n"
-            f"Last M5: {health.get('last_closed_m5') or 'UNKNOWN'}\n"
-            f"Last signal: {health.get('last_signal') or 'UNKNOWN'}\n"
-            f"Open trades: {health.get('open_shadow_trades', 0)}\n"
-            "Execution: DISABLED"
+            "🔭 สุขภาพ Forward Shadow\n"
+            f"สถานะ: {translate_health_state(health.get('state'))}\n"
+            f"กลยุทธ์: {strategy_id} {strategy_version}\n"
+            f"Session:\n{session_id or 'UNKNOWN'}\n"
+            f"แท่ง M5 ล่าสุด: {format_thai_datetime(last_m5, include_utc=True)}\n"
+            f"สัญญาณล่าสุด: {health.get('last_signal') or 'ยังไม่มี'}\n"
+            f"ไม้จำลองที่ยังเปิดอยู่: {health.get('open_shadow_trades', 0)}\n"
+            f"{execution_disabled()}"
         )
 
     def _forwardtrades(self) -> str:
@@ -888,11 +1040,25 @@ class TelegramControlService:
         row = latest_forward_session(self.database)
         trades = forward_trades(self.database, row.session_id if row else None, limit=8)
         if not trades:
-            return "FORWARD TRADES\nNo forward virtual trades yet.\nExecution: DISABLED"
-        lines = ["FORWARD VIRTUAL TRADES"]
+            return "📭 ไม้จำลอง Forward\nยังไม่มีสัญญาณที่เข้าเงื่อนไขสำหรับเปิดไม้จำลอง\nระบบยังคงตรวจตลาดตามปกติ\nนี่ไม่ใช่ข้อผิดพลาด\n\n" + execution_disabled()
+        lines = ["📭 ไม้จำลอง Forward"]
         for trade in trades:
-            lines.append(f"{trade.timestamp.isoformat()} {trade.side} {trade.state} gross={trade.gross_r} net={trade.net_r}")
-        lines.append("No real orders. Execution: DISABLED")
+            rr = None
+            if trade.risk_distance:
+                rr = abs(trade.take_profit - trade.entry_price) / abs(trade.risk_distance)
+            lines.extend([
+                f"{trade.side} — {translate_trade_state(trade.state)}",
+                f"เข้า: {trade.entry_price}",
+                f"SL: {trade.stop_loss}",
+                f"TP: {trade.take_profit}",
+                f"RR: {format_value(rr, 2) if rr is not None else 'ยังไม่มีข้อมูล'}",
+                f"เวลาเปิด: {format_thai_datetime(trade.timestamp, include_utc=True)}",
+                f"ผลลัพธ์: {translate_trade_state(trade.state)}",
+                f"Gross: {format_value(trade.gross_r, 2, signed=True)} R",
+                f"Net: {format_value(trade.net_r, 2, signed=True)} R",
+                "",
+            ])
+        lines.append(execution_disabled())
         return "\n".join(lines)
 
     def _forwardperformance(self) -> str:
@@ -900,19 +1066,22 @@ class TelegramControlService:
 
         row = latest_forward_session(self.database)
         if row is None:
-            return "FORWARD PERFORMANCE\nNo forward validation session yet.\nExecution: DISABLED"
+            return "📈 ผลการทดสอบ Forward\nยังไม่มี Forward Test session\n" + execution_disabled()
         result = forward_performance(self.database, row.session_id)
         combined = result.get("combined", {})
         expired = result.get("expired_only", {})
         tp_sl = result.get("tp_sl_only", {})
         return (
-            "FORWARD PERFORMANCE\n"
-            f"Signals={result.get('signals', 0)} BUY={result.get('BUY', 0)} SELL={result.get('SELL', 0)}\n"
-            f"Combined gross={combined.get('gross_total_r')} net={combined.get('net_total_r')}\n"
-            f"TP/SL/AMBIGUOUS net={tp_sl.get('net_total_r')}\n"
-            f"EXPIRED count={expired.get('EXPIRED', 0)} net={expired.get('net_total_r')}\n"
-            f"Expectancy={combined.get('net_expectancy')} PF={combined.get('profit_factor')}\n"
-            "Forward-only evidence. Execution: DISABLED"
+            "📈 ผลการทดสอบ Forward\n"
+            f"สัญญาณทั้งหมด: {result.get('signals', 0)}\nBUY: {result.get('BUY', 0)}\nSELL: {result.get('SELL', 0)}\n\n"
+            f"ผลลัพธ์ TP/SL/AMBIGUOUS: {tp_sl.get('resolved', 0)}\n"
+            f"TP/SL/AMBIGUOUS Net R: {tp_sl.get('net_total_r')}\n"
+            f"EXPIRED: {expired.get('EXPIRED', 0)}  Net R: {expired.get('net_total_r')}\n"
+            f"OPEN: {result.get('OPEN', 0)}\n"
+            f"Expectancy: {combined.get('net_expectancy')} R\nProfit Factor: {combined.get('profit_factor')}\n"
+            f"Net R: {combined.get('net_total_r')}\n\n"
+            "ข้อมูลนี้มาจาก Forward Test เท่านั้น\nห้ามรวมกับผล Historical Backtest\n"
+            f"{execution_disabled()}"
         )
 
     async def _backtest(self, text: str) -> str:
@@ -926,7 +1095,7 @@ class TelegramControlService:
         strategy_id = parts[1] if len(parts) == 2 else self.settings.shadow_strategy
         from services.strategy_platform import StrategyRegistry
         if strategy_id not in StrategyRegistry(self.settings).identifiers():
-            return "BACKTEST REJECTED\nUnknown strategy. Use /strategies."
+            return "🧪 เริ่ม Backtest ไม่ได้\nไม่รู้จัก strategy โปรดใช้ /strategies"
         job_id = enqueue_backtest_dataset(self.database, self.settings, strategy_id=strategy_id,
                                           project_root=self.project_root, run_name="telegram")
         self.health.record("worker:research", "CONNECTED", message="Research job queued",
@@ -948,11 +1117,11 @@ class TelegramControlService:
         task = asyncio.create_task(execute(), name=f"research-{job_id[:8]}")
         self._research_tasks.add(task)
         task.add_done_callback(self._research_tasks.discard)
-        return f"BACKTEST QUEUED\nJob: {job_id}\nStrategy: {strategy_id}\nUse /backtests for persisted progress.\nExecution: DISABLED"
+        return f"🧪 รับงาน Backtest แล้ว\nJob: {job_id}\nStrategy: {strategy_id}\nดูความคืบหน้าได้ที่ /backtests\n{execution_disabled()}"
 
     def _dashboard(self) -> str:
         url = self.settings.dashboard_public_url
-        return f"DASHBOARD\n{url or 'UNKNOWN (DASHBOARD_PUBLIC_URL not configured)'}\nExecution: DISABLED"
+        return f"🖥️ Dashboard\n{url or '⚪ ยังไม่ทราบสถานะ (DASHBOARD_PUBLIC_URL ยังไม่ได้ตั้งค่า)'}\n{execution_disabled()}"
 
     def _snapshot_context(self):
         """Return the latest coherent risk/position view from one persisted cycle."""
@@ -1043,16 +1212,16 @@ class TelegramControlService:
             rows = session.scalars(
                 select(SystemEventRecord).order_by(desc(SystemEventRecord.timestamp)).limit(8)
             ).all()
-        lines = ["RECENT SAFE EVENTS"]
+        lines = ["🧾 เหตุการณ์ล่าสุด (ข้อมูลปลอดภัย)"]
         for row in rows:
             payload = row.payload if isinstance(row.payload, dict) else {}
             detail = payload.get("message") or payload.get("status") or "recorded"
-            lines.append(f"{row.timestamp.isoformat()} {row.event_type}: {str(detail)[:120]}")
+            lines.append(f"{format_thai_datetime(row.timestamp)} {row.event_type}: {str(detail)[:120]}")
         return "\n".join(lines)
 
     @staticmethod
     def _help() -> str:
-        return "COMMANDS\n" + "\n".join(f"{key} — {value}" for key, value in COMMAND_HELP.items())
+        return thai_help()
 
     def _latest_service_state(self, component: str) -> str:
         with self.database.session() as session:
