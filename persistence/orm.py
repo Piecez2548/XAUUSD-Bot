@@ -334,6 +334,8 @@ class ShadowDecisionRecord(IdMixin, Base):
     confidence: Mapped[float | None] = mapped_column(Float)
     strategy_name: Mapped[str] = mapped_column(String(100))
     strategy_version: Mapped[str] = mapped_column(String(64))
+    config_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    config_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason_codes: Mapped[list[str]] = mapped_column(JSON)
     human_readable_reason: Mapped[str] = mapped_column(Text)
     risk_gate_state: Mapped[str] = mapped_column(String(32))
@@ -341,6 +343,25 @@ class ShadowDecisionRecord(IdMixin, Base):
     execution_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
     feature_context: Mapped[dict[str, Any]] = mapped_column(JSON)
     outcome_status: Mapped[str] = mapped_column(String(32), default="PENDING")
+
+
+class StrategyActivationRecord(IdMixin, Base):
+    """Auditable shadow-only strategy activation at a closed-candle boundary."""
+
+    __tablename__ = "strategy_activations"
+    __table_args__ = (Index("ix_strategy_activations_effective", "effective_from_m5"),)
+
+    strategy_id: Mapped[str] = mapped_column(String(100), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64))
+    config_version: Mapped[str] = mapped_column(String(64))
+    config_hash: Mapped[str] = mapped_column(String(64))
+    requested_at: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
+    activated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    effective_from_m5: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
+    previous_strategy: Mapped[str | None] = mapped_column(String(100))
+    reason: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(32))
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class ShadowOutcomeRecord(IdMixin, Base):

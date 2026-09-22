@@ -15,9 +15,14 @@ from domain.events import AiDecisionEventPayload, DomainEvent, EventSeverity, Ev
 from models.market import MarketSnapshot
 from models.observatory import RiskSnapshot
 from persistence.orm import SystemHealthRecord
-from persistence.repositories import ShadowDecisionRepository, SystemHealthRepository
+from persistence.repositories import (
+    ShadowDecisionRepository,
+    StrategyActivationRepository,
+    SystemHealthRepository,
+)
 from services.shadow_engine import ShadowDecisionEngine
 from services.shadow_replay import load_persisted_snapshots
+from services.strategy_platform import StrategyRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,12 +43,11 @@ class ShadowDecisionWorker:
         self.events = event_bus
         self.repository = ShadowDecisionRepository(database)
         self.health = SystemHealthRepository(database)
-        self.engine = ShadowDecisionEngine(
-            target_risk_percent=min(settings.max_trade_risk_percent, 2.0),
-            max_aggregate_risk_percent=min(settings.max_aggregate_risk_percent, 6.0),
-            min_rr=settings.shadow_min_rr,
-            max_spread_points=settings.shadow_max_spread_points,
-        )
+        self.registry = StrategyRegistry(settings)
+        self.strategy = self.registry.resolve(getattr(settings, "shadow_strategy", "baseline_v1"))
+        self.engine = getattr(self.strategy, "engine", self.strategy)
+        self.activations = StrategyActivationRepository(database)
+        self._record_strategy_activation()
         self._queue: asyncio.Queue[ShadowInput] = asyncio.Queue(maxsize=8)
         self._deferred_keys: set[tuple[str, datetime, str]] = set()
         self._queued_keys: set[tuple[str, datetime, str]] = set()
@@ -67,6 +71,30 @@ class ShadowDecisionWorker:
         self.stall_ttl_seconds = max(60.0, settings.live_account_interval_seconds * 4)
         self._catchup_pending_keys: set[tuple[str, datetime, str]] = set()
         self._restore_prior_health()
+
+    def _record_strategy_activation(self) -> None:
+        """Record a selected strategy for the next closed-M5 boundary only."""
+
+        from datetime import timedelta
+
+        now = datetime.now(UTC)
+        next_boundary = now.replace(second=0, microsecond=0) + timedelta(
+            minutes=5 - (now.minute % 5)
+        )
+        latest = self.activations.latest()
+        if latest is not None and latest.config_hash == self.strategy.metadata.config_hash:
+            return
+        self.activations.record(
+            strategy_id=self.strategy.metadata.strategy_id,
+            strategy_version=self.strategy.metadata.strategy_version,
+            config_version=self.strategy.metadata.config_version,
+            config_hash=self.strategy.metadata.config_hash,
+            effective_from_m5=next_boundary,
+            previous_strategy=latest.strategy_id if latest else None,
+            reason="Human-controlled shadow strategy selection",
+            source="SYSTEM_STARTUP",
+            requested_at=now,
+        )
 
     @property
     def queue_depth(self) -> int:
@@ -180,7 +208,7 @@ class ShadowDecisionWorker:
         self._processing_keys.add(key)
         completed = False
         try:
-            decision = self.engine.evaluate(
+            decision = self.strategy.evaluate(
                 item.snapshot,
                 market_snapshot_id=item.market_snapshot_id,
                 risk=item.risk,
@@ -273,7 +301,7 @@ class ShadowDecisionWorker:
             key = (
                 snapshot.symbol.name,
                 ShadowDecisionEngine._m5_timestamp(snapshot, candles_are_closed=True),
-                self.engine.strategy_version,
+                self.strategy.metadata.strategy_version,
             )
             if (
                 key in self._queued_keys
@@ -306,7 +334,7 @@ class ShadowDecisionWorker:
             ShadowDecisionEngine._m5_timestamp(
                 item.snapshot, candles_are_closed=item.candles_are_closed
             ),
-            self.engine.strategy_version,
+            self.strategy.metadata.strategy_version,
         )
 
     def _record_failure(self, exc: Exception) -> None:

@@ -30,6 +30,7 @@ from persistence.orm import (
     RiskSnapshotRecord,
     ShadowDecisionRecord,
     ShadowOutcomeRecord,
+    StrategyActivationRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
@@ -421,6 +422,8 @@ class ShadowDecisionRepository:
                 confidence=decision.confidence,
                 strategy_name=decision.strategy_name,
                 strategy_version=decision.strategy_version,
+                config_version=decision.config_version,
+                config_hash=decision.config_hash,
                 reason_codes=list(decision.reason_codes),
                 human_readable_reason=decision.human_readable_reason,
                 risk_gate_state=decision.risk_gate_state,
@@ -496,6 +499,40 @@ class ShadowDecisionRepository:
                 or 0
             )
             return result
+
+
+class StrategyActivationRepository:
+    """Append-only strategy activation audit; no execution authority."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def record(
+        self, *, strategy_id: str, strategy_version: str, config_version: str,
+        config_hash: str, effective_from_m5: datetime, previous_strategy: str | None,
+        reason: str, source: str = "SYSTEM_STARTUP", requested_at: datetime | None = None,
+    ) -> StrategyActivationRecord:
+        now = requested_at or datetime.now(UTC)
+        with self._database.session() as session:
+            row = StrategyActivationRecord(
+                strategy_id=strategy_id, strategy_version=strategy_version,
+                config_version=config_version, config_hash=config_hash,
+                requested_at=now, activated_at=now, effective_from_m5=effective_from_m5,
+                previous_strategy=previous_strategy, reason=reason, source=source,
+                execution_allowed=False,
+            )
+            session.add(row)
+            session.flush()
+            return row
+
+    def latest(self) -> StrategyActivationRecord | None:
+        with self._database.session() as session:
+            return session.scalar(
+                select(StrategyActivationRecord)
+                .order_by(StrategyActivationRecord.effective_from_m5.desc(),
+                          StrategyActivationRecord.requested_at.desc())
+                .limit(1)
+            )
 
 
 class ShadowOutcomeRepository:

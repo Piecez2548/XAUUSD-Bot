@@ -54,6 +54,8 @@ COMMAND_HELP = {
     "/performance": "Show shadow performance summary",
     "/outcomehealth": "Show shadow outcome worker liveness",
     "/strategy": "Show deterministic baseline rules",
+    "/strategies": "Show registered shadow strategies",
+    "/research": "Show active strategy research identity",
     "/logs": "Show safe recent operational events",
     "/help": "Show available commands",
 }
@@ -242,6 +244,8 @@ class TelegramControlService:
             "/performance": self._performance,
             "/outcomehealth": self._outcomehealth,
             "/strategy": self._strategy,
+            "/strategies": self._strategies,
+            "/research": self._research,
             "/logs": self._logs,
             "/help": self._help,
         }
@@ -687,16 +691,37 @@ class TelegramControlService:
         )
         return f"SHADOW OUTCOME HEALTH\nState: {state}\nObserved: {row.timestamp.isoformat() if row else 'UNKNOWN'}\nExecution: DISABLED"
 
-    @staticmethod
-    def _strategy() -> str:
+    def _strategy(self) -> str:
         return (
-            "SHADOW STRATEGY baseline_v1\n"
+            f"SHADOW STRATEGY {self.settings.shadow_strategy}\n"
             "H4/H1: directional bias from EMA, slope, and higher/lower structure.\n"
             "M15: setup must align with the higher-timeframe bias.\n"
             "M5: timing must align; stop uses recent structure plus ATR buffer.\n"
             "Target: minimum configurable R:R (default 2.0).\n"
             "Risk gate: max 2% per shadow trade and 6% aggregate.\n"
             "Execution: DISABLED — SHADOW ONLY"
+        )
+
+    def _strategies(self) -> str:
+        from services.strategy_platform import StrategyRegistry
+
+        registry = StrategyRegistry(self.settings)
+        return "REGISTERED SHADOW STRATEGIES\n" + "\n".join(
+            f"{identifier}{' (ACTIVE)' if identifier == self.settings.shadow_strategy else ''}"
+            for identifier in registry.identifiers()
+        ) + "\nExecution: DISABLED"
+
+    def _research(self) -> str:
+        from services.strategy_platform import StrategyRegistry
+
+        strategy = StrategyRegistry(self.settings).resolve(self.settings.shadow_strategy)
+        return (
+            "ACTIVE SHADOW STRATEGY\n"
+            f"{strategy.metadata.strategy_id}\n"
+            f"Version: {strategy.metadata.strategy_version}\n"
+            f"Config: {strategy.metadata.config_hash}\n"
+            "Activation policy: next closed M5 boundary\n"
+            "Execution: DISABLED"
         )
 
     def _snapshot_context(self):

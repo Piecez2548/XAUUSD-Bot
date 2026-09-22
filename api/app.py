@@ -34,6 +34,7 @@ from persistence.orm import (
     RiskSnapshotRecord,
     ShadowDecisionRecord,
     ShadowOutcomeRecord,
+    StrategyActivationRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
@@ -48,6 +49,7 @@ from services.shadow_outcome import (
 from services.shadow_outcome import (
     performance_summary as shadow_performance_summary,
 )
+from services.strategy_platform import StrategyRegistry
 from services.worker_health import derive_worker_state, worker_health_payload, worker_health_ttl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -780,6 +782,31 @@ def create_app(
         )
         return payload
 
+    @app.get("/api/research/strategies")
+    def research_strategies() -> dict[str, Any]:
+        registry = StrategyRegistry(runtime_settings)
+        with db.session() as session:
+            activation = session.scalar(
+                select(StrategyActivationRecord)
+                .order_by(StrategyActivationRecord.effective_from_m5.desc(),
+                          StrategyActivationRecord.requested_at.desc())
+                .limit(1)
+            )
+        return {
+            "active_strategy": runtime_settings.shadow_strategy,
+            "available_strategies": registry.identifiers(),
+            "activation": {
+                "strategy_id": activation.strategy_id,
+                "strategy_version": activation.strategy_version,
+                "config_version": activation.config_version,
+                "config_hash": activation.config_hash,
+                "effective_from_m5": activation.effective_from_m5,
+                "execution_allowed": False,
+            } if activation else None,
+            "read_only": True,
+            "execution_allowed": False,
+        }
+
     @app.get("/api/decisions/{decision_id}")
     def decision_detail(decision_id: str) -> dict[str, Any]:
         with db.session() as session:
@@ -1207,6 +1234,7 @@ def create_app(
             "max_trade_risk_percent": runtime_settings.max_trade_risk_percent,
             "max_aggregate_risk_percent": runtime_settings.max_aggregate_risk_percent,
             "shadow_engine_enabled": runtime_settings.shadow_engine_enabled,
+            "shadow_strategy": runtime_settings.shadow_strategy,
             "shadow_decision_timeframe": runtime_settings.shadow_decision_timeframe,
             "shadow_min_rr": runtime_settings.shadow_min_rr,
             "shadow_notify_signals": runtime_settings.shadow_notify_signals,

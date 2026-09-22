@@ -96,6 +96,8 @@ class ShadowDecision(ShadowModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
     strategy_name: str = "baseline"
     strategy_version: str = "baseline_v1"
+    config_version: str = "default"
+    config_hash: str = ""
     reason_codes: tuple[str, ...] = ()
     human_readable_reason: str
     risk_gate_state: str

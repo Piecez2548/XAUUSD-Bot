@@ -116,6 +116,7 @@ class Settings:
     max_trade_risk_percent: float = 2.0
     max_aggregate_risk_percent: float = 6.0
     shadow_engine_enabled: bool = True
+    shadow_strategy: str = "baseline_v1"
     shadow_decision_timeframe: str = "M5"
     shadow_min_rr: float = 2.0
     shadow_max_spread_points: int = 100
@@ -163,6 +164,8 @@ class Settings:
             )
         if self.shadow_decision_timeframe != "M5":
             raise ConfigurationError("SHADOW_DECISION_TIMEFRAME must be M5")
+        if not self.shadow_strategy.strip():
+            raise ConfigurationError("SHADOW_STRATEGY must not be empty")
         if self.shadow_min_rr <= 0:
             raise ConfigurationError("SHADOW_MIN_RR must be greater than zero")
         if self.shadow_max_spread_points < 0:
@@ -247,6 +250,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         max_trade_risk_percent=float(os.getenv("MAX_TRADE_RISK_PERCENT", "2")),
         max_aggregate_risk_percent=float(os.getenv("MAX_AGGREGATE_RISK_PERCENT", "6")),
         shadow_engine_enabled=_boolean("SHADOW_ENGINE_ENABLED", True),
+        shadow_strategy=os.getenv("SHADOW_STRATEGY", "baseline_v1").strip(),
         shadow_decision_timeframe=os.getenv("SHADOW_DECISION_TIMEFRAME", "M5").upper(),
         shadow_min_rr=float(os.getenv("SHADOW_MIN_RR", "2")),
         shadow_max_spread_points=_nonnegative_int("SHADOW_MAX_SPREAD_POINTS", 100),

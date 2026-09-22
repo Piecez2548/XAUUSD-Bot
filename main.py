@@ -22,6 +22,7 @@ from services.live import LiveDataEngine
 from services.observatory import ObservatoryService
 from services.shadow_outcome import ShadowOutcomeWorker
 from services.shadow_replay import load_persisted_snapshots, replay_snapshots
+from services.strategy_research import run_strategy_research, write_result
 from utils.logging import configure_logging
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -297,6 +298,29 @@ def run_shadow_evaluate() -> int:
         database.dispose()
 
 
+def run_strategy_research_command(strategy_id: str | None = None, output: str | None = None) -> int:
+    settings, _logger = _load_runtime()
+    migrate_database(settings.database_url, PROJECT_ROOT)
+    database = Database(settings.database_url, project_root=PROJECT_ROOT)
+    try:
+        result = run_strategy_research(database, settings, strategy_id=strategy_id)
+        if output:
+            write_result(result, Path(output))
+        print("STRATEGY RESEARCH")
+        print(f"Strategy: {result.strategy_id} {result.strategy_version}")
+        print(f"Config: {result.config_version} {result.config_hash}")
+        print(f"Dataset: {result.dataset_start} -> {result.dataset_end}")
+        print(f"Candles: {result.eligible_candles}")
+        print(f"BUY: {result.buy}")
+        print(f"SELL: {result.sell}")
+        print(f"NO_TRADE: {result.no_trade}")
+        print(f"Reasons: {result.reason_counts}")
+        print("Execution: DISABLED")
+        return 0
+    finally:
+        database.dispose()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="XAUUSD AI Trader read-only tools")
     parser.add_argument(
@@ -313,15 +337,19 @@ def build_parser() -> argparse.ArgumentParser:
             "migrate",
             "shadow-replay",
             "shadow-evaluate",
+            "strategy-research",
         ),
         default="phase1",
         help="phase1 is the unchanged default diagnostic",
     )
+    parser.add_argument("--strategy", default=None, help="research strategy identifier")
+    parser.add_argument("--output", default=None, help="optional JSON research output path")
     return parser
 
 
 def run(argv: list[str] | None = None) -> int:
-    command = build_parser().parse_args(argv).command
+    args = build_parser().parse_args(argv)
+    command = args.command
     if command == "phase1":
         return run_phase1()
     if command == "observe":
@@ -340,6 +368,8 @@ def run(argv: list[str] | None = None) -> int:
         return run_shadow_replay()
     if command == "shadow-evaluate":
         return run_shadow_evaluate()
+    if command == "strategy-research":
+        return run_strategy_research_command(args.strategy, args.output)
     settings, _logger = _load_runtime()
     migrate_database(settings.database_url, PROJECT_ROOT)
     print("Database migrations applied.")

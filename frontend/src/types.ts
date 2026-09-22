@@ -330,6 +330,7 @@ export interface PublicConfig {
   telegram_control_enabled: boolean;
   max_trade_risk_percent: number;
   max_aggregate_risk_percent: number;
+  shadow_strategy?: string;
   read_only: boolean;
   timezone: string;
 }
