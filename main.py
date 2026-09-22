@@ -20,6 +20,7 @@ from services.collector import collect_market_snapshot
 from services.control import TelegramControlService
 from services.live import LiveDataEngine
 from services.observatory import ObservatoryService
+from services.shadow_outcome import ShadowOutcomeWorker
 from services.shadow_replay import load_persisted_snapshots, replay_snapshots
 from utils.logging import configure_logging
 
@@ -276,6 +277,26 @@ def run_shadow_replay() -> int:
         database.dispose()
 
 
+def run_shadow_evaluate() -> int:
+    settings, logger = _load_runtime()
+    migrate_database(settings.database_url, PROJECT_ROOT)
+    database = Database(settings.database_url, project_root=PROJECT_ROOT)
+    worker = ShadowOutcomeWorker(settings, database, logger=logger)
+
+    async def evaluate() -> dict[str, int]:
+        return await worker.evaluate_once()
+
+    try:
+        report = asyncio.run(evaluate())
+        print("PHASE 2.1 SHADOW OUTCOME EVALUATION")
+        for key, value in report.items():
+            print(f"{key.replace('_', ' ').title()}: {value}")
+        print("Execution: DISABLED")
+        return 0 if report.get("errors", 0) == 0 else 1
+    finally:
+        database.dispose()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="XAUUSD AI Trader read-only tools")
     parser.add_argument(
@@ -291,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
             "backup",
             "migrate",
             "shadow-replay",
+            "shadow-evaluate",
         ),
         default="phase1",
         help="phase1 is the unchanged default diagnostic",
@@ -316,6 +338,8 @@ def run(argv: list[str] | None = None) -> int:
         return run_backup()
     if command == "shadow-replay":
         return run_shadow_replay()
+    if command == "shadow-evaluate":
+        return run_shadow_evaluate()
     settings, _logger = _load_runtime()
     migrate_database(settings.database_url, PROJECT_ROOT)
     print("Database migrations applied.")

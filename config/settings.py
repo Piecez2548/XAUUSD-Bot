@@ -121,6 +121,7 @@ class Settings:
     shadow_max_spread_points: int = 100
     shadow_notify_signals: bool = True
     shadow_notify_no_trade: bool = False
+    shadow_outcome_horizon_bars: int = 12
     live_tick_interval_seconds: float = 1.0
     live_account_interval_seconds: float = 5.0
     live_candle_interval_seconds: float = 5.0
@@ -166,6 +167,8 @@ class Settings:
             raise ConfigurationError("SHADOW_MIN_RR must be greater than zero")
         if self.shadow_max_spread_points < 0:
             raise ConfigurationError("SHADOW_MAX_SPREAD_POINTS cannot be negative")
+        if self.shadow_outcome_horizon_bars <= 0:
+            raise ConfigurationError("SHADOW_OUTCOME_HORIZON_BARS must be greater than zero")
         positive = {
             "LIVE_TICK_INTERVAL_SECONDS": self.live_tick_interval_seconds,
             "LIVE_ACCOUNT_INTERVAL_SECONDS": self.live_account_interval_seconds,
@@ -249,6 +252,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         shadow_max_spread_points=_nonnegative_int("SHADOW_MAX_SPREAD_POINTS", 100),
         shadow_notify_signals=_boolean("SHADOW_NOTIFY_SIGNALS", True),
         shadow_notify_no_trade=_boolean("SHADOW_NOTIFY_NO_TRADE", False),
+        shadow_outcome_horizon_bars=_positive_int("SHADOW_OUTCOME_HORIZON_BARS", 12),
         live_tick_interval_seconds=float(os.getenv("LIVE_TICK_INTERVAL_SECONDS", "1")),
         live_account_interval_seconds=float(os.getenv("LIVE_ACCOUNT_INTERVAL_SECONDS", "5")),
         live_candle_interval_seconds=float(os.getenv("LIVE_CANDLE_INTERVAL_SECONDS", "5")),

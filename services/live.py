@@ -46,6 +46,7 @@ from services.risk import (
     normalize_risk_state,
     risk_state_changed,
 )
+from services.shadow_outcome import ShadowOutcomeWorker
 from services.shadow_service import ShadowDecisionWorker, ShadowInput
 from services.worker_health import worker_health_ttl
 
@@ -88,6 +89,7 @@ class LiveDataEngine:
         self.history = HistoryRepository(database)
         self.health = SystemHealthRepository(database)
         self.shadow = ShadowDecisionWorker(settings, database, event_bus, logger=logger)
+        self.shadow_outcome = ShadowOutcomeWorker(settings, database, logger=logger)
         self.state = _LiveState()
         self.runtime_state = RuntimeState.STARTING
         self.started_at = datetime.now(UTC)
@@ -134,6 +136,7 @@ class LiveDataEngine:
                 asyncio.create_task(self._watchdog_loop(), name="live-watchdog"),
             ]
             self.shadow.start()
+            self.shadow_outcome.start()
             await self._publish(EventType.SYSTEM_LIVE_STARTED, "Live Data Engine started")
             await self._stop.wait()
         except asyncio.CancelledError:
@@ -165,6 +168,7 @@ class LiveDataEngine:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.shadow.stop()
+        await self.shadow_outcome.stop()
         await self.gateway.shutdown()
         self._set_runtime_state(RuntimeState.STOPPED, "Live Data Engine stopped")
         with contextlib.suppress(Exception):
@@ -586,11 +590,9 @@ class LiveDataEngine:
                     "candles": self.settings.live_candle_interval_seconds,
                     "history": self.settings.live_history_interval_seconds,
                 }.get(name, 30)
-                if (
-                    worker.last_attempted_at
-                    and (now - worker.last_attempted_at).total_seconds()
-                    > worker_health_ttl(interval)
-                ):
+                if worker.last_attempted_at and (
+                    now - worker.last_attempted_at
+                ).total_seconds() > worker_health_ttl(interval):
                     self.health.record(
                         f"worker:{name}",
                         "DEGRADED",

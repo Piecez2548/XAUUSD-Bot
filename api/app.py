@@ -1,4 +1,5 @@
 """Local-first FastAPI read API for the Trading Observatory."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ from persistence.orm import (
     PositionSnapshotRecord,
     RiskSnapshotRecord,
     ShadowDecisionRecord,
+    ShadowOutcomeRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
@@ -39,6 +41,13 @@ from persistence.orm import (
     TradeRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.shadow_outcome import (
+    OUTCOME_POLICY_VERSION,
+    performance_breakdown,
+)
+from services.shadow_outcome import (
+    performance_summary as shadow_performance_summary,
+)
 from services.worker_health import derive_worker_state, worker_health_payload, worker_health_ttl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -585,6 +594,36 @@ def create_app(
             "outcome_status": row.outcome_status,
         }
 
+    def _shadow_outcome_dict(row: ShadowOutcomeRecord) -> dict[str, Any]:
+        return {
+            "outcome_id": row.id,
+            "decision_id": row.decision_id,
+            "symbol": row.symbol,
+            "strategy_version": row.strategy_version,
+            "evaluation_policy_version": row.evaluation_policy_version,
+            "decision_m5_timestamp": row.decision_m5_timestamp,
+            "side": row.side,
+            "entry_price": row.entry_price,
+            "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit,
+            "initial_risk_distance": row.initial_risk_distance,
+            "target_r_multiple": row.target_r_multiple,
+            "evaluation_started_at": row.evaluation_started_at,
+            "terminal_candle_timestamp": row.terminal_candle_timestamp,
+            "terminal_status": row.terminal_status,
+            "exit_price": row.exit_price,
+            "realized_r": row.realized_r,
+            "bars_held": row.bars_held,
+            "max_favorable_excursion_price": row.max_favorable_excursion_price,
+            "max_adverse_excursion_price": row.max_adverse_excursion_price,
+            "mfe_r": row.mfe_r,
+            "mae_r": row.mae_r,
+            "evaluated_at": row.evaluated_at,
+            "reason_code": row.reason_code,
+            "read_only": True,
+            "execution_allowed": False,
+        }
+
     @app.get("/api/shadow/decision")
     def latest_shadow_decision() -> dict[str, Any] | None:
         with db.session() as session:
@@ -678,6 +717,65 @@ def create_app(
                 ),
                 "checked_at": now,
                 "read_only": True,
+            }
+        )
+        return payload
+
+    @app.get("/api/shadow/outcomes")
+    def shadow_outcomes(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
+        with db.session() as session:
+            rows = session.scalars(
+                select(ShadowOutcomeRecord)
+                .where(ShadowOutcomeRecord.evaluation_policy_version == OUTCOME_POLICY_VERSION)
+                .order_by(
+                    desc(ShadowOutcomeRecord.decision_m5_timestamp),
+                    desc(ShadowOutcomeRecord.created_at),
+                )
+                .limit(limit)
+            )
+            return [_shadow_outcome_dict(row) for row in rows]
+
+    @app.get("/api/shadow/outcome/{decision_id}")
+    def shadow_outcome(decision_id: str) -> dict[str, Any]:
+        with db.session() as session:
+            row = session.scalar(
+                select(ShadowOutcomeRecord).where(
+                    ShadowOutcomeRecord.decision_id == decision_id,
+                    ShadowOutcomeRecord.evaluation_policy_version == OUTCOME_POLICY_VERSION,
+                )
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="shadow outcome not found")
+            return _shadow_outcome_dict(row)
+
+    @app.get("/api/shadow/performance")
+    def shadow_performance() -> dict[str, Any]:
+        return shadow_performance_summary(db, policy_version=OUTCOME_POLICY_VERSION)
+
+    @app.get("/api/shadow/performance/breakdown")
+    def shadow_performance_breakdown() -> list[dict[str, Any]]:
+        return performance_breakdown(db, policy_version=OUTCOME_POLICY_VERSION)
+
+    @app.get("/api/shadow/outcome-health")
+    def shadow_outcome_health() -> dict[str, Any]:
+        now = datetime.now(UTC)
+        with db.session() as session:
+            row = session.scalar(
+                select(SystemHealthRecord)
+                .where(SystemHealthRecord.component == "worker:shadow_outcome")
+                .order_by(desc(SystemHealthRecord.timestamp), desc(SystemHealthRecord.id))
+                .limit(1)
+            )
+        payload = worker_health_payload(
+            row,
+            interval_seconds=max(15.0, runtime_settings.live_candle_interval_seconds * 4),
+            now=now,
+        )
+        payload.update(
+            {
+                "evaluation_policy_version": OUTCOME_POLICY_VERSION,
+                "read_only": True,
+                "execution_allowed": False,
             }
         )
         return payload
@@ -928,6 +1026,13 @@ def create_app(
                 interval_seconds=max(15.0, runtime_settings.live_account_interval_seconds * 4),
                 now=now,
             )
+            outcome_row = latest.get("worker:shadow_outcome")
+            outcome_state = derive_worker_state(
+                status=outcome_row["status"] if outcome_row else None,
+                timestamp=outcome_row["timestamp"] if outcome_row else None,
+                interval_seconds=max(15.0, runtime_settings.live_candle_interval_seconds * 4),
+                now=now,
+            )
             last_market_update = session.scalar(
                 select(MarketSnapshotRecord.timestamp)
                 .order_by(desc(MarketSnapshotRecord.timestamp))
@@ -945,6 +1050,7 @@ def create_app(
                     "live_engine": runtime_state,
                     "history_worker": history_state,
                     "shadow_worker": shadow_state,
+                    "shadow_outcome_worker": outcome_state,
                 },
                 "components": list(latest.values()),
                 "error_count": session.scalar(
@@ -1022,6 +1128,8 @@ def create_app(
                             if component == "worker:history"
                             else max(15.0, runtime_settings.live_account_interval_seconds * 4)
                             if component == "worker:shadow"
+                            else max(15.0, runtime_settings.live_candle_interval_seconds * 4)
+                            if component == "worker:shadow_outcome"
                             else runtime_settings.live_account_interval_seconds
                         ),
                         now=now,
@@ -1078,6 +1186,11 @@ def create_app(
                 "shadow_worker": worker_health_payload(
                     latest.get("worker:shadow"),
                     interval_seconds=max(15.0, runtime_settings.live_account_interval_seconds * 4),
+                    now=now,
+                ),
+                "shadow_outcome_worker": worker_health_payload(
+                    latest.get("worker:shadow_outcome"),
+                    interval_seconds=max(15.0, runtime_settings.live_candle_interval_seconds * 4),
                     now=now,
                 ),
             },

@@ -1,10 +1,11 @@
 """Transactional persistence services for snapshots, events, and query views."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
@@ -28,6 +29,7 @@ from persistence.orm import (
     PositionSnapshotRecord,
     RiskSnapshotRecord,
     ShadowDecisionRecord,
+    ShadowOutcomeRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
@@ -496,6 +498,133 @@ class ShadowDecisionRepository:
             return result
 
 
+class ShadowOutcomeRepository:
+    """Idempotent outcome persistence keyed by decision and policy version."""
+
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    def get(self, decision_id: str, policy_version: str) -> ShadowOutcomeRecord | None:
+        with self._database.session() as session:
+            return session.scalar(
+                select(ShadowOutcomeRecord).where(
+                    ShadowOutcomeRecord.decision_id == decision_id,
+                    ShadowOutcomeRecord.evaluation_policy_version == policy_version,
+                )
+            )
+
+    def ensure_pending(
+        self,
+        decision: ShadowDecisionRecord,
+        *,
+        policy_version: str,
+        status: str = "PENDING",
+        reason_code: str = "WAITING_FOR_FUTURE_CANDLES",
+    ) -> ShadowOutcomeRecord:
+        with self._database.session() as session:
+            existing = session.scalar(
+                select(ShadowOutcomeRecord).where(
+                    ShadowOutcomeRecord.decision_id == decision.id,
+                    ShadowOutcomeRecord.evaluation_policy_version == policy_version,
+                )
+            )
+            if existing is not None:
+                return existing
+            risk = _initial_risk(decision)
+            target_r = (
+                (abs(decision.take_profit - decision.entry_price) / risk)
+                if risk and decision.take_profit is not None and decision.entry_price is not None
+                else None
+            )
+            outcome = ShadowOutcomeRecord(
+                id=str(uuid4()),
+                decision_id=decision.id,
+                symbol=decision.symbol,
+                strategy_version=decision.strategy_version,
+                evaluation_policy_version=policy_version,
+                decision_m5_timestamp=decision.m5_candle_timestamp,
+                side=decision.decision,
+                entry_price=decision.entry_price,
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit,
+                initial_risk_distance=risk,
+                target_r_multiple=target_r,
+                evaluation_started_at=datetime.now(UTC),
+                terminal_status=status,
+                reason_code=reason_code,
+                source_snapshot_id=decision.market_snapshot_id,
+            )
+            session.add(outcome)
+            session.flush()
+            return outcome
+
+    def update(self, outcome_id: str, **values: object) -> ShadowOutcomeRecord:
+        with self._database.session() as session:
+            outcome = session.get(ShadowOutcomeRecord, outcome_id)
+            if outcome is None:
+                raise KeyError(f"shadow outcome not found: {outcome_id}")
+            for key, value in values.items():
+                if key in {"id", "decision_id", "evaluation_policy_version"}:
+                    continue
+                setattr(outcome, key, value)
+            decision = session.get(ShadowDecisionRecord, outcome.decision_id)
+            if decision is not None:
+                decision.outcome_status = outcome.terminal_status
+            session.flush()
+            return outcome
+
+    def list(
+        self, *, policy_version: str | None = None, limit: int = 500
+    ) -> list[ShadowOutcomeRecord]:
+        with self._database.session() as session:
+            query = select(ShadowOutcomeRecord)
+            if policy_version:
+                query = query.where(ShadowOutcomeRecord.evaluation_policy_version == policy_version)
+            return list(
+                session.scalars(
+                    query.order_by(
+                        ShadowOutcomeRecord.decision_m5_timestamp,
+                        ShadowOutcomeRecord.created_at,
+                        ShadowOutcomeRecord.id,
+                    ).limit(limit)
+                )
+            )
+
+    def unresolved_decisions(
+        self, *, policy_version: str, limit: int = 200
+    ) -> list[ShadowDecisionRecord]:
+        with self._database.session() as session:
+            existing = select(ShadowOutcomeRecord.decision_id).where(
+                ShadowOutcomeRecord.evaluation_policy_version == policy_version
+            )
+            return list(
+                session.scalars(
+                    select(ShadowDecisionRecord)
+                    .where(
+                        ShadowDecisionRecord.decision.in_(("BUY", "SELL")),
+                        ~ShadowDecisionRecord.id.in_(existing),
+                    )
+                    .order_by(
+                        ShadowDecisionRecord.m5_candle_timestamp,
+                        ShadowDecisionRecord.created_at,
+                        ShadowDecisionRecord.id,
+                    )
+                    .limit(limit)
+                )
+            )
+
+
+def _initial_risk(decision: ShadowDecisionRecord) -> float | None:
+    if decision.entry_price is None or decision.stop_loss is None:
+        return None
+    risk = (
+        decision.entry_price - decision.stop_loss
+        if decision.decision == "BUY"
+        else decision.stop_loss - decision.entry_price
+    )
+    return risk if risk > 0 else None
+
+
 class EventRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -634,24 +763,23 @@ class SystemHealthRepository:
         busy workers can push a quiet component out of that window.
         """
 
-        latest = (
-            select(
-                SystemHealthRecord.id,
-                func.row_number()
-                .over(
-                    partition_by=SystemHealthRecord.component,
-                    order_by=(SystemHealthRecord.timestamp.desc(), SystemHealthRecord.id.desc()),
-                )
-                .label("health_rank"),
+        latest = select(
+            SystemHealthRecord.id,
+            func.row_number()
+            .over(
+                partition_by=SystemHealthRecord.component,
+                order_by=(SystemHealthRecord.timestamp.desc(), SystemHealthRecord.id.desc()),
             )
-            .subquery()
-        )
+            .label("health_rank"),
+        ).subquery()
         return list(
             session.scalars(
-                select(SystemHealthRecord).join(
+                select(SystemHealthRecord)
+                .join(
                     latest,
                     SystemHealthRecord.id == latest.c.id,
-                ).where(latest.c.health_rank == 1)
+                )
+                .where(latest.c.health_rank == 1)
             ).all()
         )
 

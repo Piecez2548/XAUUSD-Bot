@@ -343,6 +343,49 @@ class ShadowDecisionRecord(IdMixin, Base):
     outcome_status: Mapped[str] = mapped_column(String(32), default="PENDING")
 
 
+class ShadowOutcomeRecord(IdMixin, Base):
+    """Durable, deterministic evaluation of one hypothetical trade."""
+
+    __tablename__ = "shadow_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "decision_id",
+            "evaluation_policy_version",
+            name="uq_shadow_outcome_policy",
+        ),
+        Index("ix_shadow_outcomes_terminal_time", "terminal_candle_timestamp"),
+        Index("ix_shadow_outcomes_status", "terminal_status"),
+    )
+
+    decision_id: Mapped[str] = mapped_column(ForeignKey("shadow_decisions.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), index=True)
+    evaluation_policy_version: Mapped[str] = mapped_column(String(64), index=True)
+    decision_m5_timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
+    side: Mapped[str] = mapped_column(String(16))
+    entry_price: Mapped[float | None] = mapped_column(Float)
+    stop_loss: Mapped[float | None] = mapped_column(Float)
+    take_profit: Mapped[float | None] = mapped_column(Float)
+    initial_risk_distance: Mapped[float | None] = mapped_column(Float)
+    target_r_multiple: Mapped[float | None] = mapped_column(Float)
+    evaluation_started_at: Mapped[datetime] = mapped_column(UtcDateTime())
+    terminal_candle_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime(), index=True)
+    terminal_status: Mapped[str] = mapped_column(String(32), index=True)
+    exit_price: Mapped[float | None] = mapped_column(Float)
+    realized_r: Mapped[float | None] = mapped_column(Float)
+    bars_held: Mapped[int] = mapped_column(Integer, default=0)
+    max_favorable_excursion_price: Mapped[float | None] = mapped_column(Float)
+    max_adverse_excursion_price: Mapped[float | None] = mapped_column(Float)
+    mfe_r: Mapped[float | None] = mapped_column(Float)
+    mae_r: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
+    evaluated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    reason_code: Mapped[str] = mapped_column(String(64))
+    source_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("market_snapshots.id"), index=True
+    )
+
+
 class RiskSnapshotRecord(IdMixin, Base):
     __tablename__ = "risk_snapshots"
 

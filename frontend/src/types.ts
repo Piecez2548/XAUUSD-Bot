@@ -253,6 +253,50 @@ export interface ShadowHealthResponse {
   read_only: boolean;
 }
 
+export interface ShadowOutcome {
+  outcome_id: string;
+  decision_id: string;
+  symbol: string;
+  strategy_version: string;
+  evaluation_policy_version: string;
+  decision_m5_timestamp: string;
+  side: "BUY" | "SELL";
+  terminal_status: "PENDING" | "TP_HIT" | "SL_HIT" | "AMBIGUOUS" | "EXPIRED" | "INVALID";
+  realized_r: number | null;
+  bars_held: number;
+  mfe_r: number | null;
+  mae_r: number | null;
+  reason_code: string;
+  execution_allowed: false;
+}
+
+export interface ShadowOutcomeHealth {
+  state: ServiceState;
+  observed_at: string | null;
+  age_seconds: number | null;
+  evaluation_policy_version: string;
+  execution_allowed: false;
+}
+
+export interface ShadowPerformance {
+  eligible_trades: number;
+  resolved_sample_size: number;
+  pending: number;
+  tp_hits: number;
+  sl_hits: number;
+  ambiguous: number;
+  expired: number;
+  invalid: number;
+  no_trade_rate: number | null;
+  win_rate: number | null;
+  average_r: number | null;
+  total_r: number | null;
+  expectancy_r: number | null;
+  profit_factor: number | null;
+  max_drawdown_r: number | null;
+  execution_allowed: false;
+}
+
 export interface SupervisorResponse {
   components: Record<string, {
     pid: number | null;

@@ -1,4 +1,5 @@
 """Authenticated Telegram control plane for local monitoring infrastructure."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -26,11 +27,13 @@ from persistence.orm import (
     PositionSnapshotRecord,
     RiskSnapshotRecord,
     ShadowDecisionRecord,
+    ShadowOutcomeRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
 )
 from persistence.repositories import ControlAuditRepository, SystemHealthRepository
+from services.shadow_outcome import OUTCOME_POLICY_VERSION, performance_summary
 from services.supervisor import ProcessSupervisor
 from services.worker_health import derive_worker_state
 
@@ -47,6 +50,9 @@ COMMAND_HELP = {
     "/decision": "Show latest shadow decision",
     "/shadow": "Show shadow decision summary",
     "/shadowhealth": "Show shadow worker liveness",
+    "/outcome": "Show recent shadow outcomes",
+    "/performance": "Show shadow performance summary",
+    "/outcomehealth": "Show shadow outcome worker liveness",
     "/strategy": "Show deterministic baseline rules",
     "/logs": "Show safe recent operational events",
     "/help": "Show available commands",
@@ -232,6 +238,9 @@ class TelegramControlService:
             "/decision": self._decision,
             "/shadow": self._shadow,
             "/shadowhealth": self._shadowhealth,
+            "/outcome": self._outcome,
+            "/performance": self._performance,
+            "/outcomehealth": self._outcomehealth,
             "/strategy": self._strategy,
             "/logs": self._logs,
             "/help": self._help,
@@ -359,6 +368,7 @@ class TelegramControlService:
         statuses["mt5"] = self._latest_service_state("mt5")
         statuses["worker:history"] = self._history_worker_state()
         statuses["worker:shadow"] = self._shadow_worker_state()
+        statuses["worker:shadow_outcome"] = self._shadow_outcome_worker_state()
         lines = ["SYSTEM HEALTH"]
         for name, default in (
             ("supervisor", "HEALTHY"),
@@ -368,8 +378,11 @@ class TelegramControlService:
             ("telegram", self._telegram_state()),
             ("worker:history", "UNKNOWN"),
             ("worker:shadow", "UNKNOWN"),
+            ("worker:shadow_outcome", "UNKNOWN"),
         ):
-            lines.append(f"{name.replace('_', ' ').title():16}{statuses.get(name, default)}")
+            label = name.replace('_', ' ').title()
+            label_width = max(16, len(label) + 2)
+            lines.append(f"{label:<{label_width}}{statuses.get(name, default)}")
         return "\n".join(lines)
 
     def _history_worker_state(self) -> str:
@@ -401,6 +414,20 @@ class TelegramControlService:
             status=row.status if row else None,
             timestamp=row.timestamp if row else None,
             interval_seconds=max(15.0, self.settings.live_account_interval_seconds * 4),
+        )
+
+    def _shadow_outcome_worker_state(self) -> str:
+        with self.database.session() as session:
+            row = session.scalar(
+                select(SystemHealthRecord)
+                .where(SystemHealthRecord.component == "worker:shadow_outcome")
+                .order_by(desc(SystemHealthRecord.timestamp), desc(SystemHealthRecord.id))
+                .limit(1)
+            )
+        return derive_worker_state(
+            status=row.status if row else None,
+            timestamp=row.timestamp if row else None,
+            interval_seconds=max(15.0, self.settings.live_candle_interval_seconds * 4),
         )
 
     def _shadowhealth(self) -> str:
@@ -542,7 +569,10 @@ class TelegramControlService:
         with self.database.session() as session:
             row = session.scalar(
                 select(ShadowDecisionRecord)
-                .order_by(desc(ShadowDecisionRecord.created_at))
+                .order_by(
+                    desc(ShadowDecisionRecord.m5_candle_timestamp),
+                    desc(ShadowDecisionRecord.created_at),
+                )
                 .limit(1)
             )
         if row is None:
@@ -599,6 +629,63 @@ class TelegramControlService:
             f"NO_TRADE: {counts.get('NO_TRADE', 0)}\n"
             f"Pending outcomes: {pending}\nExecution: DISABLED"
         )
+
+    def _outcome(self) -> str:
+        with self.database.session() as session:
+            rows = session.scalars(
+                select(ShadowOutcomeRecord)
+                .where(ShadowOutcomeRecord.evaluation_policy_version == OUTCOME_POLICY_VERSION)
+                .order_by(
+                    desc(ShadowOutcomeRecord.decision_m5_timestamp),
+                    desc(ShadowOutcomeRecord.created_at),
+                )
+                .limit(5)
+            ).all()
+        if not rows:
+            return "SHADOW OUTCOMES\nNo evaluated shadow outcomes yet.\nExecution: DISABLED"
+        lines = ["SHADOW OUTCOMES"]
+        for row in rows:
+            value = "UNKNOWN" if row.realized_r is None else f"{row.realized_r:.3f}R"
+            lines.append(
+                f"{row.decision_m5_timestamp.isoformat()} {row.side} {row.terminal_status} {value}"
+            )
+        lines.append("Execution: DISABLED")
+        return "\n".join(lines)
+
+    def _performance(self) -> str:
+        report = performance_summary(self.database, policy_version=OUTCOME_POLICY_VERSION)
+
+        def fmt(value):
+            return (
+                "UNKNOWN"
+                if value is None
+                else f"{value:.3f}"
+                if isinstance(value, float)
+                else str(value)
+            )
+
+        return (
+            "SHADOW PERFORMANCE\n"
+            f"Eligible: {report['eligible_trades']} Resolved: {report['resolved_sample_size']}\n"
+            f"TP: {report['tp_hits']} SL: {report['sl_hits']} Ambiguous: {report['ambiguous']} Expired: {report['expired']}\n"
+            f"Win rate: {fmt(report['win_rate'])} Average R: {fmt(report['average_r'])} Total R: {fmt(report['total_r'])}\n"
+            "Execution: DISABLED"
+        )
+
+    def _outcomehealth(self) -> str:
+        with self.database.session() as session:
+            row = session.scalar(
+                select(SystemHealthRecord)
+                .where(SystemHealthRecord.component == "worker:shadow_outcome")
+                .order_by(desc(SystemHealthRecord.timestamp), desc(SystemHealthRecord.id))
+                .limit(1)
+            )
+        state = derive_worker_state(
+            status=row.status if row else None,
+            timestamp=row.timestamp if row else None,
+            interval_seconds=max(15.0, self.settings.live_candle_interval_seconds * 4),
+        )
+        return f"SHADOW OUTCOME HEALTH\nState: {state}\nObserved: {row.timestamp.isoformat() if row else 'UNKNOWN'}\nExecution: DISABLED"
 
     @staticmethod
     def _strategy() -> str:

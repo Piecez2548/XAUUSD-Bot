@@ -1,4 +1,5 @@
 """Database-backed realtime event fan-out for local and multi-process operation."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -117,7 +118,8 @@ class RealtimeHub:
                             timestamp=row.timestamp,
                             interval_seconds=self._history_interval_seconds,
                         )
-                        if row.component in {"worker:history", "worker:shadow"}
+                        if row.component
+                        in {"worker:history", "worker:shadow", "worker:shadow_outcome"}
                         else row.status
                     ),
                     "timestamp": row.timestamp.isoformat(),
