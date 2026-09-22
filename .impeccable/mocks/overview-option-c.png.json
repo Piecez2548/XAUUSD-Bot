@@ -1,0 +1,5 @@
+{
+  "prompt": "High-fidelity desktop web application comp, 1440x900 landscape, composition option C for an XAUUSD AI Trader read-only Trading Observatory. Emphasize an operations console and realtime Event Stream while retaining a dark institutional trading terminal, left navigation, compact system status bar, account and XAUUSD market telemetry, system health, aggregate risk budget, audit activity, open positions and recent trades. Event rows show UTC, severity, source, event name, description and correlation ID with filtering and auto-scroll affordances. Use charcoal navy #0B1117, panel #151A22, border #262C36, restrained semantic colors, dense legible typography, subtle borders, no gradients or neon, no fabricated metrics, no trading controls, prominent READ ONLY and ORDER EXECUTION DISABLED.",
+  "approved": false,
+  "concept": "operations console"
+}

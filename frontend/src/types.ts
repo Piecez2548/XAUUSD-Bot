@@ -1,0 +1,291 @@
+export type ServiceState =
+  | "ONLINE"
+  | "CONNECTED"
+  | "DEGRADED"
+  | "DISCONNECTED"
+  | "STARTING"
+  | "RECONNECTING"
+  | "STOPPED"
+  | "DISABLED"
+  | "PLANNED"
+  | "ERROR"
+  | "UNKNOWN";
+
+export interface AccountSnapshot {
+  timestamp: string;
+  balance: number;
+  equity: number;
+  margin: number;
+  free_margin: number;
+  margin_level: number;
+  profit: number;
+  leverage: number;
+  currency: string;
+  server: string;
+  trade_mode: number;
+}
+
+export interface SymbolSnapshot {
+  timestamp: string;
+  name: string;
+  bid: number;
+  ask: number;
+  spread: number;
+  digits: number;
+  point: number;
+  trade_mode: string | null;
+  session: string | null;
+  market_status: string;
+}
+
+export interface Position {
+  position_id: string;
+  broker_ticket: number;
+  direction: string;
+  open_time: string;
+  volume: number;
+  open_price: number;
+  current_price: number;
+  stop_loss: number;
+  take_profit: number;
+  profit: number;
+  swap: number;
+  observed_at?: string | null;
+  snapshot_id?: string | null;
+  freshness?: "LIVE" | "STALE" | "STATE_SYNC_PENDING" | "UNKNOWN";
+}
+
+export interface PositionStatus {
+  open_positions: number;
+  observed_at: string | null;
+  snapshot_id: string | null;
+  freshness: "LIVE" | "STALE" | "STATE_SYNC_PENDING" | "UNKNOWN";
+  read_only: boolean;
+}
+
+export interface Trade {
+  trade_id: string;
+  broker_ticket: number | null;
+  direction: string;
+  entry_time: string | null;
+  entry_price: number | null;
+  exit_time: string | null;
+  exit_price: number | null;
+  volume: number | null;
+  initial_stop_loss: number | null;
+  initial_take_profit: number | null;
+  final_stop_loss: number | null;
+  final_take_profit: number | null;
+  risk_percent: number | null;
+  planned_rr: number | null;
+  net_profit: number | null;
+  realized_r: number | null;
+  duration_seconds: number | null;
+  mae: number | null;
+  mfe: number | null;
+  exit_reason: string | null;
+  session: string | null;
+  market_regime: string | null;
+  strategy_version: string | null;
+  prompt_version: string | null;
+  model_version: string | null;
+  ai_decision_id: string | null;
+}
+
+export interface TradeEvent {
+  event_id: string;
+  timestamp: string;
+  event_type: string;
+  price: number | null;
+  volume: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  pnl: number | null;
+  reason: string | null;
+  source: string;
+}
+
+export interface AiDecision {
+  decision_id: string;
+  timestamp: string;
+  action: "BUY" | "SELL" | "WAIT" | "HOLD" | "MODIFY" | "CLOSE";
+  confidence: number | null;
+  structured_rationale: Record<string, unknown>;
+  requested_risk_percent: number | null;
+  validation_status: string | null;
+  execution_status: string | null;
+  model_name: string | null;
+  model_version: string | null;
+  prompt_version: string | null;
+  result_trade_id: string | null;
+}
+
+export interface ShadowDecision {
+  decision_id: string;
+  created_at: string;
+  market_snapshot_id: string | null;
+  symbol: string;
+  m5_candle_timestamp: string;
+  decision: "BUY" | "SELL" | "NO_TRADE";
+  market_regime: string;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  risk_reward_ratio: number | null;
+  requested_risk_percent: number | null;
+  approved_risk_percent: number | null;
+  hypothetical_volume: number | null;
+  confidence: number | null;
+  strategy_name: string;
+  strategy_version: string;
+  reason_codes: string[];
+  human_readable_reason: string;
+  risk_gate_state: string;
+  data_freshness: string;
+  execution_allowed: false;
+  outcome_status: string;
+}
+
+export interface RiskSnapshot {
+  timestamp: string;
+  equity: number;
+  balance: number;
+  open_risk_percent: number | null;
+  remaining_risk_percent: number | null;
+  drawdown_percent: number | null;
+  max_trade_risk_percent: number;
+  max_aggregate_risk_percent: number;
+  shadow_engine_enabled: boolean;
+  shadow_decision_timeframe: string;
+  shadow_min_rr: number;
+  shadow_notify_signals: boolean;
+  shadow_notify_no_trade: boolean;
+  open_positions_count: number;
+  unbounded_positions_count: number;
+  daily_pnl: number | null;
+  daily_realized_loss: number | null;
+  margin_usage_percent: number | null;
+  risk_per_position: Array<{
+    ticket: number;
+    risk_percent: number | null;
+    risk_amount: number | null;
+    bounded_by_stop: boolean;
+  }>;
+  observed_at?: string | null;
+  snapshot_id?: string | null;
+  freshness?: "LIVE" | "STALE" | "STATE_SYNC_PENDING" | "UNKNOWN";
+  read_only?: boolean;
+}
+
+export interface SystemEvent {
+  event_id: string;
+  event_type: string;
+  timestamp: string;
+  source: string;
+  severity: "DEBUG" | "INFO" | "SUCCESS" | "WARNING" | "ERROR" | "CRITICAL";
+  correlation_id: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface HealthResponse {
+  database: ServiceState;
+  services: Record<string, ServiceState>;
+  components: Array<{
+    component: string;
+    status: string;
+    timestamp: string;
+    latency_ms: number | null;
+    message: string | null;
+  }>;
+  error_count: number;
+  checked_at: string;
+  started_at: string;
+  uptime_seconds: number;
+  last_market_update: string | null;
+  websocket_clients: number;
+  database_identity?: string;
+}
+
+export interface LiveStatusResponse {
+  state: string;
+  symbol: string | null;
+  updated_at: string | null;
+  freshness: Record<string, { state: string; observed_at: string | null; age_seconds: number | null }>;
+  workers: Array<{
+    name: string;
+    state: string;
+    last_success_at: string | null;
+    last_failed_at?: string | null;
+    failure_count?: number;
+    message: string | null;
+  }>;
+  read_only: boolean;
+}
+
+export interface ShadowHealthResponse {
+  state: ServiceState;
+  observed_at: string | null;
+  age_seconds: number | null;
+  last_success_at: string | null;
+  last_failed_at: string | null;
+  queue_depth: number;
+  queue_capacity?: number;
+  deferred_count?: number;
+  catchup_pending_count?: number;
+  total_backlog?: number;
+  processing_lag_seconds?: number | null;
+  latest_available_m5?: string | null;
+  latest_received_m5?: string | null;
+  latest_processed_m5?: string | null;
+  latest_decision_m5?: string | null;
+  last_failure?: string | null;
+  error_category: string | null;
+  latest_persisted_m5?: string | null;
+  latest_completed_snapshot?: {
+    id: string;
+    timestamp: string;
+    latest_m5: string | null;
+  } | null;
+  last_received_candle_at?: string | null;
+  last_processed_candle_at?: string | null;
+  last_decision_at?: string | null;
+  execution_allowed: false;
+  read_only: boolean;
+}
+
+export interface SupervisorResponse {
+  components: Record<string, {
+    pid: number | null;
+    state: string;
+    started_at: string | null;
+    last_heartbeat: string | null;
+    exit_code: number | null;
+    restart_count: number;
+  }>;
+  read_only: boolean;
+  execution: string;
+}
+
+export interface PerformancePoint {
+  trade_id: string;
+  timestamp: string;
+  cumulative_net_profit?: number;
+  drawdown?: number;
+}
+
+export interface AccountCurvePoint {
+  snapshot_id: string;
+  timestamp: string;
+  equity: number;
+  balance: number;
+  drawdown_percent: number | null;
+}
+
+export interface PublicConfig {
+  telegram_enabled: boolean;
+  telegram_control_enabled: boolean;
+  max_trade_risk_percent: number;
+  max_aggregate_risk_percent: number;
+  read_only: boolean;
+  timezone: string;
+}

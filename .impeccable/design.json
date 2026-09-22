@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-21T17:21:51.4626568Z",
+  "title": "Design System: XAUUSD AI Trader — Trading Observatory",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Observatory Canvas",
+        "canonical": "#0b1117",
+        "tonalRamp": ["oklch(15% 0.016 248.7)", "oklch(26% 0.016 248.7)", "oklch(38% 0.016 248.7)", "oklch(50% 0.016 248.7)", "oklch(62% 0.016 248.7)", "oklch(74% 0.016 248.7)", "oklch(86% 0.016 248.7)", "oklch(95% 0.016 248.7)"]
+      },
+      "sidebar": {
+        "role": "neutral",
+        "displayName": "Navigation Charcoal",
+        "canonical": "#0d131a",
+        "tonalRamp": ["oklch(15% 0.017 252.6)", "oklch(26% 0.017 252.6)", "oklch(38% 0.017 252.6)", "oklch(50% 0.017 252.6)", "oklch(62% 0.017 252.6)", "oklch(74% 0.017 252.6)", "oklch(86% 0.017 252.6)", "oklch(95% 0.017 252.6)"]
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Graphite Panel",
+        "canonical": "#151a22",
+        "tonalRamp": ["oklch(15% 0.018 259.7)", "oklch(26% 0.018 259.7)", "oklch(38% 0.018 259.7)", "oklch(50% 0.018 259.7)", "oklch(62% 0.018 259.7)", "oklch(74% 0.018 259.7)", "oklch(86% 0.018 259.7)", "oklch(95% 0.018 259.7)"]
+      },
+      "panel-raised": {
+        "role": "neutral",
+        "displayName": "Raised Graphite",
+        "canonical": "#181f28",
+        "tonalRamp": ["oklch(15% 0.020 254.9)", "oklch(26% 0.020 254.9)", "oklch(38% 0.020 254.9)", "oklch(50% 0.020 254.9)", "oklch(62% 0.020 254.9)", "oklch(74% 0.020 254.9)", "oklch(86% 0.020 254.9)", "oklch(95% 0.020 254.9)"]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Graphite Seam",
+        "canonical": "#262c36",
+        "tonalRamp": ["oklch(15% 0.020 260.6)", "oklch(26% 0.020 260.6)", "oklch(38% 0.020 260.6)", "oklch(50% 0.020 260.6)", "oklch(62% 0.020 260.6)", "oklch(74% 0.020 260.6)", "oklch(86% 0.020 260.6)", "oklch(95% 0.020 260.6)"]
+      },
+      "line-strong": {
+        "role": "neutral",
+        "displayName": "Strong Graphite Seam",
+        "canonical": "#303945",
+        "tonalRamp": ["oklch(15% 0.024 255.7)", "oklch(26% 0.024 255.7)", "oklch(38% 0.024 255.7)", "oklch(50% 0.024 255.7)", "oklch(62% 0.024 255.7)", "oklch(74% 0.024 255.7)", "oklch(86% 0.024 255.7)", "oklch(95% 0.024 255.7)"]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Telemetry White",
+        "canonical": "#e7ecf3",
+        "tonalRamp": ["oklch(15% 0.011 256.7)", "oklch(26% 0.011 256.7)", "oklch(38% 0.011 256.7)", "oklch(50% 0.011 256.7)", "oklch(62% 0.011 256.7)", "oklch(74% 0.011 256.7)", "oklch(86% 0.011 256.7)", "oklch(95% 0.011 256.7)"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Steel",
+        "canonical": "#8d99a8",
+        "tonalRamp": ["oklch(15% 0.026 254.0)", "oklch(26% 0.026 254.0)", "oklch(38% 0.026 254.0)", "oklch(50% 0.026 254.0)", "oklch(62% 0.026 254.0)", "oklch(74% 0.026 254.0)", "oklch(86% 0.026 254.0)", "oklch(95% 0.026 254.0)"]
+      },
+      "dim": {
+        "role": "neutral",
+        "displayName": "Dim Steel",
+        "canonical": "#96a3b3",
+        "tonalRamp": ["oklch(15% 0.028 253.6)", "oklch(26% 0.028 253.6)", "oklch(38% 0.028 253.6)", "oklch(50% 0.028 253.6)", "oklch(62% 0.028 253.6)", "oklch(74% 0.028 253.6)", "oklch(86% 0.028 253.6)", "oklch(95% 0.028 253.6)"]
+      },
+      "signal-green": {
+        "role": "secondary",
+        "displayName": "Signal Green",
+        "canonical": "#3bc784",
+        "tonalRamp": ["oklch(15% 0.154 157.8)", "oklch(26% 0.154 157.8)", "oklch(38% 0.154 157.8)", "oklch(50% 0.154 157.8)", "oklch(62% 0.154 157.8)", "oklch(74% 0.154 157.8)", "oklch(86% 0.154 157.8)", "oklch(95% 0.154 157.8)"]
+      },
+      "caution-amber": {
+        "role": "tertiary",
+        "displayName": "Caution Amber",
+        "canonical": "#e8b04a",
+        "tonalRamp": ["oklch(15% 0.134 79.5)", "oklch(26% 0.134 79.5)", "oklch(38% 0.134 79.5)", "oklch(50% 0.134 79.5)", "oklch(62% 0.134 79.5)", "oklch(74% 0.134 79.5)", "oklch(86% 0.134 79.5)", "oklch(95% 0.134 79.5)"]
+      },
+      "fault-red": {
+        "role": "tertiary",
+        "displayName": "Fault Red",
+        "canonical": "#ef6262",
+        "tonalRamp": ["oklch(15% 0.175 23.0)", "oklch(26% 0.175 23.0)", "oklch(38% 0.175 23.0)", "oklch(50% 0.175 23.0)", "oklch(62% 0.175 23.0)", "oklch(74% 0.175 23.0)", "oklch(86% 0.175 23.0)", "oklch(95% 0.175 23.0)"]
+      },
+      "information-blue": {
+        "role": "primary",
+        "displayName": "Information Blue",
+        "canonical": "#64a7f2",
+        "tonalRamp": ["oklch(15% 0.130 252.5)", "oklch(26% 0.130 252.5)", "oklch(38% 0.130 252.5)", "oklch(50% 0.130 252.5)", "oklch(62% 0.130 252.5)", "oklch(74% 0.130 252.5)", "oklch(86% 0.130 252.5)", "oklch(95% 0.130 252.5)"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Page Display", "purpose": "Compact page titles only." },
+      "title": { "displayName": "Panel Title", "purpose": "Panel headers and primary module labels." },
+      "body": { "displayName": "Operational Body", "purpose": "Dense descriptions, labels, values, and explanations." },
+      "label": { "displayName": "Telemetry Label", "purpose": "Uppercase kickers, filters, table headers, and status labels." },
+      "mono": { "displayName": "Monospaced Telemetry", "purpose": "Numbers, UTC timestamps, tickets, identifiers, prices, percentages, and counts." }
+    },
+    "shadows": [
+      { "name": "mobile-drawer", "value": "18px 0 45px #0009", "purpose": "Separates the open navigation drawer from the scrim-covered workspace below 1050px." },
+      { "name": "focus-ring", "value": "0 0 0 2px var(--canvas), 0 0 0 4px var(--blue)", "purpose": "Makes keyboard focus visible on buttons, links, fields, and selects." }
+    ],
+    "motion": [
+      { "name": "state-fast", "value": "150ms ease", "purpose": "Navigation foreground and background state changes." },
+      { "name": "drawer-standard", "value": "200ms ease", "purpose": "Off-canvas navigation movement." },
+      { "name": "reduced-motion", "value": "0.001ms", "purpose": "Collapses animation and transition duration when reduced motion is requested." }
+    ],
+    "breakpoints": [
+      { "name": "compact-desktop", "value": "1360px" },
+      { "name": "drawer", "value": "1050px" },
+      { "name": "mobile", "value": "760px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Panel Card",
+      "kind": "card",
+      "refersTo": "panel-card",
+      "description": "The default bordered container for verified state, charts, timelines, and tables.",
+      "html": "<section class=\"ds-panel\"><header class=\"ds-panel-header\"><h2 class=\"ds-panel-title\">System Health</h2><span class=\"ds-panel-kicker\">TRUTHFUL SERVICE STATE</span></header><div class=\"ds-panel-body\">Verified operational content</div></section>",
+      "css": ".ds-panel { overflow: hidden; color: var(--text, #e7ecf3); background: var(--panel, #151a22); border: 1px solid var(--line, #262c36); border-radius: var(--radius, 10px); font-family: \"Segoe UI Variable\", \"Segoe UI\", sans-serif; } .ds-panel-header { min-height: 51px; padding: 11px 14px; display: flex; align-items: baseline; gap: 9px; border-bottom: 1px solid var(--line, #262c36); } .ds-panel-title { margin: 0; font: 700 13px/1.1 Bahnschrift, \"Aptos Display\", sans-serif; } .ds-panel-kicker { color: var(--dim, #96a3b3); font-size: 9px; font-weight: 650; } .ds-panel-body { padding: 14px; color: var(--muted, #8d99a8); font-size: 10px; }"
+    },
+    {
+      "name": "Text Action",
+      "kind": "button",
+      "refersTo": "button-text",
+      "description": "A compact non-execution action for exports and secondary utilities.",
+      "html": "<button class=\"ds-btn-text\" type=\"button\"><svg class=\"ds-btn-icon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" aria-hidden=\"true\"><path d=\"M12 3v12m0 0 4-4m-4 4-4-4M5 21h14\"/></svg>Export CSV</button>",
+      "css": ".ds-btn-text { height: 28px; padding: 0 9px; display: inline-flex; align-items: center; gap: 5px; color: var(--blue, #64a7f2); background: #111d28; border: 1px solid #31485e; border-radius: 5px; font: 400 9px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; cursor: pointer; transition: color 150ms ease, background 150ms ease; } .ds-btn-text:hover { color: var(--text, #e7ecf3); background: #172431; } .ds-btn-text:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--canvas, #0b1117), 0 0 0 4px var(--blue, #64a7f2); } .ds-btn-text:active { background: #23303c; } .ds-btn-icon { flex: none; }"
+    },
+    {
+      "name": "Range Control",
+      "kind": "button",
+      "refersTo": "range-control",
+      "description": "The implemented segmented control for Equity & Drawdown time windows.",
+      "html": "<div class=\"ds-range\" role=\"group\" aria-label=\"Chart range\"><button class=\"ds-range-btn\" type=\"button\">1D</button><button class=\"ds-range-btn\" type=\"button\">1W</button><button class=\"ds-range-btn ds-range-active\" type=\"button\" aria-pressed=\"true\">ALL</button></div>",
+      "css": ".ds-range { display: inline-flex; padding: 2px; background: #10161d; border: 1px solid var(--line, #262c36); border-radius: 6px; } .ds-range-btn { min-width: 35px; height: 23px; padding: 0 8px; color: var(--dim, #96a3b3); background: transparent; border: 0; border-radius: 4px; font: 700 8px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; cursor: pointer; transition: color 150ms ease, background 150ms ease; } .ds-range-btn:hover { color: var(--text, #e7ecf3); } .ds-range-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--canvas, #0b1117), 0 0 0 4px var(--blue, #64a7f2); } .ds-range-btn:active, .ds-range-active { color: var(--text, #e7ecf3); background: #23303c; }"
+    },
+    {
+      "name": "Filter Field",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "The compact dark field used for event and ledger filtering.",
+      "html": "<label class=\"ds-field-label\">SEVERITY<select class=\"ds-field\"><option>ALL</option><option>WARNING</option><option>ERROR</option></select></label>",
+      "css": ".ds-field-label { display: inline-flex; align-items: center; gap: 6px; color: var(--dim, #96a3b3); font: 700 8px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; letter-spacing: .07em; } .ds-field { height: 34px; padding: 0 24px 0 9px; color: var(--text, #e7ecf3); background: #10161d; border: 1px solid var(--line-strong, #303945); border-radius: 6px; font: 400 10px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; } .ds-field:hover { border-color: #3b4654; } .ds-field:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--canvas, #0b1117), 0 0 0 4px var(--blue, #64a7f2); }"
+    },
+    {
+      "name": "Active Navigation Item",
+      "kind": "nav",
+      "refersTo": "nav-active",
+      "description": "The selected destination in the desktop rail or mobile drawer.",
+      "html": "<a class=\"ds-nav-active\" href=\"#\"><svg class=\"ds-nav-icon\" width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\"/></svg>Overview</a>",
+      "css": ".ds-nav-active { position: relative; min-height: 38px; padding: 0 11px; display: inline-flex; align-items: center; gap: 11px; color: #e9f3ff; background: #172431; border-radius: 7px; font: 600 12px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; text-decoration: none; transition: color 150ms ease, background 150ms ease; } .ds-nav-active::before { content: \"\"; position: absolute; left: -8px; width: 2px; height: 20px; background: var(--blue, #64a7f2); } .ds-nav-active:hover { color: var(--text, #e7ecf3); background: #1b2b3a; } .ds-nav-active:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--canvas, #0b1117), 0 0 0 4px var(--blue, #64a7f2); } .ds-nav-active:active { background: #23303c; } .ds-nav-icon { flex: none; }"
+    },
+    {
+      "name": "Connected Status Pill",
+      "kind": "chip",
+      "refersTo": "status-connected",
+      "description": "Verified connected or healthy service state with redundant text and shape cues.",
+      "html": "<span class=\"ds-status ds-status-good\"><span class=\"ds-status-dot\" aria-hidden=\"true\"></span><span class=\"ds-status-label\">DB</span><strong class=\"ds-status-value\">CONNECTED</strong></span>",
+      "css": ".ds-status { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; font-family: \"Segoe UI Variable\", \"Segoe UI\", sans-serif; font-size: 8px; letter-spacing: .04em; white-space: nowrap; } .ds-status-good { color: var(--green, #3bc784); background: #102019; border: 1px solid #254838; } .ds-status-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; } .ds-status-label { color: #a3adba; } .ds-status-value { font-size: 8px; letter-spacing: .06em; }"
+    },
+    {
+      "name": "Warning Status Pill",
+      "kind": "chip",
+      "refersTo": "status-warning",
+      "description": "Unknown, degraded, or planned service state with explicit amber language.",
+      "html": "<span class=\"ds-status ds-status-warn\"><span class=\"ds-status-dot\" aria-hidden=\"true\"></span><span class=\"ds-status-label\">MT5</span><strong class=\"ds-status-value\">UNKNOWN</strong></span>",
+      "css": ".ds-status { height: 24px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; font-family: \"Segoe UI Variable\", \"Segoe UI\", sans-serif; font-size: 8px; letter-spacing: .04em; white-space: nowrap; } .ds-status-warn { color: var(--amber, #e8b04a); background: #1d190f; border: 1px solid #493b25; } .ds-status-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; } .ds-status-label { color: #a3adba; } .ds-status-value { font-size: 8px; letter-spacing: .06em; }"
+    },
+    {
+      "name": "Audit Timeline Item",
+      "kind": "custom",
+      "refersTo": "audit-timeline-item",
+      "description": "The signature chronological unit for real persisted domain events.",
+      "html": "<div class=\"ds-audit-item\"><time class=\"ds-audit-time\">16:44:08</time><span class=\"ds-audit-marker\" aria-hidden=\"true\"><svg class=\"ds-audit-icon\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/></svg></span><div class=\"ds-audit-copy\"><strong class=\"ds-audit-title\">MARKET SNAPSHOT CREATED</strong><p class=\"ds-audit-description\">XAUUSD snapshot persisted</p><small class=\"ds-audit-meta\">observatory · 1d8cdaa8</small></div></div>",
+      "css": ".ds-audit-item { min-height: 57px; display: grid; grid-template-columns: 57px 21px minmax(0, 1fr); gap: 7px; color: var(--text, #e7ecf3); font-family: \"Segoe UI Variable\", \"Segoe UI\", sans-serif; } .ds-audit-time { padding-top: 2px; color: var(--dim, #96a3b3); font: 400 9px \"Cascadia Code\", Consolas, monospace; } .ds-audit-marker { width: 21px; height: 21px; display: grid; place-items: center; color: var(--blue, #64a7f2); background: var(--panel, #151a22); border-radius: 50%; } .ds-audit-title { display: block; color: #dce3eb; font-size: 10px; letter-spacing: .025em; } .ds-audit-description { margin: 3px 0; color: var(--muted, #8d99a8); font-size: 10px; } .ds-audit-meta { color: var(--dim, #96a3b3); font-size: 8px; }"
+    },
+    {
+      "name": "Event Severity Tag",
+      "kind": "chip",
+      "refersTo": "event-severity-info",
+      "description": "A compact text-labeled severity token for the realtime event table.",
+      "html": "<span class=\"ds-severity ds-severity-info\">INFO</span>",
+      "css": ".ds-severity { display: inline-flex; padding: 2px 5px; border: 1px solid var(--line, #262c36); border-radius: 3px; font: 400 7px \"Segoe UI Variable\", \"Segoe UI\", sans-serif; letter-spacing: .06em; } .ds-severity-info { color: var(--blue, #64a7f2); border-color: #2e4963; }"
+    },
+    {
+      "name": "Empty Data State",
+      "kind": "custom",
+      "refersTo": "empty-state",
+      "description": "The honest centered state used when verified data does not exist or is unavailable.",
+      "html": "<div class=\"ds-empty\" role=\"status\"><svg class=\"ds-empty-icon\" width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><ellipse cx=\"12\" cy=\"5\" rx=\"7\" ry=\"3\"/><path d=\"M5 5v6c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 11v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6\"/></svg><strong class=\"ds-empty-title\">No account history</strong><span class=\"ds-empty-detail\">Verified snapshots will appear after a read-only observation.</span></div>",
+      "css": ".ds-empty { min-height: 120px; padding: 20px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 7px; color: #536274; text-align: center; font-family: \"Segoe UI Variable\", \"Segoe UI\", sans-serif; } .ds-empty-title { color: #aeb8c4; font-size: 11px; } .ds-empty-detail { max-width: 430px; color: var(--dim, #96a3b3); font-size: 9px; line-height: 1.5; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Read-Only Mission Control",
+    "overview": "The Trading Observatory is a compact operational flight deck where verified system truth is the visual center. Its charcoal-navy field, graphite seams, precise alignment, and sparse semantic signals make dense account, risk, health, and event data feel controlled rather than dramatic.\n\nThe system combines the approved audit-first composition with an Equity & Drawdown monitoring field and a realtime Event Stream. It is calm, factual, and explicitly non-transactional: hierarchy comes from chronology, typography, and tonal layering, never from casino color, promotional glow, or execution affordances.",
+    "keyCharacteristics": [
+      "Dense, desktop-first information architecture that preserves audit chronology.",
+      "Flat graphite surfaces separated by one-pixel seams.",
+      "Restrained blue information accents and explicit green, amber, and red status language.",
+      "Monospaced telemetry for numbers, timestamps, tickets, identifiers, and state values.",
+      "Honest empty, unavailable, unknown, planned, and disabled states.",
+      "Responsive reordering that keeps system truth ahead of secondary monitoring."
+    ],
+    "rules": [
+      { "name": "The Signal Is Evidence Rule", "body": "Green, amber, and red must always accompany text, a label, or a recognizable state shape; color never carries status alone.", "section": "colors" },
+      { "name": "The Blue Is Information Rule", "body": "Information Blue identifies navigation, focus, context, and neutral system activity; it never implies permission to trade.", "section": "colors" },
+      { "name": "The No Casino Color Rule", "body": "Saturated color stays scarce and semantic. Do not add profit spectacle, promotional gradients, neon glow, or decorative market heat.", "section": "colors" },
+      { "name": "The Telemetry Alignment Rule", "body": "Use the monospace stack and tabular numerals whenever operators compare values across time, rows, or cards.", "section": "typography" },
+      { "name": "The Label Compression Rule", "body": "Uppercase, tracked labels stay short and secondary; they orient the operator without competing with data.", "section": "typography" },
+      { "name": "The Audit-First Order Rule", "body": "Responsive layouts preserve the operator’s sequence: transport and timeline first, verified state next, then performance, events, and historical tables.", "section": "layout" },
+      { "name": "The Flat Infrastructure Rule", "body": "Resting panels, tables, and controls use tone and seams, never decorative drop shadows.", "section": "elevation" },
+      { "name": "The Radius Has Meaning Rule", "body": "Large radii belong to containing surfaces, medium radii to controls, and full pills only to state or count tokens.", "section": "shapes" }
+    ],
+    "dos": [
+      "Do place verified chronology and service truth ahead of secondary analytics.",
+      "Do pair every semantic color with explicit status text or a readable value.",
+      "Do use monospace and tabular numerals for values that operators compare.",
+      "Do preserve one-pixel seams, compact spacing, and honest empty states.",
+      "Do keep READ ONLY and execution-disabled context visible at every viewport size.",
+      "Do expose wide operational tables through scrolling instead of deleting fields on small screens."
+    ],
+    "donts": [
+      "Don't add BUY, SELL, CLOSE, MODIFY, pending-order, or execution controls to this visual system.",
+      "Don't fabricate charts, trades, decisions, account values, or service health to fill an empty view.",
+      "Don't use gradients, glow, decorative shadows, or saturated color as atmosphere.",
+      "Don't communicate connected, warning, error, planned, unknown, or disabled state through color alone.",
+      "Don't promote labels, ornament, or analytics above the audit chronology.",
+      "Don't replace explicit Unavailable, Unknown, Planned, Disabled, or em-dash states with optimistic defaults."
+    ]
+  }
+}

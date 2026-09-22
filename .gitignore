@@ -1,0 +1,33 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+logs/*.jsonl
+data/*.db
+data/*.db-*
+backups/*.db
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+.impeccable/review/
+# Local secrets
+.env.*
+!.env.example
+
+# Runtime state
+data/process_registry.json
+*.pid
+
+# Local backups / logs
+backups/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+data/telegram_update_offset.json
