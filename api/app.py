@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,9 +28,18 @@ from persistence.orm import (
     AiDecisionRecord,
     BrokerDealRecord,
     CandleRecord,
+    ForwardSignalRecord,
+    ForwardTradeRecord,
+    ForwardValidationSessionRecord,
     MarketSnapshotRecord,
     PositionRecord,
     PositionSnapshotRecord,
+    ResearchDatasetRecord,
+    ResearchDecisionRecord,
+    ResearchMetricRecord,
+    ResearchOutcomeRecord,
+    ResearchRobustnessRecord,
+    ResearchRunRecord,
     RiskSnapshotRecord,
     ShadowDecisionRecord,
     ShadowOutcomeRecord,
@@ -42,6 +51,12 @@ from persistence.orm import (
     TradeRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.forward_shadow import (
+    forward_health,
+    forward_performance,
+    forward_signals,
+    forward_trades,
+)
 from services.shadow_outcome import (
     OUTCOME_POLICY_VERSION,
     performance_breakdown,
@@ -270,6 +285,167 @@ def create_app(
             "version": "1.6.0",
             "database_identity": db.database_identity,
         }
+
+    @app.get("/api/research/datasets")
+    def research_datasets(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+        with db.session() as session:
+            rows = session.scalars(select(ResearchDatasetRecord).order_by(desc(ResearchDatasetRecord.created_at)).limit(limit)).all()
+            return [
+                {"dataset_id": row.dataset_id, "symbol": row.symbol, "timeframe": row.timeframe,
+                 "source": row.source, "start_at": row.start_at, "end_at": row.end_at,
+                 "row_count": row.row_count, "created_at": row.created_at, "dataset_hash": row.dataset_hash,
+                 "timezone": row.timezone, "closed_candles_only": row.closed_candles_only,
+                 "metadata": row.metadata_json}
+                for row in rows
+            ]
+
+    def _research_run_dict(row: ResearchRunRecord, session: Any | None = None) -> dict[str, Any]:
+        dataset_label = row.dataset_id
+        if session is not None:
+            dataset_label = session.scalar(
+                select(ResearchDatasetRecord.dataset_id).where(ResearchDatasetRecord.id == row.dataset_id)
+            ) or dataset_label
+        return {"run_id": row.run_id, "run_name": row.run_name, "strategy_id": row.strategy_id,
+                "strategy_version": row.strategy_version, "config_hash": row.config_hash,
+                "dataset_id": dataset_label, "dataset_hash": row.dataset_hash, "symbol": row.symbol,
+                "timeframe": row.timeframe, "status": row.status, "started_at": row.started_at,
+                "completed_at": row.completed_at, "created_at": row.created_at,
+                "git_commit": row.git_commit, "git_dirty": row.git_dirty, "engine_version": row.engine_version,
+                "parameters": row.parameters_json, "split_definition": row.split_definition,
+                "summary": row.summary_json, "execution_allowed": False}
+
+    @app.get("/api/research/runs")
+    def research_runs(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:
+        with db.session() as session:
+            return [_research_run_dict(row, session) for row in session.scalars(select(ResearchRunRecord).order_by(desc(ResearchRunRecord.created_at)).limit(limit)).all()]
+
+    def _research_run_or_404(session, run_id: str) -> ResearchRunRecord:
+        row = session.scalar(select(ResearchRunRecord).where(ResearchRunRecord.run_id == run_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="research run not found")
+        return row
+
+    @app.get("/api/research/runs/{run_id}")
+    def research_run(run_id: str) -> dict[str, Any]:
+        with db.session() as session:
+            return _research_run_dict(_research_run_or_404(session, run_id), session)
+
+    @app.get("/api/research/runs/{run_id}/metrics")
+    def research_metrics(run_id: str) -> list[dict[str, Any]]:
+        with db.session() as session:
+            run = _research_run_or_404(session, run_id)
+            rows = session.scalars(select(ResearchMetricRecord).where(ResearchMetricRecord.run_id == run.id).order_by(ResearchMetricRecord.metric_key)).all()
+            return [{"metric_key": row.metric_key, "value": row.value, "denominator": row.denominator, "dimension": row.dimension_json} for row in rows]
+
+    @app.get("/api/research/runs/{run_id}/trades")
+    def research_trades(run_id: str, limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0)) -> list[dict[str, Any]]:
+        with db.session() as session:
+            run = _research_run_or_404(session, run_id)
+            rows = session.scalars(select(ResearchDecisionRecord).where(ResearchDecisionRecord.run_id == run.id, ResearchDecisionRecord.decision.in_(("BUY", "SELL"))).order_by(ResearchDecisionRecord.timestamp).offset(offset).limit(limit)).all()
+            return [{"decision_id": row.id, "timestamp": row.timestamp, "decision": row.decision, "reason_code": row.reason_code,
+                     "entry_price": row.entry_price, "stop_loss": row.stop_loss, "take_profit": row.take_profit,
+                     "risk_reward_ratio": row.risk_reward_ratio, "execution_allowed": False} for row in rows]
+
+    @app.get("/api/research/runs/{run_id}/funnel")
+    def research_funnel(run_id: str) -> dict[str, Any]:
+        with db.session() as session:
+            run = _research_run_or_404(session, run_id)
+            summary = run.summary_json if isinstance(run.summary_json, dict) else {}
+            funnel = summary.get("funnel") if isinstance(summary.get("funnel"), dict) else {}
+            return {
+                "run_id": run.run_id,
+                "snapshots": int(funnel.get("snapshots", summary.get("eligible_candles", 0))),
+                "decisions": int(funnel.get("decisions", summary.get("buy", 0) + summary.get("sell", 0))),
+                "eligible": int(funnel.get("eligible", summary.get("buy", 0) + summary.get("sell", 0))),
+                "no_trade_aggregate": int(funnel.get("no_trade_aggregate", summary.get("no_trade", 0))),
+                "reason_counts": summary.get("reason_counts", {}),
+                "execution_allowed": False,
+            }
+
+    @app.get("/api/research/compare")
+    def research_compare(
+        run_id: Annotated[list[str] | None, Query()] = None,
+        strategy_id: Annotated[list[str] | None, Query()] = None,
+        rr: Annotated[float | None, Query(gt=0)] = None,
+    ) -> list[dict[str, Any]]:
+        with db.session() as session:
+            query = select(ResearchRunRecord).order_by(desc(ResearchRunRecord.created_at))
+            if run_id:
+                query = query.where(ResearchRunRecord.run_id.in_(run_id))
+            rows = list(session.scalars(query.limit(200)).all())
+            if strategy_id:
+                selected: list[ResearchRunRecord] = []
+                aliases = {
+                    "trend_pullback_v1": {"trend_pullback_v1", "trend_pullback"},
+                    "pair_zone_v1": {"pair_zone_v1"},
+                }
+                for requested in strategy_id:
+                    accepted_ids = aliases.get(requested, {requested})
+                    match = next((row for row in rows
+                                  if row.status == "COMPLETED"
+                                  and row.strategy_id in accepted_ids
+                                  and "chronological" not in (row.run_name or "")
+                                  and not (row.run_name or "").endswith(("-development", "-validation", "-holdout"))
+                                  and (rr is None or row.parameters_json.get("rr") == rr)), None)
+                    if match is not None:
+                        selected.append(match)
+                rows = selected
+            return [_research_run_dict(row, session) for row in rows]
+
+    @app.get("/api/research/runs/{run_id}/curve")
+    def research_curve(run_id: str) -> dict[str, Any]:
+        with db.session() as session:
+            run = _research_run_or_404(session, run_id)
+            rows = session.execute(
+                select(ResearchDecisionRecord.timestamp, ResearchOutcomeRecord.realized_r)
+                .join(ResearchOutcomeRecord, ResearchOutcomeRecord.decision_id == ResearchDecisionRecord.id)
+                .where(ResearchDecisionRecord.run_id == run.id)
+                .order_by(ResearchDecisionRecord.timestamp)
+            ).all()
+            equity: list[dict[str, Any]] = []
+            drawdown: list[dict[str, Any]] = []
+            cumulative = 0.0
+            peak = 0.0
+            for timestamp, realized_r in rows:
+                if realized_r is None:
+                    continue
+                cumulative += float(realized_r)
+                peak = max(peak, cumulative)
+                equity.append({"timestamp": timestamp, "value": cumulative})
+                drawdown.append({"timestamp": timestamp, "value": peak - cumulative})
+            return {"run_id": run.run_id, "equity": equity, "drawdown": drawdown,
+                    "execution_allowed": False}
+
+    @app.get("/api/research/robustness")
+    def research_robustness(
+        strategy_id: str = Query(default="pair_zone_v1"),
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> list[dict[str, Any]]:
+        """Expose persisted read-only robustness evidence from one source of truth."""
+        with db.session() as session:
+            rows = session.scalars(
+                select(ResearchRobustnessRecord)
+                .where(ResearchRobustnessRecord.strategy_id == strategy_id)
+                .order_by(desc(ResearchRobustnessRecord.created_at))
+                .limit(limit)
+            ).all()
+            return [{
+                "robustness_id": row.robustness_id,
+                "strategy_id": row.strategy_id,
+                "strategy_version": row.strategy_version,
+                "config_hash": row.config_hash,
+                "dataset_id": session.scalar(
+                    select(ResearchDatasetRecord.dataset_id).where(ResearchDatasetRecord.id == row.dataset_id)
+                ) or row.dataset_id,
+                "dataset_hash": row.dataset_hash,
+                "source_run_id": row.source_run_id,
+                "status": row.status,
+                "seed": row.seed,
+                "simulation_count": row.simulation_count,
+                "created_at": row.created_at,
+                "summary": row.summary_json,
+                "execution_allowed": False,
+            } for row in rows]
 
     @app.get("/api/account")
     def account() -> dict[str, Any] | None:
@@ -782,6 +958,69 @@ def create_app(
         )
         return payload
 
+    def _forward_session_dict(row: ForwardValidationSessionRecord | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "session_id": row.session_id, "strategy_id": row.strategy_id,
+            "strategy_version": row.strategy_version, "strategy_config_hash": row.strategy_config_hash,
+            "started_at": row.started_at, "source_identity": row.source_identity,
+            "symbol": row.symbol, "timeframes": row.timeframes_json, "rr": row.rr,
+            "cost_policy": row.cost_policy_json, "status": row.status,
+            "error_reason": row.error_reason, "execution_allowed": False, "updated_at": row.updated_at,
+            "read_only": True,
+        }
+
+    def _forward_signal_dict(row: ForwardSignalRecord) -> dict[str, Any]:
+        return {
+            "signal_id": row.signal_id, "session_id": row.session_id, "timestamp": row.timestamp,
+            "decision": row.decision, "zone_id": row.zone_id, "entry": row.entry_price,
+            "stop": row.stop_loss, "risk_distance": row.risk_distance, "rr": row.rr,
+            "take_profit": row.take_profit, "pair_first_timestamp": row.pair_first_timestamp,
+            "pair_second_timestamp": row.pair_second_timestamp, "h1_context": row.h1_context_json,
+            "confirmation_candle": row.confirmation_candle_json,
+            "market_observation": row.market_observation_json, "strategy_hash": row.strategy_hash,
+            "execution_allowed": False, "read_only": True,
+        }
+
+    def _forward_trade_dict(row: ForwardTradeRecord) -> dict[str, Any]:
+        return {
+            "trade_id": row.trade_id, "session_id": row.session_id, "signal_id": row.signal_id,
+            "timestamp": row.timestamp, "side": row.side, "state": row.state,
+            "entry": row.entry_price, "stop": row.stop_loss, "take_profit": row.take_profit,
+            "risk_distance": row.risk_distance, "terminal_timestamp": row.terminal_timestamp,
+            "mark_price": row.mark_price, "gross_r": row.gross_r, "net_r": row.net_r,
+            "bars_held": row.bars_held, "minutes_held": row.minutes_held,
+            "mfe_price": row.mfe_price, "mae_price": row.mae_price, "mfe_r": row.mfe_r,
+            "mae_r": row.mae_r, "spread_points": row.spread_points,
+            "spread_observation": row.spread_observation,
+            "entry_slippage_points": row.entry_slippage_points,
+            "exit_slippage_points": row.exit_slippage_points, "commission_r": row.commission_r,
+            "total_cost_r": row.total_cost_r, "reason_code": row.reason_code,
+            "execution_allowed": False, "read_only": True,
+        }
+
+    @app.get("/api/forward/session")
+    def forward_session() -> dict[str, Any] | None:
+        from services.forward_shadow import latest_forward_session
+        return _forward_session_dict(latest_forward_session(db))
+
+    @app.get("/api/forward/health")
+    def forward_worker_health() -> dict[str, Any]:
+        return forward_health(db, runtime_settings)
+
+    @app.get("/api/forward/signals")
+    def forward_signal_list(limit: int = Query(default=100, ge=1, le=500), session_id: str | None = None) -> list[dict[str, Any]]:
+        return [_forward_signal_dict(row) for row in forward_signals(db, session_id=session_id, limit=limit)]
+
+    @app.get("/api/forward/trades")
+    def forward_trade_list(limit: int = Query(default=100, ge=1, le=500), session_id: str | None = None) -> list[dict[str, Any]]:
+        return [_forward_trade_dict(row) for row in forward_trades(db, session_id=session_id, limit=limit)]
+
+    @app.get("/api/forward/performance")
+    def forward_performance_summary(session_id: str | None = None) -> dict[str, Any]:
+        return forward_performance(db, session_id=session_id)
+
     @app.get("/api/research/strategies")
     def research_strategies() -> dict[str, Any]:
         registry = StrategyRegistry(runtime_settings)
@@ -1060,6 +1299,17 @@ def create_app(
                 interval_seconds=max(15.0, runtime_settings.live_candle_interval_seconds * 4),
                 now=now,
             )
+            forward_row = latest.get("worker:forward_shadow")
+            forward_state = (
+                "DISABLED"
+                if not runtime_settings.forward_shadow_enabled
+                else derive_worker_state(
+                    status=forward_row["status"] if forward_row else None,
+                    timestamp=forward_row["timestamp"] if forward_row else None,
+                    interval_seconds=runtime_settings.live_history_interval_seconds,
+                    now=now,
+                )
+            )
             last_market_update = session.scalar(
                 select(MarketSnapshotRecord.timestamp)
                 .order_by(desc(MarketSnapshotRecord.timestamp))
@@ -1078,6 +1328,7 @@ def create_app(
                     "history_worker": history_state,
                     "shadow_worker": shadow_state,
                     "shadow_outcome_worker": outcome_state,
+                    "forward_shadow_worker": forward_state,
                 },
                 "components": list(latest.values()),
                 "error_count": session.scalar(
@@ -1157,6 +1408,8 @@ def create_app(
                             if component == "worker:shadow"
                             else max(15.0, runtime_settings.live_candle_interval_seconds * 4)
                             if component == "worker:shadow_outcome"
+                            else runtime_settings.live_history_interval_seconds
+                            if component == "worker:forward_shadow"
                             else runtime_settings.live_account_interval_seconds
                         ),
                         now=now,
@@ -1220,6 +1473,7 @@ def create_app(
                     interval_seconds=max(15.0, runtime_settings.live_candle_interval_seconds * 4),
                     now=now,
                 ),
+                "forward_shadow_worker": forward_health(db, runtime_settings),
             },
             "workers": workers,
             "read_only": True,

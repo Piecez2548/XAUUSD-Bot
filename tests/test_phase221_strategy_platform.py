@@ -15,9 +15,10 @@ from services.strategy_platform import StrategyRegistry, config_hash
 
 def test_registry_resolves_versioned_plugins_and_rejects_unknown():
     registry = StrategyRegistry(Settings())
-    assert registry.identifiers() == ("baseline_v1", "trend_pullback_v1")
+    assert registry.identifiers() == ("baseline_v1", "pair_zone_v1", "trend_pullback_v1")
     assert registry.resolve("baseline_v1").metadata.strategy_version == "baseline_v1"
     assert registry.resolve("trend_pullback_v1").metadata.config_hash
+    assert registry.resolve("pair_zone_v1").metadata.config_hash
     with pytest.raises(ValueError, match="unknown strategy"):
         registry.resolve("missing_strategy")
 

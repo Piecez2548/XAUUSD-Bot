@@ -54,7 +54,7 @@ def run_strategy_research(database, settings, *, strategy_id: str | None = None,
     timestamps: list[datetime] = []
     for snapshot, snapshot_id, risk in ordered:
         timestamp = ShadowDecisionEngine._m5_timestamp(snapshot, candles_are_closed=True)
-        if from_time and timestamp < from_time or to_time and timestamp > to_time:
+        if (from_time and timestamp < from_time) or (to_time and timestamp > to_time):
             continue
         key = (snapshot.symbol.name, timestamp, strategy.metadata.strategy_version)
         if key in seen:

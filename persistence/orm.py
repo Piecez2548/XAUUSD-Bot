@@ -503,3 +503,252 @@ class PromptVersionRecord(IdMixin, Base):
     checksum: Mapped[str] = mapped_column(String(64))
     description: Mapped[str | None] = mapped_column(Text)
     content_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+
+
+class ResearchDatasetRecord(IdMixin, Base):
+    """Immutable, provenance-bearing dataset manifest for offline research."""
+
+    __tablename__ = "research_datasets"
+    __table_args__ = (
+        UniqueConstraint("dataset_hash", name="uq_research_dataset_hash"),
+        Index("ix_research_datasets_symbol_timeframe", "symbol", "timeframe"),
+    )
+
+    dataset_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    start_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(32), nullable=False, default="UTC")
+    closed_candles_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class ResearchCandleRecord(IdMixin, Base):
+    """Copied closed candle rows; research never mutates operational candles."""
+
+    __tablename__ = "research_candles"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "timestamp", name="uq_research_candle"),
+        Index("ix_research_candles_dataset_time", "dataset_id", "timestamp"),
+    )
+
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("research_datasets.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    raw_timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    open: Mapped[float] = mapped_column(Float, nullable=False)
+    high: Mapped[float] = mapped_column(Float, nullable=False)
+    low: Mapped[float] = mapped_column(Float, nullable=False)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    tick_volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    spread: Mapped[int] = mapped_column(Integer, nullable=False)
+    real_volume: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class ResearchRunRecord(IdMixin, Base):
+    """Persistent run manifest and aggregate result for deterministic backtests."""
+
+    __tablename__ = "research_runs"
+    __table_args__ = (Index("ix_research_runs_created", "created_at"),)
+
+    run_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    run_name: Mapped[str | None] = mapped_column(String(120))
+    strategy_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("research_datasets.id"), nullable=False)
+    dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    git_commit: Mapped[str | None] = mapped_column(String(64))
+    git_dirty: Mapped[bool | None] = mapped_column(Boolean)
+    engine_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    split_definition: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ResearchDecisionRecord(IdMixin, Base):
+    __tablename__ = "research_decisions"
+    __table_args__ = (Index("ix_research_decisions_run_time", "run_id", "timestamp"),)
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("research_runs.id"), index=True)
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_regime: Mapped[str] = mapped_column(String(32), nullable=False)
+    entry_price: Mapped[float | None] = mapped_column(Float)
+    stop_loss: Mapped[float | None] = mapped_column(Float)
+    take_profit: Mapped[float | None] = mapped_column(Float)
+    risk_reward_ratio: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    feature_context: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    rejection_stage: Mapped[str | None] = mapped_column(String(64))
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ResearchOutcomeRecord(IdMixin, Base):
+    __tablename__ = "research_outcomes"
+    __table_args__ = (
+        UniqueConstraint("decision_id", "policy_version", name="uq_research_outcome_policy"),
+    )
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("research_runs.id"), index=True)
+    decision_id: Mapped[str] = mapped_column(ForeignKey("research_decisions.id"), index=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    terminal_status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    realized_r: Mapped[float | None] = mapped_column(Float)
+    bars_held: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mfe_r: Mapped[float | None] = mapped_column(Float)
+    mae_r: Mapped[float | None] = mapped_column(Float)
+    terminal_candle_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+
+
+class ResearchMetricRecord(IdMixin, Base):
+    __tablename__ = "research_metrics"
+    __table_args__ = (UniqueConstraint("run_id", "metric_key", name="uq_research_metric"),)
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("research_runs.id"), index=True)
+    metric_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    value: Mapped[float | None] = mapped_column(Float)
+    denominator: Mapped[int | None] = mapped_column(Integer)
+    dimension_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class ResearchRobustnessRecord(IdMixin, Base):
+    """Immutable, research-only robustness manifest and aggregate evidence."""
+
+    __tablename__ = "research_robustness_runs"
+    __table_args__ = (Index("ix_research_robustness_created", "created_at"),)
+
+    robustness_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    strategy_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("research_datasets.id"), nullable=False)
+    dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(ForeignKey("research_runs.id"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    simulation_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    parameters_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+
+
+class ForwardValidationSessionRecord(IdMixin, Base):
+    """Durable, forward-only shadow validation session manifest."""
+
+    __tablename__ = "forward_validation_sessions"
+    __table_args__ = (Index("ix_forward_sessions_started", "started_at"),)
+
+    session_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    strategy_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    source_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframes_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    rr: Mapped[float] = mapped_column(Float, nullable=False)
+    cost_policy_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    error_reason: Mapped[str | None] = mapped_column(String(128))
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class ForwardSignalRecord(IdMixin, Base):
+    """One idempotent canonical signal generated after forward activation."""
+
+    __tablename__ = "forward_validation_signals"
+    __table_args__ = (
+        UniqueConstraint("session_id", "timestamp", name="uq_forward_signal_candle"),
+        Index("ix_forward_signals_session_time", "session_id", "timestamp"),
+    )
+
+    signal_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_sessions.id"), nullable=False
+    )
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    decision: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    zone_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float] = mapped_column(Float, nullable=False)
+    risk_distance: Mapped[float] = mapped_column(Float, nullable=False)
+    rr: Mapped[float] = mapped_column(Float, nullable=False)
+    take_profit: Mapped[float] = mapped_column(Float, nullable=False)
+    pair_first_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    pair_second_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    h1_context_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    confirmation_candle_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    market_observation_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    strategy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ForwardTradeRecord(IdMixin, Base):
+    """Virtual forward trade and causal closed-candle outcome."""
+
+    __tablename__ = "forward_validation_trades"
+    __table_args__ = (
+        UniqueConstraint("signal_id", name="uq_forward_trade_signal"),
+        Index("ix_forward_trades_session_state", "session_id", "state"),
+    )
+
+    trade_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_sessions.id"), nullable=False
+    )
+    signal_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_signals.id"), nullable=False
+    )
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float] = mapped_column(Float, nullable=False)
+    take_profit: Mapped[float] = mapped_column(Float, nullable=False)
+    risk_distance: Mapped[float] = mapped_column(Float, nullable=False)
+    terminal_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    mark_price: Mapped[float | None] = mapped_column(Float)
+    gross_r: Mapped[float | None] = mapped_column(Float)
+    net_r: Mapped[float | None] = mapped_column(Float)
+    bars_held: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    minutes_held: Mapped[float | None] = mapped_column(Float)
+    mfe_price: Mapped[float | None] = mapped_column(Float)
+    mae_price: Mapped[float | None] = mapped_column(Float)
+    mfe_r: Mapped[float | None] = mapped_column(Float)
+    mae_r: Mapped[float | None] = mapped_column(Float)
+    spread_points: Mapped[float] = mapped_column(Float, nullable=False)
+    spread_observation: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry_slippage_points: Mapped[float] = mapped_column(Float, nullable=False)
+    exit_slippage_points: Mapped[float] = mapped_column(Float, nullable=False)
+    commission_r: Mapped[float] = mapped_column(Float, nullable=False)
+    total_cost_r: Mapped[float | None] = mapped_column(Float)
+    evaluated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    reason_code: Mapped[str | None] = mapped_column(String(96))
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

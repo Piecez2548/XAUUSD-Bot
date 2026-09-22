@@ -162,7 +162,14 @@ class TrendPullbackV1:
         if pullback_distance > atr * float(self.config["pullback_atr_tolerance"]):
             return self._no_trade(common, "M15_PULLBACK_NOT_DETECTED", "M15_PULLBACK")
         m5 = features["M5"]
-        confirming = (m5.close >= m5.open and m5.close > ema) if direction == ShadowAction.BUY else (m5.close <= m5.open and m5.close < ema)
+        # FeatureSet intentionally stores derived values only; use the closed
+        # source candle for the raw open used by the confirmation rule.
+        m5_open = snapshot.candles[Timeframe.M5][-1].open
+        confirming = (
+            (m5.close >= m5_open and m5.close > ema)
+            if direction == ShadowAction.BUY
+            else (m5.close <= m5_open and m5.close < ema)
+        )
         if not confirming:
             return self._no_trade(common, "M5_CONFIRMATION_MISSING", "M5_CONFIRMATION")
         if snapshot.symbol.spread > self.max_spread_points:
@@ -218,8 +225,11 @@ def _ema(values: list[float], period: int) -> float:
 
 class StrategyRegistry:
     def __init__(self, settings) -> None:
+        from services.pair_zone_strategy import PairZoneV1
+
         self._strategies: dict[str, Strategy] = {
             "baseline_v1": BaselineV1Adapter(settings),
+            "pair_zone_v1": PairZoneV1(settings),
             "trend_pullback_v1": TrendPullbackV1(settings),
         }
 

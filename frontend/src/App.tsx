@@ -15,6 +15,8 @@ import {
   TradesPage,
 } from "./pages/ModulePages";
 import { OverviewPage } from "./pages/OverviewPage";
+import { ResearchPage } from "./pages/ResearchPage";
+import { ForwardValidationPage } from "./pages/ForwardValidationPage";
 
 const router = createBrowserRouter([
   {
@@ -25,6 +27,8 @@ const router = createBrowserRouter([
       { path: "/trades/:tradeId", element: <TradeDetailPage /> },
       { path: "/decisions", element: <DecisionsPage /> },
       { path: "/shadow", element: <ShadowPage /> },
+      { path: "/research", element: <ResearchPage /> },
+      { path: "/forward", element: <ForwardValidationPage /> },
       { path: "/performance", element: <PerformancePage /> },
       { path: "/risk", element: <RiskPage /> },
       { path: "/market", element: <MarketPage /> },

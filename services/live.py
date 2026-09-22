@@ -41,6 +41,7 @@ from mt5.market_data import read_all_candles, read_completed_candles
 from mt5.positions import read_open_positions
 from mt5.symbols import discover_symbol, read_symbol_specification, read_tick
 from persistence.repositories import HistoryRepository, SnapshotRepository, SystemHealthRepository
+from services.forward_shadow import ForwardInput, ForwardShadowWorker
 from services.risk import (
     calculate_risk_snapshot,
     normalize_risk_state,
@@ -90,6 +91,7 @@ class LiveDataEngine:
         self.health = SystemHealthRepository(database)
         self.shadow = ShadowDecisionWorker(settings, database, event_bus, logger=logger)
         self.shadow_outcome = ShadowOutcomeWorker(settings, database, logger=logger)
+        self.forward_shadow = ForwardShadowWorker(settings, database, logger=logger)
         self.state = _LiveState()
         self.runtime_state = RuntimeState.STARTING
         self.started_at = datetime.now(UTC)
@@ -137,6 +139,7 @@ class LiveDataEngine:
             ]
             self.shadow.start()
             self.shadow_outcome.start()
+            self.forward_shadow.start()
             await self._publish(EventType.SYSTEM_LIVE_STARTED, "Live Data Engine started")
             await self._stop.wait()
         except asyncio.CancelledError:
@@ -169,6 +172,7 @@ class LiveDataEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.shadow.stop()
         await self.shadow_outcome.stop()
+        await self.forward_shadow.stop()
         await self.gateway.shutdown()
         self._set_runtime_state(RuntimeState.STOPPED, "Live Data Engine stopped")
         with contextlib.suppress(Exception):
@@ -448,6 +452,9 @@ class LiveDataEngine:
         self._record_worker_success("account")
         self.shadow.submit(
             ShadowInput(snapshot, result.market_snapshot_id, risk, candles_are_closed=True)
+        )
+        self.forward_shadow.submit(
+            ForwardInput(snapshot, result.market_snapshot_id, risk, candles_are_closed=True)
         )
 
     async def _candle_loop(self) -> None:

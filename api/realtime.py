@@ -119,7 +119,7 @@ class RealtimeHub:
                             interval_seconds=self._history_interval_seconds,
                         )
                         if row.component
-                        in {"worker:history", "worker:shadow", "worker:shadow_outcome"}
+                        in {"worker:history", "worker:shadow", "worker:shadow_outcome", "worker:forward_shadow"}
                         else row.status
                     ),
                     "timestamp": row.timestamp.isoformat(),

@@ -109,6 +109,7 @@ class Settings:
     telegram_timeout_seconds: float = 5.0
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    dashboard_public_url: str | None = None
     cors_origins: tuple[str, ...] = (
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -123,6 +124,8 @@ class Settings:
     shadow_notify_signals: bool = True
     shadow_notify_no_trade: bool = False
     shadow_outcome_horizon_bars: int = 12
+    forward_shadow_enabled: bool = False
+    forward_shadow_rr: float = 2.0
     live_tick_interval_seconds: float = 1.0
     live_account_interval_seconds: float = 5.0
     live_candle_interval_seconds: float = 5.0
@@ -172,6 +175,8 @@ class Settings:
             raise ConfigurationError("SHADOW_MAX_SPREAD_POINTS cannot be negative")
         if self.shadow_outcome_horizon_bars <= 0:
             raise ConfigurationError("SHADOW_OUTCOME_HORIZON_BARS must be greater than zero")
+        if self.forward_shadow_rr <= 0:
+            raise ConfigurationError("FORWARD_SHADOW_RR must be greater than zero")
         positive = {
             "LIVE_TICK_INTERVAL_SECONDS": self.live_tick_interval_seconds,
             "LIVE_ACCOUNT_INTERVAL_SECONDS": self.live_account_interval_seconds,
@@ -243,6 +248,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         telegram_timeout_seconds=float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "5")),
         api_host=os.getenv("API_HOST", "127.0.0.1"),
         api_port=_positive_int("API_PORT", 8000),
+        dashboard_public_url=os.getenv("DASHBOARD_PUBLIC_URL") or None,
         cors_origins=_origins(
             "CORS_ORIGINS",
             ("http://localhost:5173", "http://127.0.0.1:5173"),
@@ -257,6 +263,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         shadow_notify_signals=_boolean("SHADOW_NOTIFY_SIGNALS", True),
         shadow_notify_no_trade=_boolean("SHADOW_NOTIFY_NO_TRADE", False),
         shadow_outcome_horizon_bars=_positive_int("SHADOW_OUTCOME_HORIZON_BARS", 12),
+        forward_shadow_enabled=_boolean("FORWARD_SHADOW_ENABLED", False),
+        forward_shadow_rr=float(os.getenv("FORWARD_SHADOW_RR", "2")),
         live_tick_interval_seconds=float(os.getenv("LIVE_TICK_INTERVAL_SECONDS", "1")),
         live_account_interval_seconds=float(os.getenv("LIVE_ACCOUNT_INTERVAL_SECONDS", "5")),
         live_candle_interval_seconds=float(os.getenv("LIVE_CANDLE_INTERVAL_SECONDS", "5")),

@@ -13,6 +13,8 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  FlaskConical,
+  RadioTower,
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -28,6 +30,8 @@ const nav = [
   ["/trades", "Trades", CandlestickChart],
   ["/decisions", "AI Decisions", Bot],
   ["/shadow", "Shadow Trading", Sparkles],
+  ["/research", "Strategy Research", FlaskConical],
+  ["/forward", "Forward Validation", RadioTower],
   ["/performance", "Performance", BarChart3],
   ["/risk", "Risk", ShieldCheck],
   ["/market", "Market", CircleGauge],

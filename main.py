@@ -1,4 +1,5 @@
 """Read-only CLI for Phase 1 diagnostics and Phase 1.5 observability services."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
@@ -20,6 +21,13 @@ from services.collector import collect_market_snapshot
 from services.control import TelegramControlService
 from services.live import LiveDataEngine
 from services.observatory import ObservatoryService
+from services.research_platform import (
+    import_mt5_research_bundle,
+    import_mt5_research_dataset,
+    import_research_dataset,
+    mark_runs_failed_by_name,
+    run_backtest,
+)
 from services.shadow_outcome import ShadowOutcomeWorker
 from services.shadow_replay import load_persisted_snapshots, replay_snapshots
 from services.strategy_research import run_strategy_research, write_result
@@ -321,6 +329,58 @@ def run_strategy_research_command(strategy_id: str | None = None, output: str | 
         database.dispose()
 
 
+def run_research_import_command(timeframe: str = "M5", source: str = "operational",
+                                count: int = 50_000, chunk_size: int = 5_000) -> int:
+    settings, _logger = _load_runtime()
+    migrate_database(settings.database_url, PROJECT_ROOT)
+    database = Database(settings.database_url, project_root=PROJECT_ROOT)
+    try:
+        if source == "mt5" and timeframe == "ALL":
+            results = import_mt5_research_bundle(database, settings, count=count, chunk_size=chunk_size)
+        elif source == "mt5":
+            results = [import_mt5_research_dataset(database, settings, timeframe=timeframe,
+                                                   count=count, chunk_size=chunk_size)]
+        else:
+            results = [import_research_dataset(database, timeframe=timeframe, symbol=settings.trading_symbol)]
+        print("RESEARCH DATASET IMPORT")
+        for result in results:
+            print(f"Dataset: {result.dataset_id}")
+            print(f"Hash: {result.dataset_hash}")
+            print(f"Symbol/timeframe: {result.symbol}/{result.timeframe}")
+            print(f"Range: {result.start_at.isoformat()} -> {result.end_at.isoformat()}")
+            print(f"Rows: {result.row_count}; duplicates: {result.duplicate_rows}; conflicts: {result.conflicting_rows}; invalid: {result.invalid_rows}; gaps: {result.gap_count}; missing intervals: {result.missing_intervals}; approximate trading days: {result.approximate_trading_days:.1f}")
+        print("Closed candles only: TRUE; gaps filled: FALSE; execution: DISABLED")
+        return 0
+    finally:
+        database.dispose()
+
+
+def run_backtest_command(strategy_id: str, dataset_id: str | None, rr: float | None,
+                         split: str, run_name: str | None, output: str | None) -> int:
+    settings, _logger = _load_runtime()
+    migrate_database(settings.database_url, PROJECT_ROOT)
+    database = Database(settings.database_url, project_root=PROJECT_ROOT)
+    try:
+        try:
+            results = run_backtest(database, settings, project_root=PROJECT_ROOT, strategy_id=strategy_id,
+                                   dataset_id=dataset_id, rr=rr, split=split, run_name=run_name)
+        except Exception as exc:
+            mark_runs_failed_by_name(database, run_name, type(exc).__name__)
+            print(f"BACKTEST FAILED: {type(exc).__name__}")
+            print("Orders sent: 0; broker writes: 0; execution: DISABLED")
+            return 1
+        if output:
+            Path(output).write_text(__import__("json").dumps(results, indent=2, default=str), encoding="utf-8")
+        print("PERSISTENT RESEARCH BACKTEST")
+        for result in results:
+            print(f"Run: {result['run_id']} | Strategy: {result['strategy_id']} | RR: {result['rr']} | Status: {result['status']}")
+            print(f"Candles: {result['eligible_candles']} BUY: {result['buy']} SELL: {result['sell']} NO_TRADE: {result['no_trade']}")
+        print("Orders sent: 0; broker writes: 0; execution: DISABLED")
+        return 0
+    finally:
+        database.dispose()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="XAUUSD AI Trader read-only tools")
     parser.add_argument(
@@ -338,12 +398,22 @@ def build_parser() -> argparse.ArgumentParser:
             "shadow-replay",
             "shadow-evaluate",
             "strategy-research",
+            "research-import",
+            "backtest",
         ),
         default="phase1",
         help="phase1 is the unchanged default diagnostic",
     )
     parser.add_argument("--strategy", default=None, help="research strategy identifier")
     parser.add_argument("--output", default=None, help="optional JSON research output path")
+    parser.add_argument("--dataset", default=None, help="immutable research dataset id")
+    parser.add_argument("--rr", type=float, default=None, help="single deterministic risk/reward value")
+    parser.add_argument("--split", default="all", choices=("all", "development", "validation", "holdout"))
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--timeframe", default="M5", choices=("M5", "M15", "H1", "H4", "ALL"))
+    parser.add_argument("--source", default="operational", choices=("operational", "mt5"))
+    parser.add_argument("--count", type=int, default=50_000)
+    parser.add_argument("--chunk-size", type=int, default=5_000)
     return parser
 
 
@@ -370,6 +440,11 @@ def run(argv: list[str] | None = None) -> int:
         return run_shadow_evaluate()
     if command == "strategy-research":
         return run_strategy_research_command(args.strategy, args.output)
+    if command == "research-import":
+        return run_research_import_command(args.timeframe, args.source, args.count, args.chunk_size)
+    if command == "backtest":
+        return run_backtest_command(args.strategy or "trend_pullback_v1", args.dataset, args.rr,
+                                     args.split, args.run_name, args.output)
     settings, _logger = _load_runtime()
     migrate_database(settings.database_url, PROJECT_ROOT)
     print("Database migrations applied.")

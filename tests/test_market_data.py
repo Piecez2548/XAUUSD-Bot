@@ -4,7 +4,12 @@ import pandas as pd
 import pytest
 
 from models.market import Timeframe
-from mt5.market_data import MarketDataError, read_candles, validate_ohlcv
+from mt5.market_data import (
+    MarketDataError,
+    read_candles,
+    read_completed_candles_paginated,
+    validate_ohlcv,
+)
 
 
 def test_valid_ohlcv_passes(valid_frame: pd.DataFrame) -> None:
@@ -66,3 +71,41 @@ def test_read_candles_returns_utc_models(valid_frame: pd.DataFrame) -> None:
     assert len(candles) == 3
     assert candles[0].timestamp.utcoffset() is not None
     assert candles[0].raw_timestamp == 1_700_000_000
+
+
+def test_paginated_closed_reader_orders_and_bounds_requests() -> None:
+    frame = pd.DataFrame(
+        {
+            "time": [1_700_000_000 + index * 300 for index in range(5)],
+            "open": [2000.0 + index for index in range(5)],
+            "high": [2002.0 + index for index in range(5)],
+            "low": [1999.0 + index for index in range(5)],
+            "close": [2001.0 + index for index in range(5)],
+            "tick_volume": [100] * 5,
+            "spread": [20] * 5,
+            "real_volume": [0] * 5,
+        }
+    )
+
+    class FakeApi:
+        TIMEFRAME_M5 = 5
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def copy_rates_from_pos(self, _symbol: str, _timeframe: int, start: int, count: int):
+            self.calls.append((start, count))
+            end = len(frame) - start + 1
+            begin = max(0, end - count)
+            return frame.iloc[begin:end].to_records(index=False)
+
+        def last_error(self):
+            return (0, "")
+
+    api = FakeApi()
+    candles = read_completed_candles_paginated(api, "XAUUSD", Timeframe.M5, 5, chunk_size=2)
+    assert len(candles) == 5
+    assert [item.raw_timestamp for item in candles] == sorted(
+        item.raw_timestamp for item in candles
+    )
+    assert api.calls == [(1, 2), (3, 2), (5, 1)]

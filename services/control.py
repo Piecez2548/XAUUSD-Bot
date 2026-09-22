@@ -56,6 +56,17 @@ COMMAND_HELP = {
     "/strategy": "Show deterministic baseline rules",
     "/strategies": "Show registered shadow strategies",
     "/research": "Show active strategy research identity",
+    "/backtests": "List recent persisted research runs",
+    "/backtest": "Queue a deterministic research backtest",
+    "/compare": "Compare persisted strategy research runs",
+    "/robustness": "Show persisted Pair Zone robustness evidence",
+    "/costs": "Show persisted Pair Zone cost sensitivity",
+    "/stability": "Show persisted Pair Zone temporal stability",
+    "/forward": "Show live forward shadow validation",
+    "/forwardhealth": "Show forward shadow worker health",
+    "/forwardtrades": "Show recent forward virtual trades",
+    "/forwardperformance": "Show forward gross/net performance",
+    "/dashboard": "Open the configured dashboard URL",
     "/logs": "Show safe recent operational events",
     "/help": "Show available commands",
 }
@@ -93,6 +104,9 @@ class TelegramControlService:
         self._process_notifications: set[tuple[str, int, str]] = set()
         self._offset_path = project_root / "data" / "telegram_update_offset.json"
         self._offset = self._load_offset()
+        self._research_tasks: set[asyncio.Task[object]] = set()
+        from services.research_platform import recover_interrupted_runs
+        recover_interrupted_runs(self.database)
 
     @property
     def configured(self) -> bool:
@@ -192,7 +206,7 @@ class TelegramControlService:
             self._advance_offset(update_id)
             return "Command rate limited; please retry shortly."
         try:
-            response = await self._dispatch(command)
+            response = await self._dispatch(command, text)
             result = "SUCCEEDED"
         except Exception:
             self.logger.exception("Telegram control command failed: %s", command)
@@ -221,7 +235,7 @@ class TelegramControlService:
         self._last_command_at[key] = now
         return True
 
-    async def _dispatch(self, command: str) -> str:
+    async def _dispatch(self, command: str, text: str = "") -> str:
         if command == "/start":
             return await self._start_infrastructure()
         if command == "/stop":
@@ -246,9 +260,23 @@ class TelegramControlService:
             "/strategy": self._strategy,
             "/strategies": self._strategies,
             "/research": self._research,
+            "/backtests": self._backtests,
+            "/compare": self._compare,
+            "/robustness": self._robustness,
+            "/costs": self._costs,
+            "/stability": self._stability,
+            "/forward": self._forward,
+            "/forwardhealth": self._forwardhealth,
+            "/forwardtrades": self._forwardtrades,
+            "/forwardperformance": self._forwardperformance,
+            "/dashboard": self._dashboard,
             "/logs": self._logs,
             "/help": self._help,
         }
+        if command == "/backtest":
+            return await self._backtest(text)
+        if command == "/strategy":
+            return self._strategy(text)
         return handlers[command]()
 
     async def _start_infrastructure(self) -> str:
@@ -691,14 +719,20 @@ class TelegramControlService:
         )
         return f"SHADOW OUTCOME HEALTH\nState: {state}\nObserved: {row.timestamp.isoformat() if row else 'UNKNOWN'}\nExecution: DISABLED"
 
-    def _strategy(self) -> str:
+    def _strategy(self, text: str = "/strategy") -> str:
+        from services.strategy_platform import StrategyRegistry
+
+        parts = text.strip().split()
+        identifier = parts[1] if len(parts) > 1 else self.settings.shadow_strategy
+        try:
+            strategy = StrategyRegistry(self.settings).resolve(identifier)
+        except ValueError:
+            return f"STRATEGY REJECTED\nUnknown strategy: {identifier}"
         return (
-            f"SHADOW STRATEGY {self.settings.shadow_strategy}\n"
-            "H4/H1: directional bias from EMA, slope, and higher/lower structure.\n"
-            "M15: setup must align with the higher-timeframe bias.\n"
-            "M5: timing must align; stop uses recent structure plus ATR buffer.\n"
-            "Target: minimum configurable R:R (default 2.0).\n"
-            "Risk gate: max 2% per shadow trade and 6% aggregate.\n"
+            f"SHADOW STRATEGY {identifier}\n"
+            f"Version: {strategy.metadata.strategy_version}\n"
+            f"Config: {strategy.metadata.config_hash}\n"
+            f"Rules: {strategy.explain()}\n"
             "Execution: DISABLED — SHADOW ONLY"
         )
 
@@ -723,6 +757,202 @@ class TelegramControlService:
             "Activation policy: next closed M5 boundary\n"
             "Execution: DISABLED"
         )
+
+    def _backtests(self) -> str:
+        from services.research_platform import list_runs
+
+        rows = list_runs(self.database, limit=8)
+        if not rows:
+            return "RESEARCH BACKTESTS\nNo persisted research runs yet.\nExecution: DISABLED"
+        lines = ["RESEARCH BACKTESTS"]
+        for row in rows:
+            summary = row.summary_json if isinstance(row.summary_json, dict) else {}
+            lines.append(f"{row.run_id[:8]} {row.status} {row.strategy_id} RR={row.parameters_json.get('rr', 'GRID')} "
+                         f"BUY={summary.get('buy', 0)} SELL={summary.get('sell', 0)} NO_TRADE={summary.get('no_trade', 0)}")
+        lines.append("Execution: DISABLED")
+        return "\n".join(lines)
+
+    def _compare(self, text: str) -> str:
+        from services.research_platform import list_runs
+
+        requested = text.strip().split()[1:]
+        if len(requested) < 2:
+            return "COMPARE REJECTED\nUsage: /compare trend_pullback_v1 pair_zone_v1"
+        aliases = {
+            "trend_pullback_v1": {"trend_pullback_v1", "trend_pullback"},
+            "pair_zone_v1": {"pair_zone_v1"},
+        }
+        rows = [row for row in list_runs(self.database, limit=200)
+                if row.status == "COMPLETED" and "chronological" not in (row.run_name or "")
+                and not (row.run_name or "").endswith(("-development", "-validation", "-holdout"))
+                and row.parameters_json.get("rr") == 2.0]
+        lines = ["STRATEGY COMPARISON (RR=2.0)"]
+        for identifier in requested:
+            accepted = aliases.get(identifier, {identifier})
+            row = next((item for item in rows if item.strategy_id in accepted), None)
+            if row is None:
+                lines.append(f"{identifier}: NO PERSISTED RUN")
+                continue
+            summary = row.summary_json if isinstance(row.summary_json, dict) else {}
+            lines.append(
+                f"{identifier} dataset={row.dataset_hash[:12]} signals={summary.get('trades', 0)} "
+                f"expectancy={summary.get('expectancy')} total_R={summary.get('total_r')} "
+                f"PF={summary.get('profit_factor')} win_rate={summary.get('win_rate')} "
+                f"max_DD={summary.get('max_drawdown_r')}"
+            )
+        lines.append("Evidence only; no automatic winner. Execution: DISABLED")
+        return "\n".join(lines)
+
+    def _latest_robustness_summary(self) -> tuple[str | None, dict[str, object]]:
+        from services.research_robustness import list_robustness
+
+        rows = list_robustness(self.database, strategy_id="pair_zone_v1", limit=1)
+        if not rows:
+            return None, {}
+        row = rows[0]
+        return row.robustness_id, row.summary_json if isinstance(row.summary_json, dict) else {}
+
+    def _robustness(self) -> str:
+        robustness_id, summary = self._latest_robustness_summary()
+        if robustness_id is None:
+            return "ROBUSTNESS\nNo persisted Pair Zone robustness run yet.\nExecution: DISABLED"
+        normal = (summary.get("cost_scenarios") or {}).get("normal", {})
+        return ("ROBUSTNESS TESTS COMPLETE\n"
+                f"Run: {robustness_id[:12]}\n"
+                f"Class: {summary.get('classification', 'unknown').upper()}\n"
+                f"Signals BUY={summary.get('canonical_signals', {}).get('buy', 0)} SELL={summary.get('canonical_signals', {}).get('sell', 0)}\n"
+                f"Normal cost Net R={normal.get('net_total_r')} Net DD={normal.get('net_max_drawdown_r')}\n"
+                "Frozen signals; evidence only. Execution: DISABLED")
+
+    def _costs(self) -> str:
+        robustness_id, summary = self._latest_robustness_summary()
+        if robustness_id is None:
+            return "COSTS\nNo persisted Pair Zone cost run yet.\nExecution: DISABLED"
+        scenarios = summary.get("cost_scenarios") or {}
+        lines = ["PAIR ZONE COST SENSITIVITY"]
+        for name in ("zero", "normal", "elevated", "stress"):
+            row = scenarios.get(name, {})
+            lines.append(f"{name}: gross={row.get('gross_total_r')} net={row.get('net_total_r')} cost={row.get('cost_total_r')}")
+        lines.append("Execution: DISABLED")
+        return "\n".join(lines)
+
+    def _stability(self) -> str:
+        robustness_id, summary = self._latest_robustness_summary()
+        if robustness_id is None:
+            return "STABILITY\nNo persisted Pair Zone stability run yet.\nExecution: DISABLED"
+        monthly = summary.get("monthly_stability_normal_cost") or {}
+        sides = summary.get("buy_sell_normal_cost") or {}
+        return ("PAIR ZONE STABILITY\n"
+                f"Months: {len(monthly)}\n"
+                f"BUY net R={sides.get('BUY', {}).get('net_total_r')} SELL net R={sides.get('SELL', {}).get('net_total_r')}\n"
+                "Chronological frozen windows; descriptive evidence only. Execution: DISABLED")
+
+    def _forward(self) -> str:
+        from services.forward_shadow import forward_performance, latest_forward_session
+
+        row = latest_forward_session(self.database)
+        if row is None:
+            return "FORWARD SHADOW\nNo active forward validation session.\nExecution: DISABLED"
+        performance = forward_performance(self.database, row.session_id)
+        combined = performance.get("combined", {})
+        return (
+            "LIVE FORWARD SHADOW\n"
+            f"Strategy: {row.strategy_id} {row.strategy_version}\n"
+            f"Session: {row.session_id}\n"
+            f"Status: {row.status}\n"
+            f"Started: {row.started_at.isoformat()}\n"
+            f"Signals: {performance.get('signals', 0)}\n"
+            f"Open trades: {performance.get('OPEN', 0)}\n"
+            f"Resolved trades: {combined.get('resolved', 0)}\n"
+            f"Net R: {combined.get('net_total_r')}\n"
+            "Execution: DISABLED — NO REAL ORDERS"
+        )
+
+    def _forwardhealth(self) -> str:
+        from services.forward_shadow import forward_health
+
+        health = forward_health(self.database, self.settings)
+        return (
+            "FORWARD SHADOW HEALTH\n"
+            f"State: {health.get('state')}\n"
+            f"Session: {(health.get('session_id') or 'UNKNOWN')}\n"
+            f"Last M5: {health.get('last_closed_m5') or 'UNKNOWN'}\n"
+            f"Last signal: {health.get('last_signal') or 'UNKNOWN'}\n"
+            f"Open trades: {health.get('open_shadow_trades', 0)}\n"
+            "Execution: DISABLED"
+        )
+
+    def _forwardtrades(self) -> str:
+        from services.forward_shadow import forward_trades, latest_forward_session
+
+        row = latest_forward_session(self.database)
+        trades = forward_trades(self.database, row.session_id if row else None, limit=8)
+        if not trades:
+            return "FORWARD TRADES\nNo forward virtual trades yet.\nExecution: DISABLED"
+        lines = ["FORWARD VIRTUAL TRADES"]
+        for trade in trades:
+            lines.append(f"{trade.timestamp.isoformat()} {trade.side} {trade.state} gross={trade.gross_r} net={trade.net_r}")
+        lines.append("No real orders. Execution: DISABLED")
+        return "\n".join(lines)
+
+    def _forwardperformance(self) -> str:
+        from services.forward_shadow import forward_performance, latest_forward_session
+
+        row = latest_forward_session(self.database)
+        if row is None:
+            return "FORWARD PERFORMANCE\nNo forward validation session yet.\nExecution: DISABLED"
+        result = forward_performance(self.database, row.session_id)
+        combined = result.get("combined", {})
+        expired = result.get("expired_only", {})
+        tp_sl = result.get("tp_sl_only", {})
+        return (
+            "FORWARD PERFORMANCE\n"
+            f"Signals={result.get('signals', 0)} BUY={result.get('BUY', 0)} SELL={result.get('SELL', 0)}\n"
+            f"Combined gross={combined.get('gross_total_r')} net={combined.get('net_total_r')}\n"
+            f"TP/SL/AMBIGUOUS net={tp_sl.get('net_total_r')}\n"
+            f"EXPIRED count={expired.get('EXPIRED', 0)} net={expired.get('net_total_r')}\n"
+            f"Expectancy={combined.get('net_expectancy')} PF={combined.get('profit_factor')}\n"
+            "Forward-only evidence. Execution: DISABLED"
+        )
+
+    async def _backtest(self, text: str) -> str:
+        from services.research_platform import (
+            enqueue_backtest_dataset,
+            mark_run_failed,
+            run_backtest,
+        )
+
+        parts = text.strip().split()
+        strategy_id = parts[1] if len(parts) == 2 else self.settings.shadow_strategy
+        from services.strategy_platform import StrategyRegistry
+        if strategy_id not in StrategyRegistry(self.settings).identifiers():
+            return "BACKTEST REJECTED\nUnknown strategy. Use /strategies."
+        job_id = enqueue_backtest_dataset(self.database, self.settings, strategy_id=strategy_id,
+                                          project_root=self.project_root, run_name="telegram")
+        self.health.record("worker:research", "CONNECTED", message="Research job queued",
+                           metadata={"job_id": job_id, "execution_allowed": False})
+
+        async def execute() -> None:
+            try:
+                await asyncio.to_thread(run_backtest, self.database, self.settings,
+                                        project_root=self.project_root, strategy_id=strategy_id,
+                                        rr=2.0, run_name="telegram", existing_run_id=job_id)
+                self.health.record("worker:research", "CONNECTED", message="Research job completed",
+                                   metadata={"job_id": job_id, "execution_allowed": False})
+            except Exception:
+                self.logger.exception("Research backtest job failed: %s", job_id)
+                mark_run_failed(self.database, job_id, "RESEARCH_JOB_FAILED")
+                self.health.record("worker:research", "DEGRADED", message="Research job failed",
+                                   metadata={"job_id": job_id, "execution_allowed": False})
+
+        task = asyncio.create_task(execute(), name=f"research-{job_id[:8]}")
+        self._research_tasks.add(task)
+        task.add_done_callback(self._research_tasks.discard)
+        return f"BACKTEST QUEUED\nJob: {job_id}\nStrategy: {strategy_id}\nUse /backtests for persisted progress.\nExecution: DISABLED"
+
+    def _dashboard(self) -> str:
+        url = self.settings.dashboard_public_url
+        return f"DASHBOARD\n{url or 'UNKNOWN (DASHBOARD_PUBLIC_URL not configured)'}\nExecution: DISABLED"
 
     def _snapshot_context(self):
         """Return the latest coherent risk/position view from one persisted cycle."""

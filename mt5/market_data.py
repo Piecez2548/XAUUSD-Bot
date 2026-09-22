@@ -174,3 +174,58 @@ def read_completed_candles(
         frame["timestamp"] = pd.to_datetime(frame["time"], unit="s", utc=True)
     validate_ohlcv(frame, requested_count=count, minimum_ratio=minimum_ratio)
     return _to_candles(frame)
+
+
+def read_completed_candles_paginated(
+    api: Any,
+    symbol: str,
+    timeframe: Timeframe,
+    count: int,
+    *,
+    chunk_size: int = 5_000,
+) -> tuple[Candle, ...]:
+    """Read a bounded historical range in closed-bar chunks.
+
+    MT5 rejects very large ``copy_rates_from_pos`` requests on some terminals.
+    Requests therefore stay bounded and walk backwards by position.  Returned
+    chunks are normalized, validated, deduplicated by timestamp, and sorted
+    oldest-to-newest.  No missing interval is filled.
+    """
+    if count <= 0:
+        raise MarketDataError("historical candle count must be greater than zero")
+    if chunk_size <= 0 or chunk_size > 50_000:
+        raise MarketDataError("historical chunk size must be between 1 and 50000")
+    timeframe_constant = getattr(api, f"TIMEFRAME_{timeframe.value}", None)
+    if timeframe_constant is None:
+        raise MarketDataError(f"MT5 does not expose TIMEFRAME_{timeframe.value}")
+
+    by_timestamp: dict[int, Candle] = {}
+    offset = 0
+    while len(by_timestamp) < count:
+        requested = min(chunk_size, count - len(by_timestamp))
+        rates = api.copy_rates_from_pos(symbol, timeframe_constant, 1 + offset, requested)
+        if rates is None:
+            raise MarketDataError(
+                f"MT5 paginated candle query failed for {symbol} {timeframe.value}: "
+                f"{api.last_error()!r}"
+            )
+        frame = pd.DataFrame(rates)
+        if frame.empty:
+            break
+        if "time" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        # A short final response is valid evidence that the terminal has no
+        # older bars; validate the rows returned rather than inventing padding.
+        validate_ohlcv(
+            frame,
+            requested_count=len(frame),
+            minimum_ratio=1.0,
+        )
+        candles = _to_candles(frame)
+        before = len(by_timestamp)
+        for candle in candles:
+            by_timestamp.setdefault(candle.raw_timestamp, candle)
+        offset += len(candles)
+        if len(candles) < requested or len(by_timestamp) == before:
+            break
+    return tuple(by_timestamp[key] for key in sorted(by_timestamp)[:count])
