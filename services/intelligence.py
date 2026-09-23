@@ -39,6 +39,10 @@ from services.features import FeatureValidationError, extract_features
 from services.pair_zone_strategy import PairZoneV1
 
 
+class ProvenanceConflictError(ValueError):
+    """Raised when immutable intelligence provenance cannot be reconciled."""
+
+
 INTELLIGENCE_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "strategy_intelligence_v1.yaml"
 SUPPORTED_INTELLIGENCE_VERSION = "phase3.0_intelligence_v1"
 SCORING_CATEGORIES = (
@@ -614,8 +618,14 @@ def persist_intelligence_record(
     *,
     forward_session_id: str | None = None,
     forward_signal_id: str | None = None,
+    pair_zone_event_id: str | None = None,
 ) -> Any:
-    """Persist one idempotent evidence snapshot without changing strategy history."""
+    """Persist one idempotent evidence snapshot without changing strategy history.
+
+    Forward linkage is intentionally not late-bound by this function.  Use
+    :func:`link_intelligence_forward_provenance` for the explicit, auditable
+    lifecycle link after a Forward Signal exists.
+    """
 
     from persistence.orm import StrategyIntelligenceRecord
 
@@ -628,12 +638,36 @@ def persist_intelligence_record(
             )
         )
         if existing is not None:
+            immutable = (
+                ("symbol", existing.symbol, candidate.symbol),
+                ("strategy", existing.strategy, candidate.strategy),
+                ("strategy_version", existing.strategy_version, candidate.strategy_version),
+                ("evidence_version", existing.evidence_version, candidate.evidence_version),
+                ("detected_at", existing.detected_at, candidate.detected_at),
+            )
+            for field_name, current, incoming in immutable:
+                if current != incoming:
+                    raise ProvenanceConflictError(
+                        f"candidate {candidate.candidate_id} immutable field conflict: {field_name}"
+                    )
+            for field_name, incoming in (
+                ("forward_session_id", forward_session_id),
+                ("forward_signal_id", forward_signal_id),
+                ("pair_zone_event_id", pair_zone_event_id),
+            ):
+                current = getattr(existing, field_name)
+                if current is not None and incoming is not None and current != incoming:
+                    raise ProvenanceConflictError(
+                        f"candidate {candidate.candidate_id} provenance conflict: {field_name}"
+                    )
             return existing
         row = StrategyIntelligenceRecord(
             candidate_id=candidate.candidate_id,
             symbol=candidate.symbol,
             strategy=candidate.strategy,
             strategy_version=candidate.strategy_version,
+            intelligence_version=INTELLIGENCE_VERSION,
+            intelligence_runtime_version=StrategyIntelligenceEngine.version,
             evidence_version=candidate.evidence_version,
             detected_at=candidate.detected_at,
             timeframe=candidate.timeframe,
@@ -648,6 +682,7 @@ def persist_intelligence_record(
             evidence_json=payload["evidence"],
             score_components_json=payload["score_components"],
             source=candidate.source,
+            pair_zone_event_id=pair_zone_event_id,
             forward_session_id=forward_session_id,
             forward_signal_id=forward_signal_id,
             execution_allowed=False,
@@ -655,3 +690,63 @@ def persist_intelligence_record(
         session.add(row)
         session.flush()
         return row
+
+
+def link_intelligence_forward_provenance(
+    database: Any,
+    *,
+    candidate_id: str,
+    forward_session_id: str,
+    forward_signal_id: str,
+) -> Any:
+    """Bind one candidate to exactly one same-session Forward Signal/trade.
+
+    The signal and its virtual trade are already created by Forward Shadow.
+    This function permits only the modeled late-bound lifecycle fields to be
+    filled once.  It never changes the candidate evidence or decision.
+    """
+
+    from persistence.orm import (
+        ForwardSignalRecord,
+        ForwardTradeRecord,
+        ForwardValidationSessionRecord,
+        StrategyIntelligenceRecord,
+    )
+
+    with database.session() as session:
+        candidate = session.scalar(
+            select(StrategyIntelligenceRecord).where(
+                StrategyIntelligenceRecord.candidate_id == candidate_id
+            )
+        )
+        if candidate is None:
+            raise ProvenanceConflictError(f"intelligence candidate not found: {candidate_id}")
+        signal = session.get(ForwardSignalRecord, forward_signal_id)
+        if signal is None:
+            raise ProvenanceConflictError(f"forward signal not found: {forward_signal_id}")
+        forward_session = session.get(ForwardValidationSessionRecord, forward_session_id)
+        if forward_session is None:
+            raise ProvenanceConflictError(f"forward session not found: {forward_session_id}")
+        if signal.session_id != forward_session.id:
+            raise ProvenanceConflictError("forward signal belongs to a different session")
+        if candidate.forward_session_id not in (None, forward_session.id):
+            raise ProvenanceConflictError("candidate is already linked to a different session")
+        if candidate.forward_signal_id not in (None, signal.id):
+            raise ProvenanceConflictError("candidate is already linked to a different signal")
+
+        trade = session.scalar(
+            select(ForwardTradeRecord).where(ForwardTradeRecord.signal_id == signal.id)
+        )
+        if trade is not None:
+            if trade.session_id != forward_session.id:
+                raise ProvenanceConflictError("forward trade belongs to a different session")
+            if trade.terminal_timestamp is not None and trade.terminal_timestamp <= candidate.detected_at:
+                raise ProvenanceConflictError("forward outcome is not after the intelligence observation")
+            if candidate.forward_trade_id not in (None, trade.id):
+                raise ProvenanceConflictError("candidate is already linked to a different outcome")
+            candidate.forward_trade_id = trade.id
+
+        candidate.forward_session_id = forward_session.id
+        candidate.forward_signal_id = signal.id
+        session.flush()
+        return candidate

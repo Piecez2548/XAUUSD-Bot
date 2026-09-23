@@ -765,6 +765,8 @@ class StrategyIntelligenceRecord(IdMixin, Base):
     __tablename__ = "strategy_intelligence_records"
     __table_args__ = (
         UniqueConstraint("candidate_id", name="uq_strategy_intelligence_candidate"),
+        UniqueConstraint("forward_signal_id", name="uq_strategy_intelligence_forward_signal"),
+        UniqueConstraint("forward_trade_id", name="uq_strategy_intelligence_forward_trade"),
         Index("ix_strategy_intelligence_symbol_time", "symbol", "detected_at"),
         Index("ix_strategy_intelligence_alert", "alert_decision", "detected_at"),
     )
@@ -773,6 +775,8 @@ class StrategyIntelligenceRecord(IdMixin, Base):
     symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     strategy: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    intelligence_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    intelligence_runtime_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     evidence_version: Mapped[str] = mapped_column(String(64), nullable=False)
     detected_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, index=True)
     timeframe: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -787,11 +791,15 @@ class StrategyIntelligenceRecord(IdMixin, Base):
     evidence_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     score_components_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
+    pair_zone_event_id: Mapped[str | None] = mapped_column(String(100), index=True)
     forward_session_id: Mapped[str | None] = mapped_column(
         ForeignKey("forward_validation_sessions.id"), index=True
     )
     forward_signal_id: Mapped[str | None] = mapped_column(
         ForeignKey("forward_validation_signals.id"), index=True
+    )
+    forward_trade_id: Mapped[str | None] = mapped_column(
+        ForeignKey("forward_validation_trades.id"), index=True
     )
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)

@@ -374,15 +374,21 @@ class ForwardShadowWorker:
         # existing Pair Zone decision and Forward Shadow history remain the
         # canonical behavior; intelligence is additive and execution-disabled.
         intelligence_available = True
+        intelligence_record = None
         try:
-            from services.intelligence import StrategyIntelligenceEngine, persist_intelligence_record
+            from services.intelligence import (
+                StrategyIntelligenceEngine,
+                persist_intelligence_record,
+            )
 
             intelligence = StrategyIntelligenceEngine(self.settings).evaluate(
                 item.snapshot, risk=item.risk, as_of=timestamp, candles_are_closed=True
             )
-            persist_intelligence_record(
-                self.database, intelligence, forward_session_id=self.session.id,
-            )
+            persist_kwargs = {"forward_session_id": self.session.id}
+            zone_id = decision.feature_context.get("zone_id") if isinstance(decision.feature_context, dict) else None
+            if zone_id:
+                persist_kwargs["pair_zone_event_id"] = str(zone_id)
+            intelligence_record = persist_intelligence_record(self.database, intelligence, **persist_kwargs)
         except Exception as exc:
             # Intelligence is advisory metadata. Its failure must not rewrite
             # or suppress the canonical Pair Zone/Forward Shadow decision.
@@ -397,6 +403,22 @@ class ForwardShadowWorker:
             if record is not None:
                 self._last_signal = record.timestamp
                 self._last_zone_created = _parse_iso(decision.feature_context.get("zone_created_at"))
+                if intelligence_record is not None:
+                    try:
+                        from services.intelligence import link_intelligence_forward_provenance
+
+                        link_intelligence_forward_provenance(
+                            self.database,
+                            candidate_id=intelligence_record.candidate_id,
+                            forward_session_id=self.session.id,
+                            forward_signal_id=record.id,
+                        )
+                    except Exception as exc:
+                        intelligence_available = False
+                        self.logger.exception(
+                            "Strategy intelligence provenance unavailable; preserving Forward Shadow decision: %s",
+                            type(exc).__name__,
+                        )
         await self._evaluate_open_trades()
         self._failure_count = 0
         self._record_health(

@@ -1378,6 +1378,8 @@ def create_app(
             "symbol": row.symbol,
             "strategy": row.strategy,
             "strategy_version": row.strategy_version,
+            "intelligence_version": row.intelligence_version,
+            "intelligence_runtime_version": row.intelligence_runtime_version,
             "evidence_version": row.evidence_version,
             "detected_at": row.detected_at,
             "timeframe": row.timeframe,
@@ -1392,6 +1394,10 @@ def create_app(
             "evidence": row.evidence_json,
             "score_components": row.score_components_json,
             "source": row.source,
+            "pair_zone_event_id": row.pair_zone_event_id,
+            "forward_session_id": row.forward_session_id,
+            "forward_signal_id": row.forward_signal_id,
+            "forward_trade_id": row.forward_trade_id,
             "execution_allowed": False,
         }
 

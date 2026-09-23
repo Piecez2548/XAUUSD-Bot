@@ -24,6 +24,7 @@ NEGATIVE_OUTCOMES = frozenset({"SL_HIT", "SL", "LOSS", "NEGATIVE"})
 UNRESOLVED_OUTCOMES = frozenset({"PENDING", "AMBIGUOUS", "UNRESOLVED", "UNKNOWN", "INVALID"})
 MANUAL_OB_ALLOWED = frozenset({"APPROACHING_OB", "ENTERED_OB"})
 MANUAL_OB_REJECTION = "REJECTION_CONFIRMED"
+EVALUATION_POPULATIONS = frozenset({"HISTORICAL_REPLAY", "FORWARD_SHADOW"})
 
 
 class EvaluationInputError(ValueError):
@@ -40,6 +41,7 @@ class EvaluationObservation:
     """
 
     observation_id: str
+    population: str
     symbol: str
     timeframe: str
     timestamp: datetime
@@ -61,6 +63,7 @@ class EvaluationObservation:
     manual_ob_state: str | None = None
     baseline_positive: bool | None = None
     outcome_status: str | None = None
+    outcome_id: str | None = None
     outcome_realized_r: float | None = None
     outcome_timestamp: datetime | None = None
     execution_allowed: bool = False
@@ -68,6 +71,8 @@ class EvaluationObservation:
     def __post_init__(self) -> None:
         if not self.observation_id or not self.symbol or not self.timeframe:
             raise EvaluationInputError("observation provenance is incomplete")
+        if self.population not in EVALUATION_POPULATIONS:
+            raise EvaluationInputError(f"unsupported evaluation population: {self.population}")
         if self.timestamp.tzinfo is None:
             raise EvaluationInputError("observation timestamp must be timezone-aware")
         if self.outcome_timestamp is not None:
@@ -180,6 +185,7 @@ def observation_from_mapping(raw: Mapping[str, Any]) -> EvaluationObservation:
     manual_state = raw.get("manual_ob_state") or _manual_state(evidence)
     return EvaluationObservation(
         observation_id=str(raw.get("observation_id") or raw.get("candidate_id") or ""),
+        population=str(raw.get("population") or "FORWARD_SHADOW"),
         symbol=str(raw.get("symbol") or ""),
         timeframe=str(raw.get("timeframe") or ""),
         timestamp=_timestamp(raw.get("timestamp") or raw.get("detected_at")),
@@ -209,6 +215,7 @@ def observation_from_mapping(raw: Mapping[str, Any]) -> EvaluationObservation:
         outcome_status=str(raw["outcome_status"])
         if raw.get("outcome_status") is not None
         else None,
+        outcome_id=str(raw["outcome_id"]) if raw.get("outcome_id") is not None else None,
         outcome_realized_r=_optional_float(raw.get("outcome_realized_r"), "outcome_realized_r"),
         outcome_timestamp=_timestamp(raw["outcome_timestamp"])
         if raw.get("outcome_timestamp")
@@ -577,6 +584,17 @@ def evaluate_records(
     if generated.tzinfo is None:
         raise ValueError("generated_at must be timezone-aware")
     counts = _counts(observations)
+    population_metrics = {}
+    for population in sorted(EVALUATION_POPULATIONS):
+        members = tuple(item for item in observations if item.population == population)
+        population_metrics[population] = {
+            "metrics": _dataset_metrics(members),
+            "intelligence_metrics": _classifier_metrics(
+                members,
+                lambda item: item.disposition == "ALERT" if item.disposition is not None else None,
+                unavailable_reason="no resolved outcome labels or intelligence disposition",
+            ),
+        }
     baseline = _classifier_metrics(
         observations,
         lambda item: item.baseline_positive,
@@ -597,6 +615,10 @@ def evaluate_records(
             "latest": observations[-1].timestamp.isoformat() if observations else None,
             "symbols": sorted({item.symbol for item in observations}),
             "timeframes": sorted({item.timeframe for item in observations}),
+            "populations": {
+                population: sum(item.population == population for item in observations)
+                for population in sorted(EVALUATION_POPULATIONS)
+            },
         },
         "source_versions": {
             "intelligence_versions": sorted({item.intelligence_version for item in observations}),
@@ -610,6 +632,7 @@ def evaluate_records(
         "sample_counts": counts,
         "baseline_metrics": baseline,
         "intelligence_metrics": intelligence,
+        "population_metrics": population_metrics,
         "segmented_metrics": _segmented_metrics(observations),
         "component_metrics": _component_metrics(observations),
         "manual_ob_metrics": _manual_ob_metrics(observations),
@@ -642,7 +665,12 @@ def observations_from_persisted_rows(
     signals = {
         getattr(row, "id", None): row for row in forward_signal_rows if getattr(row, "id", None)
     }
-    trades = {
+    trades_by_id = {
+        getattr(row, "id", None): row
+        for row in forward_trade_rows
+        if getattr(row, "id", None)
+    }
+    trades_by_signal = {
         getattr(row, "signal_id", None): row
         for row in forward_trade_rows
         if getattr(row, "signal_id", None)
@@ -650,23 +678,34 @@ def observations_from_persisted_rows(
     result: list[EvaluationObservation] = []
     for row in intelligence_rows:
         signal = signals.get(getattr(row, "forward_signal_id", None))
-        trade = trades.get(getattr(row, "forward_signal_id", None))
+        outcome_id = getattr(row, "forward_trade_id", None)
+        trade = (
+            trades_by_id.get(outcome_id)
+            if outcome_id
+            else trades_by_signal.get(getattr(row, "forward_signal_id", None))
+        )
         evidence = getattr(row, "evidence_json", None) or []
         components = getattr(row, "score_components_json", None) or []
         result.append(
             EvaluationObservation(
                 observation_id=str(row.candidate_id),
+                population="FORWARD_SHADOW",
                 symbol=str(row.symbol),
                 timeframe=str(row.timeframe),
                 timestamp=row.detected_at,
                 pair_zone_source={
                     "strategy": getattr(row, "strategy", None),
                     "strategy_version": getattr(row, "strategy_version", None),
+                    "pair_zone_event_id": getattr(row, "pair_zone_event_id", None),
                     "forward_session_id": getattr(row, "forward_session_id", None),
                     "forward_signal_id": getattr(row, "forward_signal_id", None),
                 },
-                intelligence_version=RUNTIME_VERSION,
-                intelligence_runtime_version=RUNTIME_VERSION,
+                intelligence_version=(
+                    getattr(row, "intelligence_version", None) or RUNTIME_VERSION
+                ),
+                intelligence_runtime_version=(
+                    getattr(row, "intelligence_runtime_version", None) or RUNTIME_VERSION
+                ),
                 evidence_version=getattr(row, "evidence_version", None),
                 score=getattr(row, "score", None),
                 confidence_band=getattr(row, "confidence_band", None),
@@ -682,9 +721,10 @@ def observations_from_persisted_rows(
                 if signal
                 else None,
                 outcome_status=getattr(trade, "state", None) if trade else None,
+                outcome_id=getattr(trade, "id", None) if trade else None,
                 outcome_realized_r=getattr(trade, "net_r", None) if trade else None,
                 outcome_timestamp=getattr(trade, "terminal_timestamp", None) if trade else None,
-                execution_allowed=getattr(row, "execution_allowed", False),
+                execution_allowed=bool(getattr(row, "execution_allowed", False)),
             )
         )
     return sorted(result, key=lambda item: (item.timestamp, item.observation_id))
