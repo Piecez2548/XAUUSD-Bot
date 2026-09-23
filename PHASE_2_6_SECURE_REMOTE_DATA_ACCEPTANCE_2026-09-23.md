@@ -36,9 +36,11 @@ served only through the tailnet endpoint.
 - `127.0.0.1:8000` remains the FastAPI bind address.
 - `services/supervisor.py`, `services/control.py`, and `mt5/bootstrap.py` were
   not modified.
-- No `/start`, `/stop`, `/restart`, MT5, Telegram, broker, registry, or live
-  runtime action was invoked. The authorized API-only process was started,
-  stopped, and restarted for gateway acceptance.
+- No `/start`, `/stop`, `/restart`, MT5, Telegram, broker, or live runtime
+  action was invoked. The authorized API-only process was started, stopped,
+  and restarted for gateway acceptance. Supervisor implementation/configuration
+  was untouched; the existing supervisor API start updated the registry
+  truthfully and no manual registry edit was performed.
 - Pair Zone V1, Forward Shadow history/session, and execution-disabled state
   were not changed.
 
@@ -303,7 +305,10 @@ the approved API process and persisted `REMOTE_DASHBOARD_MODE=true`. The
 production health response reported `database=CONNECTED`, `mt5=CONNECTED`,
 `trade_execution=DISABLED`, and `error_count=0`. The recorded live runtime,
 Telegram, Forward Shadow, Pair Zone, and session evidence remained unchanged;
-no lifecycle or trading action was invoked.
+no lifecycle or trading action was invoked. After the final supervised API
+start, the API registry state was `RUNNING`/desired `RUNNING` with
+`restart_count=4`; the preserved Live record remained `STOPPED` with
+`restart_count=2`.
 
 ## Vercel configuration
 
@@ -327,6 +332,7 @@ no lifecycle or trading action was invoked.
 | Private HTTPS transport | PASS | `piecez2548.tail708f84.ts.net` is tailnet-only and proxies only loopback 8000 |
 | Remote read-only data | PASS | All 40 concrete frontend GET paths returned 200 through production Serve |
 | Route allowlist | PASS locally and through production Serve | Policy, middleware tests, and HTTPS lifecycle/write denial checks passed |
+| API supervisor ownership | PASS | Existing supervisor API start recorded verified API PID/tree truthfully; no manual registry edit |
 | Control endpoint isolation | PASS by design | Telegram control is outside FastAPI and denied by policy |
 | Broker-write isolation | PASS locally | Existing API route audit plus boundary tests; no `mt5.order_send` production path exposed |
 | HTTPS | PASS | Tailscale Serve HTTPS responded successfully; no public endpoint |
