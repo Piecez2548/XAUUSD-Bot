@@ -127,7 +127,7 @@ export function ShadowPage() {
 
 export function PerformancePage() {
   const summary = useApi<Record<string, number | null>>("/api/performance/summary");
-  const account = useApi<AccountCurvePoint[]>("/api/performance/account-curve");
+  const account = useApi<AccountCurvePoint[]>("/api/performance/account-curve?display_limit=600");
   const cumulativeR = useApi<Array<Record<string, unknown>>>("/api/performance/cumulative-r");
   const pnlDay = useApi<Array<Record<string, unknown>>>("/api/performance/pnl-by-day");
   const direction = useApi<Array<Record<string, unknown>>>("/api/performance/by-direction");

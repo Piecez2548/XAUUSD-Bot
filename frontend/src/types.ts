@@ -368,6 +368,10 @@ export interface ResearchCurve {
   equity: Array<{ timestamp: string; value: number }>;
   drawdown: Array<{ timestamp: string; value: number }>;
   execution_allowed: false;
+  point_count?: number;
+  display_point_count?: number;
+  display_sampled?: boolean;
+  display_limit?: number;
 }
 
 export interface ResearchRobustness {

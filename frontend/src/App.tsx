@@ -17,6 +17,7 @@ import {
 import { OverviewPage } from "./pages/OverviewPage";
 import { ResearchPage } from "./pages/ResearchPage";
 import { ForwardValidationPage } from "./pages/ForwardValidationPage";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 
 const router = createBrowserRouter([
   {
@@ -40,4 +41,4 @@ const router = createBrowserRouter([
   },
 ]);
 
-export function App() { return <RouterProvider router={router} />; }
+export function App() { return <AppErrorBoundary><RouterProvider router={router} /></AppErrorBoundary>; }

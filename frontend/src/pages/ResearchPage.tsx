@@ -5,94 +5,62 @@ import { Panel } from "../components/Panel";
 import { StatusPill } from "../components/StatusPill";
 import { useApi } from "../hooks/useApi";
 import { utcTime } from "../lib/format";
+import { stateLabel, thaiDateTime } from "../lib/runtime";
 import type { ResearchCurve, ResearchDataset, ResearchRobustness, ResearchRun } from "../types";
 
 const strategyIds = ["pair_zone_v1", "trend_pullback_v1"] as const;
+const asArray = <T,>(value: unknown): T[] => Array.isArray(value) ? value as T[] : [];
+const asRecord = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const metric = (value: unknown, digits = 4) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
+const runKey = (run: Partial<ResearchRun>, index: number) => `${typeof run.run_id === "string" ? run.run_id : "run"}-${index}`;
 
 function matchesStrategy(run: ResearchRun, strategy: string) {
-  return strategy === "trend_pullback_v1"
-    ? run.strategy_id === "trend_pullback" || run.strategy_id === "trend_pullback_v1"
-    : run.strategy_id === strategy;
-}
-
-function metric(value: unknown) {
-  return typeof value === "number" ? value.toFixed(4) : "—";
+  return strategy === "trend_pullback_v1" ? run.strategy_id === "trend_pullback" || run.strategy_id === "trend_pullback_v1" : run.strategy_id === strategy;
 }
 
 export function ResearchPage() {
   const [selectedStrategy, setSelectedStrategy] = useState<string>("pair_zone_v1");
   const datasets = useApi<ResearchDataset[]>("/api/research/datasets", 15_000);
   const runs = useApi<ResearchRun[]>("/api/research/runs?limit=200", 10_000);
-  const comparison = useApi<ResearchRun[]>(
-    `/api/research/compare?strategy_id=${encodeURIComponent(selectedStrategy)}&rr=2.0`, 10_000,
-  );
-  const selectedRun = comparison.data?.[0] ?? null;
-  const robustness = useApi<ResearchRobustness[]>(
-    `/api/research/robustness?strategy_id=${encodeURIComponent(selectedStrategy)}&limit=1`, 15_000,
-  );
-  const curve = useApi<ResearchCurve>(
-    selectedRun ? `/api/research/runs/${selectedRun.run_id}/curve` : "/api/research/runs?limit=1",
-    15_000,
-  );
-  const strategyRuns = useMemo(
-    () => (runs.data ?? []).filter((run) => matchesStrategy(run, selectedStrategy)),
-    [runs.data, selectedStrategy],
-  );
-  const isSplitRun = (run: ResearchRun) => ["-development", "-validation", "-holdout"].some((suffix) => run.run_name?.endsWith(suffix));
-  const rrRuns = strategyRuns.filter((run) => run.parameters?.rr !== undefined && !isSplitRun(run));
-  const splitRuns = strategyRuns.filter(isSplitRun);
-  const summary = selectedRun?.summary ?? {};
-  const funnel = (summary.funnel ?? {}) as Record<string, unknown>;
-  const lifecycle = (summary.pair_zone_lifecycle ?? {}) as Record<string, unknown>;
-  const reasons = (summary.reason_counts ?? {}) as Record<string, unknown>;
-  const latestEquity = curve.data?.equity.at(-1)?.value;
-  const latestDrawdown = curve.data?.drawdown.at(-1)?.value;
-  const robustnessSummary = robustness.data?.[0]?.summary ?? {};
-  const robustnessCosts = (robustnessSummary.cost_scenarios ?? {}) as Record<string, Record<string, unknown>>;
-  const robustnessSides = (robustnessSummary.buy_sell_normal_cost ?? {}) as Record<string, Record<string, unknown>>;
+  const comparison = useApi<ResearchRun[]>(`/api/research/compare?strategy_id=${encodeURIComponent(selectedStrategy)}&rr=2.0`, 10_000);
+  const allComparison = useApi<ResearchRun[]>("/api/research/compare?strategy_id=pair_zone_v1&strategy_id=trend_pullback_v1&rr=2.0", 15_000);
+  const registry = useApi<{ active_strategy?: string; available_strategies?: string[]; activation?: { strategy_version?: string; config_hash?: string; effective_from_m5?: string } | null }>("/api/research/strategies", 30_000);
+  const robustness = useApi<ResearchRobustness[]>(`/api/research/robustness?strategy_id=${encodeURIComponent(selectedStrategy)}&limit=1`, 15_000);
+  const comparisonRows = asArray<ResearchRun>(comparison.data);
+  const selectedRun = comparisonRows[0] ?? null;
+  const datasetRows = asArray<ResearchDataset>(datasets.data);
+  const runRows = asArray<ResearchRun>(runs.data);
+  const comparisonAllRows = asArray<ResearchRun>(allComparison.data);
+  const robustnessRows = asArray<ResearchRobustness>(robustness.data);
+  const strategyRuns = useMemo(() => runRows.filter((run) => matchesStrategy(run, selectedStrategy)), [runRows, selectedStrategy]);
+  const splitRun = (run: ResearchRun) => ["-development", "-validation", "-holdout"].some((suffix) => typeof run.run_name === "string" && run.run_name.endsWith(suffix));
+  const rrRuns = strategyRuns.filter((run) => asRecord(run.parameters).rr !== undefined && !splitRun(run));
+  const splitRuns = strategyRuns.filter(splitRun);
+  const summary = asRecord(selectedRun?.summary);
+  const funnel = asRecord(summary.funnel);
+  const lifecycle = asRecord(summary.pair_zone_lifecycle);
+  const reasons = asRecord(summary.reason_counts);
+  const selectedDataset = datasetRows.find((dataset) => dataset.dataset_id === selectedRun?.dataset_id);
+  const robustnessSummary = asRecord(robustnessRows[0]?.summary);
+  const robustnessCosts = asRecord(robustnessSummary.cost_scenarios) as Record<string, Record<string, unknown>>;
+  const robustnessSides = asRecord(robustnessSummary.buy_sell_normal_cost) as Record<string, Record<string, unknown>>;
+  const curve = useApi<ResearchCurve>(selectedRun ? `/api/research/runs/${selectedRun.run_id}/curve?display_limit=600` : "/api/research/runs?limit=1", 15_000);
+  const equity = asArray<{ value?: number }>(curve.data?.equity);
+  const drawdown = asArray<{ value?: number }>(curve.data?.drawdown);
 
   return <div className="page">
-    <div className="page-heading"><div><div className="title-row"><h1>Strategy Lab</h1><span className="page-context">OFFLINE / SHADOW ONLY</span></div><p>Read-only evidence for independently persisted strategies. Research never sends broker orders.</p></div></div>
-    <div className="summary-grid">
-      <div className="summary-card"><span>Execution</span><strong>DISABLED</strong></div>
-      <div className="summary-card"><span>Broker writes</span><strong>NONE</strong></div>
-      <div className="summary-card"><span>Selected strategy</span><strong>{selectedStrategy}</strong></div>
-      <div className="summary-card"><span>Dataset</span><strong>{selectedRun?.dataset_id ?? "—"}</strong></div>
-    </div>
-    <Panel title="Strategy selector" kicker="Evidence only">
-      <label className="metric-row"><span>Strategy</span><select value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.target.value)}>{strategyIds.map((id) => <option key={id}>{id}</option>)}</select></label>
-      <div className="metric-row"><span>Version</span><strong>{selectedRun?.strategy_version ?? "—"}</strong></div>
-      <div className="metric-row"><span>Dataset hash</span><strong>{selectedRun?.dataset_hash ?? "—"}</strong></div>
-    </Panel>
-    <Panel title="Research funnel" kicker="Canonical signals and aggregate rejections">
-      <DataState loading={comparison.loading} error={comparison.error} emptyTitle="No persisted run" emptyDetail="Run the read-only research CLI or Telegram backtest command." />
-      {selectedRun && <><div className="metric-row"><span>Snapshots</span><strong>{String(funnel.snapshots ?? summary.eligible_candles ?? "—")}</strong></div><div className="metric-row"><span>BUY / SELL / NO_TRADE</span><strong>{String(summary.buy ?? 0)} / {String(summary.sell ?? 0)} / {String(summary.no_trade ?? 0)}</strong></div>{Object.entries(reasons).map(([reason, count]) => <div className="metric-row" key={reason}><span>{reason}</span><strong>{String(count)}</strong></div>)}</>}
-    </Panel>
-    <Panel title="RR results" kicker="Same canonical signal set">
-      {rrRuns.map((run) => <div className="metric-row" key={run.run_id}><span>RR {String(run.parameters?.rr)} · {run.run_id.slice(0, 8)}</span><strong>Trades {String(run.summary?.trades ?? 0)} · Avg R {metric(run.summary?.average_r)} · Total R {metric(run.summary?.total_r)} · PF {metric(run.summary?.profit_factor)}</strong></div>)}
-    </Panel>
-    <Panel title="Chronological validation" kicker="Development · Validation · Holdout">
-      {splitRuns.map((run) => <div className="metric-row" key={run.run_id}><span>{run.run_name?.replace("phase-2.3-pair-zone-", "") ?? run.run_id.slice(0, 8)}</span><strong>Trades {String(run.summary?.trades ?? 0)} · Total R {metric(run.summary?.total_r)} · Win {metric(run.summary?.win_rate)}</strong></div>)}
-    </Panel>
-    <Panel title="Pair Zone lifecycle" kicker="Persisted aggregate statistics">
-      {Object.entries(lifecycle).filter(([key]) => key !== "lifecycle_states").map(([key, value]) => <div className="metric-row" key={key}><span>{key.replaceAll("_", " ")}</span><strong>{String(value)}</strong></div>)}
-    </Panel>
-    <Panel title="Equity and drawdown curves" kicker="Resolved outcomes in chronological order">
-      <div className="metric-row"><span>Latest cumulative R</span><strong>{metric(latestEquity)}</strong></div><div className="metric-row"><span>Latest drawdown R</span><strong>{metric(latestDrawdown)}</strong></div><div className="metric-row"><span>Curve points</span><strong>{curve.data?.equity.length ?? 0}</strong></div>
-      <div className="metric-row"><span>Equity curve (latest)</span><strong>{curve.data?.equity.slice(-8).map((point) => point.value.toFixed(2)).join(" → ") || "—"}</strong></div>
-      <div className="metric-row"><span>Drawdown curve (latest)</span><strong>{curve.data?.drawdown.slice(-8).map((point) => point.value.toFixed(2)).join(" → ") || "—"}</strong></div>
-    </Panel>
-    <Panel title="Robustness and cost validation" kicker="Frozen signals · descriptive evidence only">
-      <DataState loading={robustness.loading} error={robustness.error} emptyTitle="No robustness run" emptyDetail="Run the read-only Phase 2.4 research analysis." />
-      {robustness.data?.[0] && <>
-        <div className="metric-row"><span>Acceptance</span><strong>{String(robustnessSummary.acceptance ?? "—")}</strong></div>
-        <div className="metric-row"><span>Classification</span><strong>{String(robustnessSummary.classification ?? "—")}</strong></div>
-        {(["zero", "normal", "elevated", "stress"] as const).map((name) => <div className="metric-row" key={name}><span>{name} cost net R</span><strong>{metric(robustnessCosts[name]?.net_total_r)}</strong></div>)}
-        <div className="metric-row"><span>BUY / SELL net R</span><strong>{metric(robustnessSides.BUY?.net_total_r)} / {metric(robustnessSides.SELL?.net_total_r)}</strong></div>
-        <div className="metric-row"><span>Monte Carlo</span><strong>seed {String(robustness.data[0].seed)} · {String(robustness.data[0].simulation_count)} simulations</strong></div>
-      </>}
-    </Panel>
-    <Panel title="Recent persisted runs"><DataState loading={runs.loading} error={runs.error} emptyTitle="No backtest runs" emptyDetail="Use the read-only CLI or Telegram /backtest." />{strategyRuns.slice(0, 20).map((run) => <div className="metric-row" key={run.run_id}><span>{run.run_id.slice(0, 8)} · {run.strategy_id} · RR {String(run.parameters?.rr ?? "GRID")}</span><strong><StatusPill state={run.status === "COMPLETED" ? "CONNECTED" : run.status === "FAILED" ? "ERROR" : "STARTING"} /> {run.summary?.buy ?? 0} BUY / {run.summary?.sell ?? 0} SELL / {run.summary?.no_trade ?? 0} NO_TRADE</strong></div>)}</Panel>
-    <Panel title="Research datasets">{datasets.data?.map((dataset) => <div className="metric-row" key={dataset.dataset_id}><span>{dataset.dataset_id} · {dataset.symbol} {dataset.timeframe}</span><strong>{dataset.row_count} rows · {utcTime(dataset.start_at, true)} → {utcTime(dataset.end_at, true)}</strong></div>)}</Panel>
+    <div className="page-heading"><div><div className="title-row"><h1>Strategy Lab</h1><span className="page-context">READ ONLY · EVIDENCE ONLY</span></div><p>หลักฐานวิจัย immutable แยกจาก Forward และไม่ส่งคำสั่ง Broker</p></div><StatusPill state="DISABLED" label="Execution" /></div>
+    <div className="summary-grid"><div className="summary-card"><span>Execution</span><strong>DISABLED</strong></div><div className="summary-card"><span>Broker writes</span><strong>NONE</strong></div><div className="summary-card"><span>Selected strategy</span><strong>{selectedStrategy}</strong></div><div className="summary-card"><span>Dataset</span><strong>{selectedRun?.dataset_id ?? "ข้อมูลนี้ไม่มี"}</strong></div></div>
+    <Panel title="Strategy selector" kicker="Evidence only"><label className="metric-row"><span>Strategy</span><select value={selectedStrategy} onChange={(event) => setSelectedStrategy(event.target.value)}>{strategyIds.map((id) => <option key={id}>{id}</option>)}</select></label><div className="metric-row"><span>Version</span><strong>{selectedRun?.strategy_version ?? "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Dataset hash</span><strong className="mono">{selectedRun?.dataset_hash ?? "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Active runtime</span><strong>{registry.data?.active_strategy ?? "ข้อมูลนี้ไม่มี"} · {registry.data?.activation?.strategy_version ?? "ข้อมูลนี้ไม่มี"}</strong></div><div className="metric-row"><span>Config hash</span><strong className="mono">{registry.data?.activation?.config_hash ?? "ข้อมูลนี้ไม่มี"}</strong></div></Panel>
+    <Panel title="Historical Strategy Comparison" kicker="NO AUTOMATIC WINNER · RR 2.0">{comparisonAllRows.length ? comparisonAllRows.map((run, index) => { const runSummary = asRecord(run.summary); return <div className="comparison-row" key={runKey(run, index)}><div><strong>{run.strategy_id ?? "UNKNOWN"}</strong><span>{run.strategy_version ?? "ข้อมูลนี้ไม่มี"} · dataset {run.dataset_id ?? "UNKNOWN"}</span></div><div><span>Signals</span><strong>{String(runSummary.trades ?? "ข้อมูลนี้ไม่มี")}</strong></div><div><span>Expectancy</span><strong>{metric(runSummary.expectancy)}</strong></div><div><span>PF</span><strong>{metric(runSummary.profit_factor)}</strong></div><div><span>Net R</span><strong>{metric(runSummary.total_r)}</strong></div><div><span>Status</span><strong>{stateLabel(run.status)}</strong></div></div>; }) : <DataState loading={allComparison.loading} error={allComparison.error} emptyTitle="ยังไม่มีผลเปรียบเทียบ" emptyDetail="ต้องมี persisted completed run ของแต่ละ strategy ก่อน" />}<p className="prose-note">แสดงหลักฐาน Historical เท่านั้น ไม่รวม Forward returns และไม่สรุปว่า strategy ใดดีที่สุด</p></Panel>
+    <Panel title="Research funnel" kicker="Canonical signals and aggregate rejections">{selectedRun ? <><div className="metric-row"><span>Snapshots</span><strong>{String(funnel.snapshots ?? summary.eligible_candles ?? "ข้อมูลนี้ไม่มี")}</strong></div><div className="metric-row"><span>BUY / SELL / NO_TRADE</span><strong>{String(summary.buy ?? "ข้อมูลนี้ไม่มี")} / {String(summary.sell ?? "ข้อมูลนี้ไม่มี")} / {String(summary.no_trade ?? "ข้อมูลนี้ไม่มี")}</strong></div>{Object.entries(reasons).map(([reason, count]) => <div className="metric-row" key={reason}><span>{reason}</span><strong>{String(count)}</strong></div>)}</> : <DataState loading={comparison.loading} error={comparison.error} emptyTitle="ยังไม่มี persisted run" emptyDetail="ข้อมูลนี้ไม่มีใน Research API" />}</Panel>
+    <Panel title="RR results" kicker="Same canonical signal set">{rrRuns.length ? rrRuns.map((run, index) => { const parameters = asRecord(run.parameters); const runSummary = asRecord(run.summary); return <div className="metric-row" key={runKey(run, index)}><span>RR {String(parameters.rr ?? "ข้อมูลนี้ไม่มี")} · {String(run.run_id ?? "UNKNOWN").slice(0, 8)}</span><strong>Trades {String(runSummary.trades ?? "ข้อมูลนี้ไม่มี")} · Avg R {metric(runSummary.average_r)} · Total R {metric(runSummary.total_r)} · PF {metric(runSummary.profit_factor)}</strong></div>; }) : <DataState loading={runs.loading} error={runs.error} emptyTitle="ยังไม่มี RR results" emptyDetail="ข้อมูลนี้ไม่มีใน Research Run นี้" />}</Panel>
+    <Panel title="Chronological validation" kicker="Development · Validation · Holdout">{splitRuns.length ? splitRuns.map((run, index) => { const runSummary = asRecord(run.summary); return <div className="metric-row" key={runKey(run, index)}><span>{typeof run.run_name === "string" ? run.run_name.replace("phase-2.3-pair-zone-", "") : String(run.run_id ?? "UNKNOWN").slice(0, 8)}</span><strong>Trades {String(runSummary.trades ?? "ข้อมูลนี้ไม่มี")} · Total R {metric(runSummary.total_r)} · Win {metric(runSummary.win_rate)}</strong></div>; }) : <DataState loading={runs.loading} error={runs.error} emptyTitle="ยังไม่มี chronological split" emptyDetail="ข้อมูล Development / Validation / Holdout ยังไม่มี" />}</Panel>
+    <Panel title="Pair Zone lifecycle" kicker="Persisted aggregate statistics">{Object.entries(lifecycle).filter(([key]) => key !== "lifecycle_states").map(([key, value]) => <div className="metric-row" key={key}><span>{key.replaceAll("_", " ")}</span><strong>{String(value)}</strong></div>)}{!Object.keys(lifecycle).length && <div className="prose-note">ข้อมูลนี้ไม่มีใน Research Run นี้</div>}</Panel>
+    <Panel title="Parameter & Monte Carlo diagnostics" kicker="PERSISTED RESEARCH EVIDENCE"><div className="metrics"><div className="metric-row"><span>Config hash</span><strong className="mono">{summary.config_hash ? String(summary.config_hash) : registry.data?.activation?.config_hash ?? "ข้อมูลนี้ไม่มี"}</strong></div><div className="metric-row"><span>Dataset range</span><strong>{selectedDataset ? `${thaiDateTime(selectedDataset.start_at)} → ${thaiDateTime(selectedDataset.end_at)}` : "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Perturbation</span><strong>{String(summary.parameter_perturbation ?? summary.perturbation_diagnostics ?? "ข้อมูลนี้ไม่มีใน Research Run นี้")}</strong></div><div className="metric-row"><span>Monte Carlo</span><strong>{String(robustnessSummary.monte_carlo ?? (robustnessRows[0] ? `${robustnessRows[0].simulation_count} simulations · seed ${robustnessRows[0].seed}` : "ข้อมูลนี้ไม่มีใน Research Run นี้"))}</strong></div></div></Panel>
+    <Panel title="Equity and drawdown curves" kicker="Resolved outcomes in chronological order"><div className="metric-row"><span>Latest cumulative R</span><strong>{metric(equity[equity.length - 1]?.value)}</strong></div><div className="metric-row"><span>Latest drawdown R</span><strong>{metric(drawdown[drawdown.length - 1]?.value)}</strong></div><div className="metric-row"><span>Curve points</span><strong>{(curve.data?.point_count ?? equity.length) || "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Display points</span><strong>{curve.data?.display_sampled ? `${equity.length} / ${curve.data.point_count} (sampled)` : equity.length || "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Equity curve (latest)</span><strong>{equity.slice(-8).map((point) => metric(point.value, 2)).join(" → ") || "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div><div className="metric-row"><span>Drawdown curve (latest)</span><strong>{drawdown.slice(-8).map((point) => metric(point.value, 2)).join(" → ") || "ข้อมูลนี้ไม่มีใน Research Run นี้"}</strong></div></Panel>
+    <Panel title="Robustness and cost validation" kicker="Frozen signals · descriptive evidence only">{robustnessRows[0] ? <><div className="metric-row"><span>Acceptance</span><strong>{String(robustnessSummary.acceptance ?? "ข้อมูลนี้ไม่มี")}</strong></div><div className="metric-row"><span>Classification</span><strong>{String(robustnessSummary.classification ?? "ข้อมูลนี้ไม่มี")}</strong></div>{["zero", "normal", "elevated", "stress"].map((name) => <div className="metric-row" key={name}><span>{name} cost net R</span><strong>{metric(robustnessCosts[name]?.net_total_r)}</strong></div>)}<div className="metric-row"><span>BUY / SELL net R</span><strong>{metric(robustnessSides.BUY?.net_total_r)} / {metric(robustnessSides.SELL?.net_total_r)}</strong></div><div className="metric-row"><span>Monte Carlo</span><strong>seed {String(robustnessRows[0].seed)} · {String(robustnessRows[0].simulation_count)} simulations</strong></div></> : <DataState loading={robustness.loading} error={robustness.error} emptyTitle="ยังไม่มี robustness evidence" emptyDetail="ข้อมูลนี้ไม่มีใน Research API" />}</Panel>
+    <Panel title="Recent persisted runs"><DataState loading={runs.loading} error={runs.error} emptyTitle="No backtest runs" emptyDetail="Use the read-only CLI or Telegram /backtest." />{strategyRuns.slice(0, 20).map((run, index) => { const runSummary = asRecord(run.summary); const parameters = asRecord(run.parameters); return <div className="metric-row" key={runKey(run, index)}><span>{String(run.run_id ?? "UNKNOWN").slice(0, 8)} · {run.strategy_id ?? "UNKNOWN"} · RR {String(parameters.rr ?? "GRID")}</span><strong><StatusPill state={run.status === "COMPLETED" ? "CONNECTED" : run.status === "FAILED" ? "ERROR" : "STARTING"} /> {String(runSummary.buy ?? "ข้อมูลนี้ไม่มี")} BUY / {String(runSummary.sell ?? "ข้อมูลนี้ไม่มี")} SELL / {String(runSummary.no_trade ?? "ข้อมูลนี้ไม่มี")} NO_TRADE</strong></div>; })}</Panel>
+    <Panel title="Research datasets">{datasetRows.length ? datasetRows.map((dataset, index) => <div className="metric-row" key={`${dataset.dataset_id ?? "dataset"}-${index}`}><span>{dataset.dataset_id ?? "UNKNOWN"} · {dataset.symbol ?? "UNKNOWN"} {dataset.timeframe ?? "UNKNOWN"}</span><strong>{dataset.row_count ?? "ข้อมูลนี้ไม่มี"} rows · {utcTime(dataset.start_at, true)} → {utcTime(dataset.end_at, true)}</strong></div>) : <DataState loading={datasets.loading} error={datasets.error} emptyTitle="ยังไม่มี datasets" emptyDetail="ข้อมูลนี้ไม่มีใน Research API" />}</Panel>
   </div>;
 }

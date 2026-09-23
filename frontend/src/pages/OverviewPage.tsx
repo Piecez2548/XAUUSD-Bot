@@ -19,10 +19,11 @@ import { StatusPill } from "../components/StatusPill";
 import { useApi } from "../hooks/useApi";
 import { useLiveEvents } from "../hooks/useLiveEvents";
 import { money, number, percent, unavailable, utcTime } from "../lib/format";
+import { sampleCheckpoint, thaiDateTime, workerState } from "../lib/runtime";
+import { useSystemHealth } from "../components/useSystemHealth";
 import type {
   AccountSnapshot,
   AccountCurvePoint,
-  HealthResponse,
   LiveStatusResponse,
   Position,
   PositionStatus,
@@ -32,6 +33,9 @@ import type {
   SymbolSnapshot,
   SystemEvent,
   Trade,
+  ForwardHealth,
+  ForwardPerformance,
+  ForwardSession,
 } from "../types";
 
 const ranges = ["1D", "1W", "1M", "3M", "ALL"] as const;
@@ -79,11 +83,14 @@ export function OverviewPage() {
   const positionStatus = useApi<PositionStatus>("/api/positions/status", 10_000);
   const trades = useApi<Trade[]>("/api/trades?limit=8", 30_000);
   const risk = useApi<RiskSnapshot | null>("/api/risk/current", 10_000);
-  const health = useApi<HealthResponse>("/api/system/health", 10_000);
+  const health = useSystemHealth();
   const liveStatus = useApi<LiveStatusResponse>("/api/live/status", 5_000);
   const config = useApi<PublicConfig>("/api/config/public");
   const storedEvents = useApi<SystemEvent[]>("/api/system/events?limit=150", 15_000);
-  const accountCurve = useApi<AccountCurvePoint[]>("/api/performance/account-curve", 30_000);
+  const accountCurve = useApi<AccountCurvePoint[]>("/api/performance/account-curve?display_limit=600", 30_000);
+  const forwardSession = useApi<ForwardSession | null>("/api/forward/session", 15_000);
+  const forwardHealth = useApi<ForwardHealth>("/api/forward/health", 10_000);
+  const forwardPerformance = useApi<ForwardPerformance>("/api/forward/performance", 15_000);
   const live = useLiveEvents(storedEvents.data ?? []);
   const [range, setRange] = useState<(typeof ranges)[number]>("ALL");
   const [severity, setSeverity] = useState("ALL");
@@ -137,6 +144,8 @@ export function OverviewPage() {
   const maxRisk = risk.data?.max_aggregate_risk_percent ?? config.data?.max_aggregate_risk_percent ?? 6;
   const usedRisk = risk.data?.open_risk_percent;
   const riskWidth = usedRisk == null ? 0 : Math.min(100, Math.max(0, usedRisk / maxRisk * 100));
+  const forward = forwardPerformance.data;
+  const forwardSessionData = forwardSession.data ?? forward?.session;
 
   return (
     <div className="page overview-page">
@@ -175,7 +184,7 @@ export function OverviewPage() {
         <div className="state-stack">
           <Panel title="System Health" kicker="TRUTHFUL SERVICE STATE">
             <div className="health-list">
-              {([ ["MT5", services.mt5 ?? "UNKNOWN"], ["Database", health.data?.database ?? "UNKNOWN"], ["Telegram", services.telegram ?? "UNKNOWN"], ["History Worker", services.history_worker ?? "UNKNOWN"], ["Shadow Worker", services.shadow_worker ?? "UNKNOWN"], ["AI Engine", "PLANNED"], ["News", "PLANNED"], ["Execution", "DISABLED"] ] as [string, ServiceState][]).map(([label, state]) => <div key={label}><span>{label}</span><StatusPill state={state} /></div>)}
+              {([ ["Supervisor", workerState(services, "supervisor")], ["API", workerState(services, "live_engine")], ["MT5", workerState(services, "mt5")], ["Database", health.data?.database ?? "UNKNOWN"], ["Telegram", workerState(services, "telegram")], ["History Worker", workerState(services, "history_worker")], ["Shadow Worker", workerState(services, "shadow_worker")], ["Shadow Outcome Worker", workerState(services, "shadow_outcome_worker")], ["Forward Shadow Worker", workerState(services, "forward_shadow_worker")], ["Execution", "DISABLED"] ] as [string, ServiceState][]).map(([label, state]) => <div key={label}><span>{label}</span><StatusPill state={state} /></div>)}
             </div>
           </Panel>
           <Panel title="Live Data Engine" kicker="READ-ONLY FRESHNESS">
@@ -195,6 +204,16 @@ export function OverviewPage() {
           </Panel>
         </div>
       </div>
+
+      <Panel title="Forward Validation Summary" kicker="PERSISTED READ-ONLY EVIDENCE" action={<StatusPill label="FORWARD" state={(forwardHealth.data?.state ?? "UNKNOWN") as ServiceState} />}>
+        {forward && forwardSessionData ? <div className="forward-summary-grid">
+          <div className="forward-identity"><span className="panel-context">SESSION</span><strong className="mono">{forwardSessionData.session_id}</strong><span>{forwardSessionData.strategy_id} · v{forwardSessionData.strategy_version}</span><small>เริ่ม {thaiDateTime(forwardSessionData.started_at)} · ล่าสุด {thaiDateTime(forwardHealth.data?.last_closed_m5)}</small></div>
+          <div className="forward-stat"><span>Signals</span><strong>{forward.signals}</strong><small>{sampleCheckpoint(forward.signals)}</small></div>
+          <div className="forward-stat"><span>BUY / SELL</span><strong>{forward.BUY} / {forward.SELL}</strong><small>Open {forward.OPEN} · Resolved {forward.combined.resolved}</small></div>
+          <div className="forward-stat"><span>TP / SL / AMBIGUOUS / EXPIRED</span><strong>{forward.TP} / {forward.SL} / {forward.AMBIGUOUS} / {forward.EXPIRED}</strong><small>Forward only</small></div>
+          <div className="forward-stat"><span>Expectancy / PF</span><strong>{forward.combined.net_expectancy == null ? unavailable : `${number(forward.combined.net_expectancy, 4)} R`} / {forward.combined.profit_factor == null ? unavailable : number(forward.combined.profit_factor, 2)}</strong><small>Net R {number(forward.combined.net_total_r, 2)}</small></div>
+        </div> : <DataState loading={forwardPerformance.loading || forwardSession.loading} error={forwardPerformance.error ?? forwardSession.error} emptyTitle="Forward data unavailable" emptyDetail="ยังไม่มีข้อมูล Forward หรือ backend ยังเชื่อมต่อไม่ได้ ระบบจะไม่สร้างข้อมูลแทน" />}
+      </Panel>
 
       <Panel title="Equity & Drawdown" kicker="ACCOUNT SNAPSHOT HISTORY" className="chart-panel" action={<div className="range-control" aria-label="Chart range">{ranges.map((item) => <button key={item} aria-pressed={range === item} className={range === item ? "active" : ""} onClick={() => setRange(item)}>{item}</button>)}</div>}>
         {chartData.length ? <><div className="chart-legend" aria-hidden="true"><span className="equity">Equity</span><span className="balance">Balance</span><span className="drawdown">Drawdown %</span></div><div className="chart-wrap" role="img" aria-label={`Account snapshot chart with ${chartData.length} point(s). Latest equity ${money(chartData.at(-1)?.equity, currency)}, balance ${money(chartData.at(-1)?.balance, currency)}, drawdown ${percent(chartData.at(-1)?.drawdown)}.`}><ResponsiveContainer width="100%" height="100%"><ComposedChart data={chartData} margin={{ top: 10, right: 8, bottom: 2, left: 0 }}><CartesianGrid stroke="#303945" vertical={false} /><XAxis dataKey="timestamp" tickFormatter={(value: string) => utcTime(value, true)} tick={{ fill: "#98a5b5", fontSize: 10 }} axisLine={false} tickLine={false} /><YAxis yAxisId="currency" tick={{ fill: "#98a5b5", fontSize: 10 }} axisLine={false} tickLine={false} width={64} /><YAxis yAxisId="drawdown" orientation="right" unit="%" tick={{ fill: "#b88d8d", fontSize: 10 }} axisLine={false} tickLine={false} width={48} /><Tooltip contentStyle={{ background: "#111820", border: "1px solid #303945", borderRadius: 8 }} labelFormatter={(value) => `${utcTime(String(value), true)} UTC`} /><Area yAxisId="drawdown" type="monotone" dataKey="drawdown" name="Drawdown %" fill="#ef62621b" stroke="#ef6262" strokeWidth={1} /><Line yAxisId="currency" type="monotone" dataKey="equity" name="Equity" stroke="#3bc784" dot={chartData.length === 1} strokeWidth={2} /><Line yAxisId="currency" type="monotone" dataKey="balance" name="Balance" stroke="#64a7f2" dot={chartData.length === 1} strokeWidth={1} strokeDasharray="4 4" /></ComposedChart></ResponsiveContainer></div></> : <DataState loading={accountCurve.loading} error={accountCurve.error} emptyTitle="No account history" emptyDetail="Equity, balance, and drawdown appear after verified read-only account snapshots are persisted." />}
