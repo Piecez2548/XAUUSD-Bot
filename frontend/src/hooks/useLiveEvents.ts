@@ -15,7 +15,9 @@ export function useLiveEvents(seed: SystemEvent[]): { events: SystemEvent[]; con
     let retry: number | undefined;
     let disposed = false;
     const connect = () => {
-      socket = new WebSocket(websocketUrl());
+      const endpoint = websocketUrl();
+      if (!endpoint) return;
+      socket = new WebSocket(endpoint);
       socket.onopen = () => setConnected(true);
       socket.onmessage = (message) => {
         const envelope = JSON.parse(message.data as string) as {

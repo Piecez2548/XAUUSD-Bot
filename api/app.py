@@ -13,14 +13,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Select, desc, func, or_, select
 
 from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
+from config.remote_read_only_policy import is_remote_path_allowed
 from config.settings import Settings, load_settings
 from persistence.database import Database
 from persistence.orm import (
@@ -375,6 +376,24 @@ def create_app(
         allow_methods=["GET"],
         allow_headers=["Accept", "Content-Type"],
     )
+
+    if runtime_settings.remote_dashboard_mode:
+
+        @app.middleware("http")
+        async def enforce_private_dashboard_boundary(request: Request, call_next):
+            """Require Tailscale Serve identity and the Phase 2.6 route contract."""
+
+            if not request.headers.get("Tailscale-User-Login"):
+                return JSONResponse(
+                    {"detail": "Tailscale identity required"}, status_code=401
+                )
+            path = request.url.path
+            if path.startswith("/api/"):
+                if request.method != "GET" or not is_remote_path_allowed(path):
+                    return JSONResponse({"detail": "Remote route denied"}, status_code=404)
+            elif request.method not in {"GET", "HEAD"}:
+                return JSONResponse({"detail": "Remote method denied"}, status_code=405)
+            return await call_next(request)
 
     def completed_trades() -> list[TradeRecord]:
         with db.session() as session:
@@ -1753,6 +1772,9 @@ def create_app(
 
     @app.websocket("/ws/live")
     async def websocket_live(websocket: WebSocket) -> None:
+        if runtime_settings.remote_dashboard_mode:
+            await websocket.close(code=1008)
+            return
         await realtime.connect(websocket)
         try:
             while True:

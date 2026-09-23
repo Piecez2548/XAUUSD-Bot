@@ -113,6 +113,7 @@ class Settings:
     telegram_timeout_seconds: float = 5.0
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    remote_dashboard_mode: bool = False
     dashboard_public_url: str | None = None
     cors_origins: tuple[str, ...] = (
         "http://localhost:5173",
@@ -258,6 +259,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         telegram_timeout_seconds=float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "5")),
         api_host=os.getenv("API_HOST", "127.0.0.1"),
         api_port=_positive_int("API_PORT", 8000),
+        remote_dashboard_mode=_boolean("REMOTE_DASHBOARD_MODE"),
         dashboard_public_url=os.getenv("DASHBOARD_PUBLIC_URL") or None,
         cors_origins=_origins(
             "CORS_ORIGINS",
