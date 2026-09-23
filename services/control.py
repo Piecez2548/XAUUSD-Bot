@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, perf_counter
@@ -44,7 +43,12 @@ from persistence.orm import (
 )
 from persistence.repositories import ControlAuditRepository, SystemHealthRepository
 from services.shadow_outcome import OUTCOME_POLICY_VERSION, performance_summary
-from services.supervisor import ProcessSupervisor
+from services.supervisor import (
+    ProcessSupervisor,
+    resolve_supervised_python,
+    write_supervisor_diagnostic,
+    write_supervisor_lifecycle_event,
+)
 from services.worker_health import derive_worker_state
 
 COMMAND_HELP = {
@@ -146,7 +150,7 @@ class TelegramControlService:
             while not self._stop.is_set():
                 try:
                     for record in self.supervisor.monitor_once(self._supervised_commands()):
-                        if record.restart_count > 0 or record.state == "ERROR":
+                        if self._process_crash_notification_required(record):
                             key = (record.component, record.restart_count, record.state)
                             if key not in self._process_notifications:
                                 self._process_notifications.add(key)
@@ -236,6 +240,24 @@ class TelegramControlService:
             and user_id in set(self.settings.telegram_allowed_user_ids)
         )
 
+    @staticmethod
+    def _process_crash_notification_required(record) -> bool:
+        """Notify only for a crash transition, not historical restart count.
+
+        ``restart_count`` is cumulative registry history.  A deliberate stop
+        can therefore legitimately return ``STOPPED`` with a non-zero count.
+        A recovered crash retains the exit diagnostic on the returned RUNNING
+        record, while an unrecovered crash is CRASHED/ERROR.
+        """
+
+        if record.state in {"CRASHED", "ERROR"}:
+            return True
+        return bool(
+            record.state == "RUNNING"
+            and isinstance(record.last_error, str)
+            and record.last_error.startswith("supervised process exited with code ")
+        )
+
     def _rate_allowed(self, user_id: str, command: str) -> bool:
         now = datetime.now(UTC)
         key = (user_id, command)
@@ -254,8 +276,76 @@ class TelegramControlService:
             return await self._stop_infrastructure()
         if command == "/restart":
             async with self._operation_lock:
-                await self._stop_infrastructure_locked()
-                return await self._start_infrastructure_locked()
+                operation_id = str(uuid4())
+                write_supervisor_lifecycle_event(
+                    self.project_root,
+                    operation="/restart",
+                    stage="restart_started",
+                    component="infrastructure",
+                    details={"operation_id": operation_id},
+                )
+                stop_response = await self._stop_infrastructure_locked(
+                    lifecycle_operation="restart",
+                    operation_id=operation_id,
+                )
+                records = self.supervisor.status()
+                stop_verified = all(
+                    records.get(component) is not None
+                    and records[component].state == "STOPPED"
+                    for component in ("api", "live")
+                )
+                write_supervisor_lifecycle_event(
+                    self.project_root,
+                    operation="/restart",
+                    stage="restart_stop_verified",
+                    component="infrastructure",
+                    details={
+                        "operation_id": operation_id,
+                        "verified_stopped": stop_verified,
+                        "states": {
+                            component: getattr(records.get(component), "state", None)
+                            for component in ("api", "live")
+                        },
+                    },
+                )
+                if not stop_verified:
+                    write_supervisor_lifecycle_event(
+                        self.project_root,
+                        operation="/restart",
+                        stage="restart_aborted",
+                        component="infrastructure",
+                        details={
+                            "operation_id": operation_id,
+                            "abort_reason": "existing supervised topology did not reach STOPPED",
+                        },
+                    )
+                    return (
+                        f"{stop_response}\n"
+                        "RESTART ABORTED — an existing supervised topology did not reach STOPPED."
+                    )
+                write_supervisor_lifecycle_event(
+                    self.project_root,
+                    operation="/restart",
+                    stage="restart_start_transition",
+                    component="infrastructure",
+                    details={"operation_id": operation_id},
+                )
+                response = await self._start_infrastructure_locked()
+                final_records = self.supervisor.status()
+                write_supervisor_lifecycle_event(
+                    self.project_root,
+                    operation="/restart",
+                    stage="restart_completed",
+                    component="infrastructure",
+                    details={
+                        "operation_id": operation_id,
+                        "final_states": {
+                            component: getattr(final_records.get(component), "state", None)
+                            for component in ("api", "live")
+                        },
+                    },
+                )
+                return response
         handlers = {
             "/status": self._status,
             "/health": self._health,
@@ -297,9 +387,19 @@ class TelegramControlService:
 
     async def _start_infrastructure_locked(self) -> str:
         try:
+            self._reconcile_supervisor()
+        except Exception as exc:
+            self.logger.exception("Supervisor reconciliation failed before /start")
+            self._write_startup_diagnostic("supervisor_reconciliation", exc)
+            return self._startup_incomplete_response(
+                {"supervisor": "ERROR", "api": "NOT_STARTED", "live": "NOT_STARTED"},
+                f"supervisor reconciliation failed ({type(exc).__name__}); inspect local logs",
+            )
+        try:
             migrate_database(self.settings.database_url, self.project_root)
         except Exception as exc:
             self.logger.exception("Database migration failed before /start")
+            self._write_startup_diagnostic("database_migration", exc)
             return (
                 "🔴 ระบบยังไม่พร้อม\n"
                 "การตรวจสอบ: DATABASE=FAILED\n"
@@ -308,20 +408,98 @@ class TelegramControlService:
                 "Telegram Control: 🟢 ออนไลน์\n"
                 f"{execution_disabled()}"
             )
-        mt5_result = await self.mt5_bootstrap.ensure_ready(self.database)
+        try:
+            mt5_result = await self.mt5_bootstrap.ensure_ready(self.database)
+        except Exception as exc:
+            self.logger.exception("MT5 readiness failed unexpectedly before /start")
+            self._write_startup_diagnostic("mt5_readiness", exc)
+            return self._startup_incomplete_response(
+                {"supervisor": "RECONCILED", "mt5": "ERROR", "api": "NOT_STARTED", "live": "NOT_STARTED"},
+                f"MT5 readiness failed ({type(exc).__name__}); inspect local logs",
+            )
         if not mt5_result.ready:
             return self._mt5_start_failure(mt5_result)
         if await self._monitoring_is_healthy():
             return self._system_ready_response(mt5_result, already_running=True)
-        api_command = [sys.executable, str(self.project_root / "main.py"), "server"]
-        live_command = [sys.executable, str(self.project_root / "main.py"), "live"]
-        self.supervisor.start_component("api", api_command)
-        self.supervisor.start_component("live", live_command)
+        try:
+            supervised_python = resolve_supervised_python()
+        except RuntimeError as exc:
+            self._write_startup_diagnostic("interpreter_resolution", exc)
+            return self._startup_incomplete_response(
+                {"api": "NOT_STARTED", "live": "NOT_STARTED"},
+                str(exc),
+            )
+        api_command = [supervised_python, str(self.project_root / "main.py"), "server"]
+        live_command = [supervised_python, str(self.project_root / "main.py"), "live"]
+        self._startup_started_at = datetime.now(UTC)
+        started_here: list[str] = []
+        started_records: dict[str, object] = {}
+        try:
+            before = self.supervisor.status()
+            api = self.supervisor.start_component("api", api_command)
+            started_records["api"] = api
+            if self._start_spawned_by_request("api", before, api):
+                started_here.append("api")
+            if api.state != "RUNNING":
+                self._stop_failed_start(
+                    started_here,
+                    reason=f"api verification failed: {api.last_error or api.state}",
+                    records=started_records,
+                )
+                return self._startup_incomplete_response(
+                    {"api": api.state, "live": "NOT_STARTED"}, api.last_error
+                )
+            live = self.supervisor.start_component("live", live_command)
+            started_records["live"] = live
+            if self._start_spawned_by_request("live", before, live):
+                started_here.append("live")
+            if live.state != "RUNNING":
+                self._stop_failed_start(
+                    started_here,
+                    reason=f"live verification failed: {live.last_error or live.state}",
+                    records=started_records,
+                )
+                return self._startup_incomplete_response(
+                    {"api": "OK", "live": live.state}, live.last_error
+                )
+        except Exception as exc:
+            self.logger.exception("Supervised child startup failed before verification")
+            self._write_startup_diagnostic("supervised_child_start", exc)
+            self._stop_failed_start(
+                started_here,
+                reason=f"supervised child startup exception: {type(exc).__name__}",
+                records=started_records,
+            )
+            return self._startup_incomplete_response(
+                {"api": "ERROR", "live": "NOT_STARTED"},
+                f"supervised child startup failed ({type(exc).__name__}); inspect local logs",
+            )
         verification = await self._wait_for_startup_verification()
+        verification_checks = dict(verification.get("checks", {}))
+        verification_complete = bool(verification.get("complete"))
+        write_supervisor_lifecycle_event(
+            self.project_root,
+            operation="/start",
+            stage="startup_verification",
+            component="infrastructure",
+            details={
+                "verification_state": "COMPLETE" if verification_complete else "INCOMPLETE",
+                "checks": verification_checks,
+                "rollback_trigger": (
+                    None
+                    if verification_complete
+                    else "startup verification complete=False"
+                ),
+            },
+        )
         if not verification["complete"]:
-            self._stop_failed_start()
             checks = " ".join(
-                f"{name.upper()}={value}" for name, value in verification["checks"].items()
+                f"{name.upper()}={value}" for name, value in verification_checks.items()
+            )
+            self._stop_failed_start(
+                started_here,
+                reason=f"startup verification incomplete: {checks}",
+                records=started_records,
             )
             return (
                 "🟠 START INCOMPLETE — ระบบเริ่มได้ไม่ครบ\n"
@@ -339,6 +517,57 @@ class TelegramControlService:
         )
         return self._system_ready_response(result)
 
+    @staticmethod
+    def _startup_incomplete_response(checks: dict[str, str], reason: str | None) -> str:
+        rendered = " ".join(f"{name.upper()}={value}" for name, value in checks.items())
+        detail = reason or "supervised process identity or startup verification failed"
+        return (
+            "🟠 START INCOMPLETE — ระบบเริ่มได้ไม่ครบ\n"
+            f"การตรวจสอบ: {rendered}\n"
+            f"สาเหตุ: {detail}\n"
+            "ระบบติดตาม: ยังไม่เริ่ม\n"
+            "Telegram Control: 🟢 ออนไลน์\n"
+            f"{execution_disabled()}"
+        )
+
+    def _reconcile_supervisor(self):
+        reconcile = getattr(self.supervisor, "reconcile", None)
+        if callable(reconcile):
+            return reconcile()
+        # Compatibility for test doubles and older injected supervisors.
+        return self.supervisor.status()
+
+    def _write_startup_diagnostic(self, stage: str, exc: BaseException) -> None:
+        write_supervisor_diagnostic(
+            self.project_root,
+            operation="/start",
+            stage=stage,
+            exc=exc,
+            secrets=(
+                self.settings.mt5_password or "",
+                self.settings.telegram_bot_token or "",
+            ),
+        )
+
+    def _start_spawned_by_request(self, component: str, before, record) -> bool:
+        """Only roll back processes actually created by this /start call."""
+
+        marker = getattr(self.supervisor, "last_start_spawned", None)
+        if callable(marker):
+            return bool(marker(component))
+        return False
+
+    def _supervisor_state(self, records=None) -> str:
+        records = records or self.supervisor.status()
+        states = [records.get(name).state if records.get(name) else "STOPPED" for name in ("api", "live")]
+        if all(state == "RUNNING" for state in states):
+            return "CONNECTED"
+        if any(state == "RUNNING" for state in states):
+            return "DEGRADED"
+        if all(state == "STOPPED" for state in states):
+            return "STOPPED"
+        return "DEGRADED"
+
     async def _monitoring_is_healthy(self) -> bool:
         records = self.supervisor.status()
         api_process = records.get("api")
@@ -349,6 +578,8 @@ class TelegramControlService:
             or live_process is None
             or live_process.state != "RUNNING"
         ):
+            return False
+        if self._supervisor_state(records) != "CONNECTED":
             return False
         if self._latest_service_state("live_runtime") != "CONNECTED":
             return False
@@ -405,10 +636,37 @@ class TelegramControlService:
             f"{execution_disabled()}"
         )
 
-    def _stop_failed_start(self) -> None:
-        for component in ("live", "api"):
+    def _stop_failed_start(
+        self,
+        components: list[str] | None = None,
+        *,
+        reason: str = "startup rollback",
+        records: dict[str, object] | None = None,
+    ) -> None:
+        targets = ("live", "api") if components is None else components
+        for component in targets:
             try:
-                self.supervisor.stop_component(component)
+                before = (records or {}).get(component)
+                final = self.supervisor.stop_component(component)
+                write_supervisor_lifecycle_event(
+                    self.project_root,
+                    operation="/start",
+                    stage="startup_rollback",
+                    component=component,
+                    details={
+                        "initial_pid": getattr(before, "pid", None),
+                        "observed_topology": {
+                            "parent_pid": getattr(before, "parent_pid", None),
+                            "process_tree": getattr(before, "process_tree", ()),
+                            "process_identities": getattr(before, "process_identities", ()),
+                        },
+                        "verification_state": getattr(before, "state", None),
+                        "verification_failure_reason": getattr(before, "last_error", None),
+                        "rollback_trigger": reason,
+                        "rollback_target": component,
+                        "final_state": getattr(final, "state", None),
+                    },
+                )
             except (AttributeError, RuntimeError):
                 self.logger.warning("Unable to stop failed supervised component %s", component)
 
@@ -416,9 +674,14 @@ class TelegramControlService:
         async with self._operation_lock:
             return await self._stop_infrastructure_locked()
 
-    async def _stop_infrastructure_locked(self) -> str:
-        live = self.supervisor.stop_component("live")
-        api = self.supervisor.stop_component("api")
+    async def _stop_infrastructure_locked(
+        self,
+        *,
+        lifecycle_operation: str = "stop",
+        operation_id: str | None = None,
+    ) -> str:
+        live = self._stop_supervised_component("live", lifecycle_operation, operation_id)
+        api = self._stop_supervised_component("api", lifecycle_operation, operation_id)
         if live.state != "STOPPED" or api.state != "STOPPED":
             return (
                 "🟠 หยุดระบบติดตามได้ไม่ครบ\n\n"
@@ -438,6 +701,32 @@ class TelegramControlService:
             f"{execution_disabled()}"
         )
 
+    def _stop_supervised_component(
+        self,
+        component: str,
+        lifecycle_operation: str,
+        operation_id: str | None,
+    ):
+        stop = self.supervisor.stop_component
+        try:
+            import inspect
+
+            parameters = inspect.signature(stop).parameters.values()
+            supports_context = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                or parameter.name in {"operation_id", "lifecycle_operation"}
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_context = False
+        if supports_context:
+            return stop(
+                component,
+                operation_id=operation_id,
+                lifecycle_operation=lifecycle_operation,
+            )
+        return stop(component)
+
     def _status(self) -> str:
         records = self.supervisor.status()
         live_process = records.get("live")
@@ -456,7 +745,7 @@ class TelegramControlService:
         return "\n".join(
             [
                 "📡 สถานะระบบ",
-                status_line("Supervisor", "CONNECTED"),
+                status_line("Supervisor", self._supervisor_state(records)),
                 status_line("Live Engine", live_state, connection=True),
                 status_line("API", records.get("api").state if records.get("api") else "STOPPED", connection=True),
                 status_line("MT5", self._latest_service_state("mt5"), connection=True),
@@ -470,6 +759,7 @@ class TelegramControlService:
     async def _wait_for_startup_verification(self) -> dict[str, object]:
         deadline = monotonic() + self.settings.supervisor_operation_timeout_seconds
         checks: dict[str, str] = {}
+        startup_started_at = getattr(self, "_startup_started_at", datetime.now(UTC))
         while True:
             records = self.supervisor.status()
             api_process = records.get("api")
@@ -479,8 +769,8 @@ class TelegramControlService:
                 and api_process.state == "RUNNING"
                 and await self._api_responsive()
             )
-            runtime = self._latest_service_state("live_runtime")
-            mt5 = self._latest_service_state("mt5")
+            runtime = self._latest_service_state("live_runtime", minimum_timestamp=startup_started_at)
+            mt5 = self._latest_service_state("mt5", minimum_timestamp=startup_started_at)
             _risk, _observed, freshness, _rows, snapshot_id = self._snapshot_context()
             checks = {
                 "api": "OK" if api_ok else "WAITING",
@@ -515,6 +805,8 @@ class TelegramControlService:
 
     def _health(self) -> str:
         statuses = self._latest_health()
+        records = self.supervisor.status()
+        statuses["supervisor"] = self._supervisor_state(records)
         statuses["live_runtime"] = self._latest_service_state("live_runtime")
         statuses["mt5"] = self._latest_service_state("mt5")
         statuses["worker:history"] = self._history_worker_state()
@@ -523,7 +815,7 @@ class TelegramControlService:
         statuses["worker:forward_shadow"] = self._forward_worker_state()
         lines = ["🩺 สุขภาพระบบ"]
         for name, default in (
-            ("supervisor", "HEALTHY"),
+            ("supervisor", "UNKNOWN"),
             ("live_runtime", "UNKNOWN"),
             ("mt5", "UNKNOWN"),
             ("database", "CONNECTED" if self.database.healthcheck() else "DISCONNECTED"),
@@ -1223,7 +1515,12 @@ class TelegramControlService:
     def _help() -> str:
         return thai_help()
 
-    def _latest_service_state(self, component: str) -> str:
+    def _latest_service_state(
+        self,
+        component: str,
+        *,
+        minimum_timestamp: datetime | None = None,
+    ) -> str:
         with self.database.session() as session:
             if component == "mt5":
                 health_row = session.scalar(
@@ -1233,6 +1530,14 @@ class TelegramControlService:
                     .limit(1)
                 )
                 if health_row is not None:
+                    if minimum_timestamp is not None:
+                        observed = (
+                            health_row.timestamp
+                            if health_row.timestamp.tzinfo
+                            else health_row.timestamp.replace(tzinfo=UTC)
+                        )
+                        if observed < minimum_timestamp:
+                            return "UNKNOWN"
                     threshold = max(30.0, self.settings.live_account_interval_seconds * 4)
                     if not _is_stale(
                         health_row.timestamp,
@@ -1254,6 +1559,10 @@ class TelegramControlService:
             )
         if row is None:
             return "UNKNOWN"
+        if minimum_timestamp is not None:
+            observed = row.timestamp if row.timestamp.tzinfo else row.timestamp.replace(tzinfo=UTC)
+            if observed < minimum_timestamp:
+                return "UNKNOWN"
         if component == "live_runtime":
             threshold = max(30.0, self.settings.live_account_interval_seconds * 4)
             if _is_stale(row.timestamp, max_age=timedelta(seconds=threshold)):
@@ -1407,9 +1716,10 @@ class TelegramControlService:
             self.logger.exception("Telegram health persistence failed")
 
     def _supervised_commands(self) -> dict[str, list[str]]:
+        supervised_python = resolve_supervised_python()
         return {
-            "api": [sys.executable, str(self.project_root / "main.py"), "server"],
-            "live": [sys.executable, str(self.project_root / "main.py"), "live"],
+            "api": [supervised_python, str(self.project_root / "main.py"), "server"],
+            "live": [supervised_python, str(self.project_root / "main.py"), "live"],
         }
 
     def _load_offset(self) -> int:

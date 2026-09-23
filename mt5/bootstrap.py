@@ -65,6 +65,7 @@ def _default_process_probe() -> tuple[TerminalProcess, ...]:
             text=True,
             check=False,
             timeout=5,
+            creationflags=_background_creation_flags(),
         )
     except (OSError, subprocess.SubprocessError):
         return ()
@@ -77,6 +78,15 @@ def _default_process_probe() -> tuple[TerminalProcess, ...]:
         except ValueError:
             continue
     return tuple(processes)
+
+
+def _background_creation_flags() -> int:
+    """Hide only background inspection helpers on Windows."""
+
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if os.name == "nt":
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return flags
 
 
 def verify_mt5_readiness(settings: Settings, database: Any) -> MT5Verification:
