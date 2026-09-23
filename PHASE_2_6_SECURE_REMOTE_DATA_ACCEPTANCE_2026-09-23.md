@@ -3,7 +3,7 @@
 Date: 2026-09-23 (Asia/Bangkok)
 Repository: `D:\Project_001\Nexus-Project\XAUUSD Bot`
 Starting SHA: `872742a1cb8077c0beaaf20ac9e2d9dfdf1b465e`
-Ending SHA: `872742a1cb8077c0beaaf20ac9e2d9dfdf1b465e` (Phase 2.6 changes are currently uncommitted)
+Ending SHA: `aafb7594035ca0ec7afe60edc58b88cbe5e4e3c0` (Phase 2.6 changes pushed in two logical commits)
 
 ## Status
 
@@ -336,14 +336,13 @@ no lifecycle or trading action was invoked.
 | Real-money execution | DISABLED | API-only window; no broker writes or execution capability exposed |
 | Forward Shadow | PRESERVED | Runtime/history/session untouched |
 | Pair Zone V1 | PRESERVED | Strategy configuration untouched |
-| Git baseline pushed | REMAINING | Final selective commit/push is the remaining closeout action |
+| Git baseline pushed | PASS | `HEAD == origin/main` after selective Phase 2.6 commits |
 
 ## What remains before Phase 2 can close
 
-The acceptance requirements are complete. The remaining closeout action is to
-audit the diff, selectively commit only Phase 2.6 files, push `origin/main`,
-and verify `HEAD == origin/main`. The original public Vercel live-data
-criterion was intentionally replaced and is not claimed as passed.
+The acceptance requirements and Git closeout are complete. `HEAD` matches
+`origin/main` after selective Phase 2.6 commits. The original public Vercel
+live-data criterion was intentionally replaced and is not claimed as passed.
 
 ## Rollback procedure
 
@@ -360,5 +359,5 @@ tailnet-only private live dashboard plus a public static Vercel dashboard.
 Tailscale Serve provisioning, production HTTPS delivery, strict route denial,
 secret isolation, execution-disabled state, and API-only failure/recovery are
 proven. The original public Vercel live-data acceptance criterion was
-intentionally replaced and is not claimed as passed. After the selective Git
-closeout is verified, Phase 2 can close and Phase 3 may begin.
+intentionally replaced and is not claimed as passed. Phase 2 is closed and
+the repository is ready for Phase 3.
