@@ -49,6 +49,7 @@ from persistence.orm import (
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
+    StrategyIntelligenceRecord,
     TradeEventRecord,
     TradeRecord,
 )
@@ -1355,6 +1356,87 @@ def create_app(
                 }
             )
             return payload
+
+    def _intelligence_dict(row: StrategyIntelligenceRecord) -> dict[str, Any]:
+        if row.execution_allowed is not False:
+            raise HTTPException(status_code=503, detail="Intelligence state unavailable")
+        if not isinstance(row.score, (int, float)) or not 0 <= row.score <= 100:
+            raise HTTPException(status_code=503, detail="Intelligence state unavailable")
+        if not all(
+            isinstance(value, expected)
+            for value, expected in (
+                (row.blockers_json, list),
+                (row.warnings_json, list),
+                (row.context_json, dict),
+                (row.evidence_json, list),
+                (row.score_components_json, list),
+            )
+        ):
+            raise HTTPException(status_code=503, detail="Intelligence state unavailable")
+        return {
+            "candidate_id": row.candidate_id,
+            "symbol": row.symbol,
+            "strategy": row.strategy,
+            "strategy_version": row.strategy_version,
+            "evidence_version": row.evidence_version,
+            "detected_at": row.detected_at,
+            "timeframe": row.timeframe,
+            "direction": row.direction,
+            "state": row.state,
+            "score": row.score,
+            "confidence_band": row.confidence_band,
+            "alert_decision": row.alert_decision,
+            "blockers": row.blockers_json,
+            "warnings": row.warnings_json,
+            "context": row.context_json,
+            "evidence": row.evidence_json,
+            "score_components": row.score_components_json,
+            "source": row.source,
+            "execution_allowed": False,
+        }
+
+    @app.get("/api/intelligence/candidate")
+    def latest_intelligence_candidate(symbol: str | None = Query(default=None)) -> dict[str, Any] | None:
+        with db.session() as session:
+            query = select(StrategyIntelligenceRecord).order_by(desc(StrategyIntelligenceRecord.detected_at))
+            if symbol:
+                query = query.where(StrategyIntelligenceRecord.symbol == symbol)
+            row = session.scalars(query.limit(1)).first()
+            return _intelligence_dict(row) if row else None
+
+    @app.get("/api/intelligence/context")
+    def latest_intelligence_context(symbol: str | None = Query(default=None)) -> dict[str, Any] | None:
+        row = latest_intelligence_candidate(symbol)
+        return row.get("context") if row else None
+
+    @app.get("/api/intelligence/evidence")
+    def latest_intelligence_evidence(symbol: str | None = Query(default=None)) -> dict[str, Any] | None:
+        row = latest_intelligence_candidate(symbol)
+        if row is None:
+            return None
+        return {
+            "candidate_id": row["candidate_id"],
+            "score": row["score"],
+            "confidence_band": row["confidence_band"],
+            "alert_decision": row["alert_decision"],
+            "evidence": row["evidence"],
+            "score_components": row["score_components"],
+            "blockers": row["blockers"],
+            "warnings": row["warnings"],
+            "execution_allowed": False,
+        }
+
+    @app.get("/api/intelligence/alerts")
+    def intelligence_alerts(
+        limit: int = Query(default=50, ge=1, le=200),
+        symbol: str | None = Query(default=None),
+    ) -> list[dict[str, Any]]:
+        with db.session() as session:
+            query = select(StrategyIntelligenceRecord).order_by(desc(StrategyIntelligenceRecord.detected_at))
+            if symbol:
+                query = query.where(StrategyIntelligenceRecord.symbol == symbol)
+            rows = session.scalars(query.limit(limit)).all()
+            return [_intelligence_dict(row) for row in rows]
 
     @app.get("/api/system/events")
     def system_events(

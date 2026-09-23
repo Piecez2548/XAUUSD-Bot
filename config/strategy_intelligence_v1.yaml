@@ -1,0 +1,30 @@
+intelligence_version: phase3.0_intelligence_v1
+context_version: market_context_v1
+evidence_version: evidence_v1
+scoring_version: evidence_scoring_v1
+alert_policy_version: alert_policy_v1
+score_is_probability: false
+confidence_is_calibrated_probability: false
+weights:
+  STRUCTURE: 0.25
+  ZONE_CONTEXT: 0.25
+  ENTRY_CONTEXT: 0.20
+  MOMENTUM: 0.10
+  VOLATILITY: 0.10
+  SESSION: 0.05
+  CONTRADICTIONS: 0.05
+confidence_thresholds:
+  MODERATE: 45
+  HIGH: 70
+alert_score_threshold: 70
+alert_cooldown_minutes: 15
+pivot_left_bars: 1
+pivot_right_bars: 1
+required_timeframes:
+  - M15
+  - M5
+manual_ob:
+  rejection_confirmation: NOT_ACCEPTED
+  allowed_states:
+    - APPROACHING_OB
+    - ENTERED_OB

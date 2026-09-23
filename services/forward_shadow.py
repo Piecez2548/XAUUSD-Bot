@@ -370,6 +370,27 @@ class ForwardShadowWorker:
             await self._evaluate_open_trades()
             self._record_health("CONNECTED", "Historical context warmed; forward boundary not reached", force=True)
             return
+        # Phase 3 records a separate, versioned evidence snapshot. The
+        # existing Pair Zone decision and Forward Shadow history remain the
+        # canonical behavior; intelligence is additive and execution-disabled.
+        intelligence_available = True
+        try:
+            from services.intelligence import StrategyIntelligenceEngine, persist_intelligence_record
+
+            intelligence = StrategyIntelligenceEngine(self.settings).evaluate(
+                item.snapshot, risk=item.risk, as_of=timestamp, candles_are_closed=True
+            )
+            persist_intelligence_record(
+                self.database, intelligence, forward_session_id=self.session.id,
+            )
+        except Exception as exc:
+            # Intelligence is advisory metadata. Its failure must not rewrite
+            # or suppress the canonical Pair Zone/Forward Shadow decision.
+            intelligence_available = False
+            self.logger.exception(
+                "Strategy intelligence unavailable; preserving Forward Shadow decision: %s",
+                type(exc).__name__,
+            )
         self._last_success_at = now
         if decision.decision.value in {"BUY", "SELL"}:
             record = self._persist_signal(decision, item.snapshot)
@@ -378,7 +399,14 @@ class ForwardShadowWorker:
                 self._last_zone_created = _parse_iso(decision.feature_context.get("zone_created_at"))
         await self._evaluate_open_trades()
         self._failure_count = 0
-        self._record_health("CONNECTED", "Forward shadow cycle completed", force=True)
+        self._record_health(
+            "CONNECTED" if intelligence_available else "DEGRADED",
+            "Forward shadow cycle completed"
+            if intelligence_available
+            else "Forward shadow cycle completed; strategy intelligence unavailable",
+            force=True,
+            error_category=None if intelligence_available else "INTELLIGENCE_UNAVAILABLE",
+        )
 
     def _persist_signal(self, decision: Any, snapshot: MarketSnapshot) -> ForwardSignalRecord | None:
         assert self.session is not None

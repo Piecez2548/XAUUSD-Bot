@@ -752,3 +752,46 @@ class ForwardTradeRecord(IdMixin, Base):
     evaluated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     reason_code: Mapped[str | None] = mapped_column(String(96))
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class StrategyIntelligenceRecord(IdMixin, Base):
+    """Versioned, append-only Phase 3 evidence snapshot.
+
+    This table is separate from historical Forward Shadow rows.  New records
+    may reference a forward session/signal, but existing history is never
+    rewritten when the intelligence schema evolves.
+    """
+
+    __tablename__ = "strategy_intelligence_records"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", name="uq_strategy_intelligence_candidate"),
+        Index("ix_strategy_intelligence_symbol_time", "symbol", "detected_at"),
+        Index("ix_strategy_intelligence_alert", "alert_decision", "detected_at"),
+    )
+
+    candidate_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    strategy: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, index=True)
+    timeframe: Mapped[str] = mapped_column(String(32), nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence_band: Mapped[str] = mapped_column(String(16), nullable=False)
+    alert_decision: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    blockers_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    warnings_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    context_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    evidence_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    score_components_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    forward_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("forward_validation_sessions.id"), index=True
+    )
+    forward_signal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("forward_validation_signals.id"), index=True
+    )
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)

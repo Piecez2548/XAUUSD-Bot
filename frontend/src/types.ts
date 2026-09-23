@@ -146,6 +146,28 @@ export interface ShadowDecision {
   outcome_status: string;
 }
 
+export interface StrategyIntelligence {
+  candidate_id: string;
+  symbol: string;
+  strategy: string;
+  strategy_version: string;
+  evidence_version: string;
+  detected_at: string;
+  timeframe: string;
+  direction: string;
+  state: string;
+  score: number;
+  confidence_band: string;
+  alert_decision: string;
+  blockers: string[];
+  warnings: string[];
+  context: Record<string, unknown>;
+  evidence: Array<Record<string, unknown>>;
+  score_components: Array<Record<string, unknown>>;
+  source: string;
+  execution_allowed: false;
+}
+
 export interface RiskSnapshot {
   timestamp: string;
   equity: number;
