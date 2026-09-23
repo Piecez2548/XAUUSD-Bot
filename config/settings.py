@@ -78,6 +78,8 @@ def _origins(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     origins = tuple(item.strip() for item in raw.split(",") if item.strip())
     if not origins:
         raise ConfigurationError(f"{name} must contain at least one origin")
+    if "*" in origins:
+        raise ConfigurationError(f"{name} must not contain wildcard origins")
     return origins
 
 
@@ -149,6 +151,8 @@ class Settings:
     supervisor_operation_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
+        if "*" in self.cors_origins:
+            raise ConfigurationError("CORS_ORIGINS must not contain wildcard origins")
         supplied = (self.mt5_login, self.mt5_server, self.mt5_password)
         if any(value is not None for value in supplied) and not all(
             value is not None for value in supplied

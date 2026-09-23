@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -65,9 +66,119 @@ from services.shadow_outcome import (
     performance_summary as shadow_performance_summary,
 )
 from services.strategy_platform import StrategyRegistry
+from services.supervisor import ProcessRecord, record_process_is_alive
 from services.worker_health import derive_worker_state, worker_health_payload, worker_health_ttl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _supervisor_health_state(project_root: Path, now: datetime, ttl_seconds: float) -> str:
+    """Derive safe supervisor health from its persisted heartbeat registry."""
+
+    registry_path = project_root / "data" / "process_registry.json"
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return "UNKNOWN"
+    if not isinstance(payload, dict) or not payload:
+        return "UNKNOWN"
+    heartbeats: list[datetime] = []
+    states: list[str] = []
+    runtime_states: list[str] = []
+    verified_runtime: dict[str, bool] = {}
+    for component, raw_record in payload.items():
+        if not isinstance(raw_record, dict):
+            continue
+        try:
+            record = ProcessRecord(
+                **{
+                    "component": component,
+                    "pid": None,
+                    "started_at": None,
+                    "exit_code": None,
+                    **raw_record,
+                    "command": tuple(raw_record.get("command") or ()),
+                    "process_tree": tuple(raw_record.get("process_tree") or ()),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+        state = str(record.state).upper()
+        states.append(state)
+        if component in {"api", "live"}:
+            verified = record_process_is_alive(record)
+            verified_runtime[component] = verified
+            runtime_states.append("CONNECTED" if verified else "STOPPED")
+        raw_heartbeat = record.last_heartbeat
+        if isinstance(raw_heartbeat, str):
+            try:
+                heartbeat = datetime.fromisoformat(raw_heartbeat)
+            except ValueError:
+                continue
+            if heartbeat.tzinfo is None:
+                heartbeat = heartbeat.replace(tzinfo=UTC)
+            heartbeats.append(heartbeat.astimezone(UTC))
+    if (
+        not states
+        or not heartbeats
+        or not runtime_states
+        or {
+            component.casefold()
+            for component in payload
+            if component.casefold() in {"api", "live"}
+        }
+        != {"api", "live"}
+    ):
+        return "UNKNOWN"
+    if any(
+        not verified_runtime.get(component, False)
+        and str(payload[component].get("state", "")).upper() in {"RUNNING", "STARTING"}
+        for component in ("api", "live")
+        if isinstance(payload.get(component), dict)
+    ):
+        return "DEGRADED"
+    if not any(state == "CONNECTED" for state in runtime_states):
+        return "STOPPED" if all(state == "STOPPED" for state in states) else "DEGRADED"
+    if any(state == "STOPPED" for state in runtime_states):
+        return "DEGRADED"
+    if any(state in {"ERROR", "CRASHED", "DEGRADED", "STOPPED"} for state in states):
+        return "DEGRADED"
+    latest = max(heartbeats)
+    if (now - latest).total_seconds() > max(30.0, ttl_seconds):
+        return "DEGRADED"
+    return "CONNECTED" if all(state in {"RUNNING", "STARTING"} for state in states) else "UNKNOWN"
+
+
+def _display_downsample(
+    points: list[dict[str, Any]],
+    limit: int,
+    *,
+    value_key: str = "value",
+) -> list[dict[str, Any]]:
+    """Deterministically bound visualization points without changing persisted evidence."""
+
+    if len(points) <= limit:
+        return points
+    anchors = {0, len(points) - 1}
+    indexes = set(anchors)
+    numeric = [
+        (index, point.get(value_key))
+        for index, point in enumerate(points)
+        if isinstance(point.get(value_key), (int, float))
+    ]
+    extrema = []
+    if numeric:
+        extrema = [min(numeric, key=lambda item: item[1])[0], max(numeric, key=lambda item: item[1])[0]]
+    for index in extrema:
+        if len(indexes) >= limit:
+            break
+        indexes.add(index)
+    remaining = max(0, limit - len(indexes))
+    if remaining:
+        step = (len(points) - 1) / (remaining + 1)
+        indexes.update(round(step * (position + 1)) for position in range(remaining))
+    indexes.update(anchors)
+    return [points[index] for index in sorted(indexes)[:limit]]
 
 
 def _trade_dict(row: TradeRecord) -> dict[str, Any]:
@@ -277,10 +388,18 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
+        now = datetime.now(UTC)
+        supervisor_state = _supervisor_health_state(
+            PROJECT_ROOT,
+            now,
+            max(30.0, runtime_settings.live_account_interval_seconds * 4),
+        )
+        database_state = db.healthcheck()
         return {
-            "status": "healthy" if db.healthcheck() else "unhealthy",
-            "database": "connected" if db.healthcheck() else "unavailable",
-            "timestamp": datetime.now(UTC),
+            "status": "healthy" if database_state else "unhealthy",
+            "database": "connected" if database_state else "unavailable",
+            "supervisor": supervisor_state,
+            "timestamp": now,
             "read_only": True,
             "version": "1.6.0",
             "database_identity": db.database_identity,
@@ -393,7 +512,10 @@ def create_app(
             return [_research_run_dict(row, session) for row in rows]
 
     @app.get("/api/research/runs/{run_id}/curve")
-    def research_curve(run_id: str) -> dict[str, Any]:
+    def research_curve(
+        run_id: str,
+        display_limit: int = Query(default=2_000, ge=2, le=5_000),
+    ) -> dict[str, Any]:
         with db.session() as session:
             run = _research_run_or_404(session, run_id)
             rows = session.execute(
@@ -413,8 +535,18 @@ def create_app(
                 peak = max(peak, cumulative)
                 equity.append({"timestamp": timestamp, "value": cumulative})
                 drawdown.append({"timestamp": timestamp, "value": peak - cumulative})
-            return {"run_id": run.run_id, "equity": equity, "drawdown": drawdown,
-                    "execution_allowed": False}
+            display_equity = _display_downsample(equity, display_limit)
+            display_drawdown = _display_downsample(drawdown, display_limit)
+            return {
+                "run_id": run.run_id,
+                "equity": display_equity,
+                "drawdown": display_drawdown,
+                "point_count": len(equity),
+                "display_point_count": len(display_equity),
+                "display_sampled": len(display_equity) < len(equity),
+                "display_limit": display_limit,
+                "execution_allowed": False,
+            }
 
     @app.get("/api/research/robustness")
     def research_robustness(
@@ -1066,7 +1198,9 @@ def create_app(
         return analytics.equity_curve(_trade_samples(completed_trades()))
 
     @app.get("/api/performance/account-curve")
-    def performance_account_curve() -> list[dict[str, Any]]:
+    def performance_account_curve(
+        display_limit: int | None = Query(default=None, ge=2, le=50_000),
+    ) -> list[dict[str, Any]]:
         with db.session() as session:
             rows = session.scalars(
                 select(AccountSnapshotRecord).order_by(AccountSnapshotRecord.timestamp)
@@ -1087,7 +1221,11 @@ def create_app(
                     "drawdown_percent": drawdown_percent,
                 }
             )
-        return result
+        # Keep the endpoint backwards-compatible for callers that need the
+        # complete immutable series, while allowing dashboards to request a
+        # bounded display projection.  Sampling is display-only: account
+        # metrics and persisted snapshots remain unchanged.
+        return result if display_limit is None else _display_downsample(result, display_limit, value_key="equity")
 
     @app.get("/api/performance/drawdown")
     def performance_drawdown() -> list[dict[str, Any]]:
@@ -1245,6 +1383,11 @@ def create_app(
                 select(SystemEventRecord).order_by(desc(SystemEventRecord.timestamp)).limit(200)
             ).all()
             database_state = "CONNECTED" if db.healthcheck() else "DISCONNECTED"
+            supervisor_state = _supervisor_health_state(
+                PROJECT_ROOT,
+                now,
+                max(30.0, runtime_settings.live_account_interval_seconds * 4),
+            )
             mt5_state = _service_state_from_events(
                 event_rows,
                 connected_type="MT5_CONNECTED",
@@ -1318,6 +1461,7 @@ def create_app(
             return {
                 "database": database_state,
                 "services": {
+                    "supervisor": supervisor_state,
                     "mt5": component_states.get("mt5", mt5_state),
                     "database": database_state,
                     "telegram": telegram_state,
@@ -1502,21 +1646,58 @@ def create_app(
     def supervisor_status() -> dict[str, Any]:
         registry_path = PROJECT_ROOT / "data" / "process_registry.json"
         try:
-            import json
-
             registry = json.loads(registry_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError):
             registry = {}
         safe: dict[str, Any] = {}
-        for component, record in registry.items():
-            if not isinstance(record, dict):
-                continue
+        for component, raw_record in registry.items() if isinstance(registry, dict) else ():
+            record = raw_record if isinstance(raw_record, dict) else {}
+            try:
+                identity_record = ProcessRecord(
+                    component=component,
+                    pid=record.get("pid"),
+                    state=str(record.get("state", "UNKNOWN")),
+                    started_at=record.get("started_at"),
+                    last_heartbeat=record.get("last_heartbeat"),
+                    exit_code=record.get("exit_code"),
+                    desired_state=str(
+                        record.get("desired_state")
+                        or (
+                            "RUNNING"
+                            if record.get("state") in {"RUNNING", "STARTING"}
+                            else "STOPPED"
+                        )
+                    ),
+                    restart_count=int(record.get("restart_count", 0)),
+                    last_error=record.get("last_error"),
+                    process_create_time=record.get("process_create_time"),
+                    parent_pid=record.get("parent_pid"),
+                    command=tuple(record.get("command") or ()),
+                    process_tree=tuple(record.get("process_tree") or ()),
+                    process_identities=tuple(
+                        (int(item[0]), item[1])
+                        for item in (record.get("process_identities") or ())
+                        if isinstance(item, (list, tuple)) and len(item) == 2
+                    ),
+                )
+            except (TypeError, ValueError):
+                identity_record = None
+            verified = bool(identity_record and record_process_is_alive(identity_record))
             safe[component] = {
                 "pid": record.get("pid"),
-                "state": record.get("state", "UNKNOWN"),
+                "state": (
+                    "DEGRADED"
+                    if record.get("state") in {"RUNNING", "STARTING"} and not verified
+                    else record.get("state", "UNKNOWN")
+                ),
+                "verified": verified,
                 "started_at": record.get("started_at"),
                 "last_heartbeat": record.get("last_heartbeat"),
                 "exit_code": record.get("exit_code"),
+                "desired_state": record.get(
+                    "desired_state",
+                    "RUNNING" if record.get("state") in {"RUNNING", "STARTING"} else "STOPPED",
+                ),
                 "restart_count": record.get("restart_count", 0),
             }
         return {"components": safe, "read_only": True, "execution": "DISABLED"}
