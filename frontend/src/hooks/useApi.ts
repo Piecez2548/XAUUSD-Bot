@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getJson } from "../lib/api";
 
@@ -14,11 +14,15 @@ export function useApi<T>(path: string, refreshMs = 0): ApiState<T> {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
+  const activeRequest = useRef<symbol | null>(null);
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
 
   useEffect(() => {
     const controller = new AbortController();
     const load = async () => {
+      if (activeRequest.current !== null) return;
+      const token = Symbol(path);
+      activeRequest.current = token;
       try {
         const next = await getJson<T>(path, controller.signal);
         setData(next);
@@ -28,13 +32,17 @@ export function useApi<T>(path: string, refreshMs = 0): ApiState<T> {
           setError(reason instanceof Error ? reason.message : "Request failed");
         }
       } finally {
-        if (!controller.signal.aborted) setLoading(false);
+        if (activeRequest.current === token) {
+          activeRequest.current = null;
+          if (!controller.signal.aborted) setLoading(false);
+        }
       }
     };
     void load();
     const timer = refreshMs > 0 ? window.setInterval(load, refreshMs) : undefined;
     return () => {
       controller.abort();
+      activeRequest.current = null;
       if (timer) window.clearInterval(timer);
     };
   }, [path, refreshMs, revision]);
