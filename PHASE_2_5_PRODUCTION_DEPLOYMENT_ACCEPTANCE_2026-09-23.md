@@ -27,6 +27,10 @@ f6135e041a93fdef945990ed53caca13ae2cbd6c
 fix(frontend): support direct forward validation preview route
 ```
 
+The final repository commit at report capture is the documentation commit
+`f69cbc5ee32619dd3cf012762d1bb561e7afddb5`; the deployed frontend behavior is
+from `f6135e0` and is unchanged by the documentation commit.
+
 The fix was selectively committed and pushed to `origin/main`. No unrelated
 historical artifact was staged.
 
@@ -69,6 +73,12 @@ Current fixed deployment:
 - Deployment record: `CZ1QMN4TmScFvUYphyP4dTXpZhPY`
 - Commit: `f6135e041a93fdef945990ed53caca13ae2cbd6c`
 - Vercel status: Ready
+
+The subsequent documentation-only deployment was also Ready:
+
+- Deployment URL: `https://xauusd-ge6n9q5q1-piecez2548s-projects.vercel.app/`
+- Commit: `f69cbc5ee32619dd3cf012762d1bb561e7afddb5`
+- Frontend payload: unchanged from `f6135e0`
 
 ## 4. Static route acceptance
 
@@ -203,14 +213,14 @@ frontend/src/routes.tsx
 frontend/src/App.test.tsx
 ```
 
-This report is a new documentation file and is intentionally not yet included
-in the prior deployment-fix commit. It is to be committed separately after
-this report is reviewed.
+This report is included in the separate documentation commit
+`f69cbc5ee32619dd3cf012762d1bb561e7afddb5`.
 
 Commits created during this task:
 
 ```text
 f6135e0 fix(frontend): support direct forward validation preview route
+f69cbc5 docs(deploy): record production deployment acceptance
 ```
 
 Push status: pushed successfully to `origin/main`; no force push was used.
