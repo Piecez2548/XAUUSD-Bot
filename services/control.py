@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic, perf_counter
@@ -84,6 +86,8 @@ COMMAND_HELP = {
     "/logs": "Show safe recent operational events",
     "/help": "Show available commands",
 }
+
+API_READINESS_VERSION = "phase26-supervisor-socket-readiness-v2"
 
 
 class TelegramControlService:
@@ -793,15 +797,165 @@ class TelegramControlService:
             await asyncio.sleep(0.25)
 
     async def _api_responsive(self) -> bool:
-        host = self.settings.api_host
-        if host in {"0.0.0.0", "::"}:
+        """Verify the supervisor-owned API listener without bypassing auth.
+
+        The API is intentionally protected even on localhost when private
+        dashboard mode is enabled.  Readiness therefore cannot call an HTTP
+        route.  ProcessSupervisor.status() reconciles the persisted identity
+        against the current OS topology; the socket check then verifies that
+        the verified API process has a loopback listener.
+        """
+
+        records = self.supervisor.status()
+        api_process = records.get("api")
+        identity_verified, identity_reason = self._api_process_verification(api_process)
+        details = {
+            "readiness_version": API_READINESS_VERSION,
+            "record_state": getattr(api_process, "state", None),
+            "desired_state": getattr(api_process, "desired_state", None),
+            "registered_pid": getattr(api_process, "pid", None),
+            "registered_process_create_time": getattr(
+                api_process, "process_create_time", None
+            ),
+            "registered_process_identity_create_times": [
+                {"pid": identity[0], "create_time": identity[1]}
+                for identity in (getattr(api_process, "process_identities", ()) or ())
+                if isinstance(identity, (tuple, list)) and len(identity) == 2
+            ],
+            "process_tree": list(getattr(api_process, "process_tree", ()) or ()),
+            "identity_verified": identity_verified,
+            "identity_reason": identity_reason,
+            "configured_api_host": self.settings.api_host,
+            "configured_api_port": self.settings.api_port,
+        }
+
+        def finish(ready: bool, reason: str, **updates: object) -> bool:
+            details.update(updates)
+            details["final_ready"] = ready
+            details["final_reason"] = reason
+            write_supervisor_lifecycle_event(
+                self.project_root,
+                operation="/start",
+                stage="api_readiness_probe",
+                component="api",
+                details=details,
+            )
+            return ready
+
+        if not identity_verified:
+            return finish(
+                False,
+                "verified supervisor API process identity/state is unavailable",
+                loopback_validation=False,
+                socket_connect_attempted=False,
+                socket_connect_succeeded=False,
+            )
+
+        endpoint = self._api_loopback_endpoint()
+        if endpoint is None:
+            return finish(
+                False,
+                "configured API host is not a valid loopback address",
+                loopback_validation=False,
+                socket_connect_attempted=False,
+                socket_connect_succeeded=False,
+            )
+        host, port = endpoint
+        details["validated_loopback_host"] = host
+        details["validated_loopback_port"] = port
+        try:
+            connected = await asyncio.to_thread(self._api_socket_is_available, host, port)
+        except (OSError, ValueError) as exc:
+            return finish(
+                False,
+                "loopback API socket connection failed",
+                loopback_validation=True,
+                socket_connect_attempted=True,
+                socket_connect_succeeded=False,
+                socket_error_type=type(exc).__name__,
+                socket_error=str(exc),
+            )
+        if not connected:
+            return finish(
+                False,
+                "loopback API socket connection was not established",
+                loopback_validation=True,
+                socket_connect_attempted=True,
+                socket_connect_succeeded=False,
+            )
+
+        # Reconcile once more after the connect to fail closed if the process
+        # exited or the PID identity changed during the socket probe.
+        latest = self.supervisor.status().get("api")
+        latest_identity_verified, latest_identity_reason = self._api_process_verification(latest)
+        same_pid = getattr(latest, "pid", None) == getattr(api_process, "pid", None)
+        return finish(
+            latest_identity_verified and same_pid,
+            "verified API process and loopback listener are ready"
+            if latest_identity_verified and same_pid
+            else "API process identity changed or is no longer verified after socket connect",
+            loopback_validation=True,
+            socket_connect_attempted=True,
+            socket_connect_succeeded=True,
+            post_connect_state=getattr(latest, "state", None),
+            post_connect_desired_state=getattr(latest, "desired_state", None),
+            post_connect_pid=getattr(latest, "pid", None),
+            post_connect_process_create_time=getattr(latest, "process_create_time", None),
+            post_connect_process_tree=list(getattr(latest, "process_tree", ()) or ()),
+            post_connect_identity_verified=latest_identity_verified,
+            post_connect_identity_reason=latest_identity_reason,
+            post_connect_same_pid=same_pid,
+        )
+
+    def _api_loopback_endpoint(self) -> tuple[str, int] | None:
+        host = str(self.settings.api_host or "").strip()
+        if host.casefold() == "localhost":
             host = "127.0.0.1"
         try:
-            async with httpx.AsyncClient(timeout=1.0) as client:
-                response = await client.get(f"http://{host}:{self.settings.api_port}/api/health")
-            return response.is_success and response.json().get("read_only") is True
-        except (httpx.HTTPError, ValueError):
-            return False
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        if not address.is_loopback:
+            return None
+        try:
+            port = int(self.settings.api_port)
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= port <= 65535:
+            return None
+        return host, port
+
+    @staticmethod
+    def _api_process_verification(record) -> tuple[bool, str]:
+        if record is None:
+            return False, "API process record is absent"
+        if getattr(record, "state", None) != "RUNNING":
+            return False, "API process state is not RUNNING"
+        if getattr(record, "desired_state", None) != "RUNNING":
+            return False, "API desired_state is not RUNNING"
+        pid = getattr(record, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            return False, "registered API PID is invalid"
+        identities = tuple(getattr(record, "process_identities", ()) or ())
+        if os.name == "nt" and not identities:
+            return False, "Windows process identity set is empty"
+        identity_pids = {
+            identity[0]
+            for identity in identities
+            if isinstance(identity, (tuple, list)) and len(identity) == 2
+        }
+        if pid not in identity_pids:
+            return False, "registered API PID is absent from verified process identities"
+        return True, "registered API PID/create-time identity is verified by supervisor status"
+
+    @classmethod
+    def _api_process_is_verified(cls, record) -> bool:
+        return cls._api_process_verification(record)[0]
+
+    @staticmethod
+    def _api_socket_is_available(host: str, port: int) -> bool:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
 
     def _health(self) -> str:
         statuses = self._latest_health()
