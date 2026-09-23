@@ -3,17 +3,33 @@
 ## Local start
 
 ```powershell
-# Terminal 1
+# Production/local dashboard build (one-time and after frontend source updates)
+.\scripts\build_frontend.ps1
+
+# API process; normal operation serves the built dashboard on the same port
 .\.venv\Scripts\Activate.ps1
 python main.py migrate
 python main.py server
 
-# Terminal 2
+# Development-only frontend server; not required for normal operation
 cd frontend
 npm run dev
 ```
 
-The API binds to `127.0.0.1:8000` by default and the frontend to `127.0.0.1:5173`. CORS is limited to configured local origins. For a packaged deployment, serve `frontend/dist` through a trusted local web server and keep the API behind the same host or a restrictive reverse proxy.
+The normal production dashboard is served by FastAPI and reached through the
+authenticated tailnet-only Tailscale Serve URL. FastAPI remains bound to
+`127.0.0.1:8000`; direct browser requests to that URL return `401` when
+`REMOTE_DASHBOARD_MODE=true` by design. Vite `:5173` is development-only. The
+production build helper marks this as the private same-origin deployment
+(`VITE_PRIVATE_DASHBOARD=true`) and clears inherited API/WebSocket endpoints;
+this marker is not a credential. The
+Task Scheduler
+installation script runs the production build helper before registering the
+Telegram Control task. Re-run that installer, or run the helper directly, after
+frontend source updates. A build failure does not prevent Telegram Control from
+being installed and does not prevent the API from starting without static assets.
+The API binds to `127.0.0.1:8000` by default and CORS remains restricted to
+configured local origins.
 
 ## Phase 2.6 private live dashboard
 

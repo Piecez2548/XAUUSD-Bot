@@ -6,28 +6,59 @@
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 export const PRIVATE_DASHBOARD =
   (import.meta.env.VITE_PRIVATE_DASHBOARD ?? "").trim().toLowerCase() === "true";
-export const productionApiConfigured =
-  !import.meta.env.PROD || API_BASE.length > 0 || PRIVATE_DASHBOARD;
 
-export function apiUrl(path: string): string {
-  return `${API_BASE}${path}`;
+export interface ApiRuntimeConfig {
+  apiBase: string;
+  privateDashboard: boolean;
+  production: boolean;
 }
 
-export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  if (import.meta.env.PROD && !API_BASE && !PRIVATE_DASHBOARD) {
+export function isApiConfigured(config: ApiRuntimeConfig): boolean {
+  return !config.production || config.apiBase.length > 0 || config.privateDashboard;
+}
+
+export const productionApiConfigured = isApiConfigured({
+  apiBase: API_BASE,
+  privateDashboard: PRIVATE_DASHBOARD,
+  production: import.meta.env.PROD,
+});
+
+export function apiUrl(path: string, apiBase = API_BASE): string {
+  return `${apiBase}${path}`;
+}
+
+export async function requestJson<T>(
+  path: string,
+  config: ApiRuntimeConfig,
+  signal?: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<T> {
+  if (!isApiConfigured(config)) {
     throw new Error("BACKEND_NOT_CONFIGURED");
   }
   // A future Access-protected HTTPS gateway authenticates the browser with
   // its own session cookie.  The cookie is not a VITE secret and is only
   // sent to the explicitly configured API origin by the browser.
-  const response = await fetch(apiUrl(path), {
-    credentials: API_BASE ? "include" : "same-origin",
+  const response = await fetcher(apiUrl(path, config.apiBase), {
+    credentials: config.apiBase ? "include" : "same-origin",
     signal,
   });
   if (!response.ok) {
     throw new Error(`Request failed (${response.status})`);
   }
   return (await response.json()) as T;
+}
+
+export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return requestJson(
+    path,
+    {
+      apiBase: API_BASE,
+      privateDashboard: PRIVATE_DASHBOARD,
+      production: import.meta.env.PROD,
+    },
+    signal,
+  );
 }
 
 export function websocketUrl(path = "/ws/live"): string {

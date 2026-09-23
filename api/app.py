@@ -16,13 +16,13 @@ from typing import Annotated, Any, Literal
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Select, desc, func, or_, select
 
 from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
 from config.remote_read_only_policy import is_remote_path_allowed
 from config.settings import Settings, load_settings
+from api.static_dashboard import DashboardStaticFiles
 from persistence.database import Database
 from persistence.orm import (
     AccountRecord,
@@ -1783,6 +1783,5 @@ def create_app(
             realtime.disconnect(websocket)
 
     frontend_dist = PROJECT_ROOT / "frontend" / "dist"
-    if frontend_dist.is_dir():
-        app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="dashboard")
+    app.mount("/", DashboardStaticFiles(frontend_dist), name="dashboard")
     return app

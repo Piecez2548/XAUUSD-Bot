@@ -13,9 +13,19 @@ Phase 2.6 intentionally maintains two deployment surfaces:
 
 ## Local
 
-From `frontend/` run `npm run dev`. Vite proxies `/api` and `/ws` to the local
-FastAPI process at `127.0.0.1:8000`. The frontend is read-only and always shows
+Normal production operation is served by the existing FastAPI process and
+opened through the authenticated tailnet-only Tailscale Serve URL. FastAPI
+remains bound to `127.0.0.1:8000`; direct browser requests to localhost return
+`401` when private dashboard mode is enabled. No Vite process is required and
+no `:5173` listener is created. Run `scripts/build_frontend.ps1` after frontend
+source updates. This helper builds the private same-origin deployment context
+(`VITE_PRIVATE_DASHBOARD=true`) and clears any inherited API or WebSocket base
+URL. The Telegram Control task installer runs this helper automatically before
+task registration. The frontend is read-only and always shows
 `REAL-MONEY EXECUTION: DISABLED`.
+
+For development-only hot reload, from `frontend/` run `npm run dev`. Vite
+proxies `/api` and `/ws` to the local FastAPI process at `127.0.0.1:8000`.
 
 ## Vercel
 
@@ -24,13 +34,16 @@ reachable, read-only FastAPI base URL. Set `VITE_WS_URL` only when the API's
 WebSocket endpoint is separately reachable. Vite variables are public: never
 place Telegram, MT5, database, or API credentials in them.
 
-If `VITE_API_BASE_URL` is not configured in production, the dashboard remains
-online but truthfully reports:
+If `VITE_API_BASE_URL` is not configured in a public/Vercel production build,
+the dashboard remains online but truthfully reports:
 
 > Dashboard ออนไลน์ แต่ Trading Runtime บนเครื่องไม่ได้เชื่อมต่อ
 
 It never falls back to localhost in a production build and never infers old
-data as connected. API timestamps drive CONNECTED/STALE/OFFLINE/UNKNOWN state.
+data as connected. The private FastAPI build uses same-origin relative `/api/*`
+requests instead; its deployment marker is set only by
+`scripts/build_frontend.ps1`. API timestamps drive
+CONNECTED/STALE/OFFLINE/UNKNOWN state.
 
 ## Private live dashboard (Tailscale Serve)
 
@@ -44,9 +57,7 @@ WebSocket routes.
 Build the private same-origin variant locally on the Windows host:
 
 ```powershell
-$env:VITE_PRIVATE_DASHBOARD="true"
-$env:VITE_API_BASE_URL=""
-npm run build
+.\scripts\build_frontend.ps1
 ```
 
 Start the existing read-only API with `REMOTE_DASHBOARD_MODE=true`, then an
