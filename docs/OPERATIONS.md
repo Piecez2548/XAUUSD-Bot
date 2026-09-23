@@ -15,6 +15,39 @@ npm run dev
 
 The API binds to `127.0.0.1:8000` by default and the frontend to `127.0.0.1:5173`. CORS is limited to configured local origins. For a packaged deployment, serve `frontend/dist` through a trusted local web server and keep the API behind the same host or a restrictive reverse proxy.
 
+## Phase 2.6 private live dashboard
+
+The approved no-custom-domain architecture separates the public static Vercel
+dashboard from the private live dashboard. The private dashboard is served by
+the same FastAPI process that serves `frontend/dist`, but is reachable only
+through tailnet-only Tailscale Serve:
+
+```text
+authorized phone/laptop
+        |
+Tailscale identity + encrypted tailnet transport
+        |
+Tailscale Serve HTTPS/MagicDNS hostname
+        |
+FastAPI 127.0.0.1:8000
+        |
+strict Phase 2.6 GET allowlist
+```
+
+`REMOTE_DASHBOARD_MODE=true` is an explicit fail-closed mode. It requires the
+trusted `Tailscale-User-Login` header, denies non-GET API methods, denies
+unknown API paths, denies `/ws/live` until WSS is separately secured, and
+leaves `/start`, `/stop`, `/restart`, broker writes, and process mutation
+outside the HTTP surface. The default is `false`, so existing local/runtime
+behavior is unchanged.
+
+For a private build, set `VITE_PRIVATE_DASHBOARD=true` and leave
+`VITE_API_BASE_URL` empty so the browser uses same-origin `/api/*` paths. Keep
+the public Vercel build with `VITE_PRIVATE_DASHBOARD=false` and no API base.
+Install/login/device authorization for Tailscale and enabling HTTPS in the
+tailnet are explicit operator actions; do not use Tailscale Funnel or expose
+port 8000 directly.
+
 ## Phase 1.7 Telegram control
 
 Build the frontend once with `npm run build`, then configure both Telegram
