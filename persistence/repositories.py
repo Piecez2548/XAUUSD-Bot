@@ -956,3 +956,14 @@ class ControlAuditRepository:
             session.add(record)
             session.flush()
             return record.id
+
+    def find_by_correlation_id(self, correlation_id: str) -> ControlAuditRecord | None:
+        """Return an already-audited operation for replay protection."""
+
+        with self._database.session() as session:
+            return session.scalar(
+                select(ControlAuditRecord)
+                .where(ControlAuditRecord.correlation_id == correlation_id)
+                .order_by(desc(ControlAuditRecord.timestamp), desc(ControlAuditRecord.id))
+                .limit(1)
+            )

@@ -3,6 +3,7 @@ export type ServiceState =
   | "CONNECTED"
   | "DEGRADED"
   | "DISCONNECTED"
+  | "RUNNING"
   | "STARTING"
   | "RECONNECTING"
   | "STOPPED"
@@ -10,6 +11,40 @@ export type ServiceState =
   | "PLANNED"
   | "ERROR"
   | "UNKNOWN";
+
+export interface ControlStatus {
+  checked_at: string;
+  control: ServiceState;
+  supervisor: ServiceState;
+  api: ServiceState;
+  live: ServiceState;
+  mt5: ServiceState;
+  database: ServiceState;
+  telegram: ServiceState;
+  forward_shadow: ServiceState;
+  execution: {
+    demo_execution_enabled: boolean;
+    demo_kill_switch_armed: boolean;
+    real_money_execution: "DISABLED";
+  };
+  strategy: {
+    pair_zone_state: string;
+    current_direction: string;
+    latest_canonical_signal_id: string | null;
+    latest_canonical_direction: string | null;
+    latest_canonical_signal_at: string | null;
+    latest_forward_session_id: string | null;
+  };
+}
+
+export interface ControlResponse {
+  ok: boolean;
+  duplicate: boolean;
+  operation_id: string;
+  command: string;
+  message: string;
+  status: ControlStatus;
+}
 
 export interface AccountSnapshot {
   timestamp: string;

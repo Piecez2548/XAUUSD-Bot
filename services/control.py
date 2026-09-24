@@ -33,6 +33,8 @@ from persistence.migrations import migrate_database
 from persistence.orm import (
     AccountSnapshotRecord,
     CandleRecord,
+    ForwardSignalRecord,
+    ForwardValidationSessionRecord,
     MarketSnapshotRecord,
     PositionRecord,
     PositionSnapshotRecord,
@@ -44,6 +46,11 @@ from persistence.orm import (
     SystemHealthRecord,
 )
 from persistence.repositories import ControlAuditRepository, SystemHealthRepository
+from services.control_ipc import (
+    ControlIpcError,
+    ControlIpcServer,
+    validate_ipc_request,
+)
 from services.demo_execution import demo_execution_armed, set_demo_execution_enabled
 from services.shadow_outcome import OUTCOME_POLICY_VERSION, performance_summary
 from services.supervisor import (
@@ -129,6 +136,7 @@ class TelegramControlService:
         self._offset_path = project_root / "data" / "telegram_update_offset.json"
         self._offset = self._load_offset()
         self._research_tasks: set[asyncio.Task[object]] = set()
+        self._ipc_server: ControlIpcServer | None = None
         from services.research_platform import recover_interrupted_runs
         recover_interrupted_runs(self.database)
 
@@ -144,17 +152,33 @@ class TelegramControlService:
     async def run_forever(self) -> None:
         if not self.configured:
             self.logger.warning(
-                "Telegram control service disabled or deny-by-default configuration incomplete"
+                "Telegram notifications disabled or incomplete; local Web Control IPC remains active"
             )
-            return
-        client = self._client or httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                self.settings.telegram_control_poll_seconds + 10,
-                connect=self.settings.telegram_timeout_seconds,
-            )
-        )
         try:
-            await self._set_command_menu(client)
+            self._ipc_server = ControlIpcServer(
+                self.project_root,
+                asyncio.get_running_loop(),
+                self._handle_ipc_request,
+                request_timeout_seconds=max(
+                    120.0, self.settings.supervisor_operation_timeout_seconds + 90.0
+                ),
+            )
+            self._ipc_server.start()
+        except ControlIpcError:
+            self.logger.exception("Local Web Control IPC could not start; Web mutations unavailable")
+            self._ipc_server = None
+
+        client = self._client
+        if client is None and self.configured:
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self.settings.telegram_control_poll_seconds + 10,
+                    connect=self.settings.telegram_timeout_seconds,
+                )
+            )
+        try:
+            if client is not None:
+                await self._set_command_menu(client)
             while not self._stop.is_set():
                 try:
                     for record in self.supervisor.monitor_once(self._supervised_commands()):
@@ -168,21 +192,27 @@ class TelegramControlService:
                                     f"PROCESS_CRASHED\nComponent: {record.component}\n"
                                     f"State: {record.state}\nRestart count: {record.restart_count}",
                                 )
-                    updates = await self._get_updates(client)
-                    for update in updates:
-                        response = await self.handle_update(update)
-                        message = update.get("message")
-                        if response and isinstance(message, dict):
-                            chat = message.get("chat")
-                            if isinstance(chat, dict) and chat.get("id") is not None:
-                                await self.send_message(str(chat["id"]), response)
+                    if client is not None:
+                        updates = await self._get_updates(client)
+                        for update in updates:
+                            response = await self.handle_update(update)
+                            message = update.get("message")
+                            if response and isinstance(message, dict):
+                                chat = message.get("chat")
+                                if isinstance(chat, dict) and chat.get("id") is not None:
+                                    await self.send_message(str(chat["id"]), response)
+                    else:
+                        await asyncio.sleep(1.0)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     self.logger.exception("Telegram control polling failed")
                     await asyncio.sleep(min(30.0, self.settings.telegram_control_poll_seconds * 2))
         finally:
-            if self._owns_client:
+            if self._ipc_server is not None:
+                self._ipc_server.close()
+                self._ipc_server = None
+            if self._owns_client and client is not None:
                 await client.aclose()
             if self._owns_client:
                 self.database.dispose()
@@ -283,77 +313,7 @@ class TelegramControlService:
         if command == "/stop":
             return await self._stop_infrastructure()
         if command == "/restart":
-            async with self._operation_lock:
-                operation_id = str(uuid4())
-                write_supervisor_lifecycle_event(
-                    self.project_root,
-                    operation="/restart",
-                    stage="restart_started",
-                    component="infrastructure",
-                    details={"operation_id": operation_id},
-                )
-                stop_response = await self._stop_infrastructure_locked(
-                    lifecycle_operation="restart",
-                    operation_id=operation_id,
-                )
-                records = self.supervisor.status()
-                stop_verified = all(
-                    records.get(component) is not None
-                    and records[component].state == "STOPPED"
-                    for component in ("api", "live")
-                )
-                write_supervisor_lifecycle_event(
-                    self.project_root,
-                    operation="/restart",
-                    stage="restart_stop_verified",
-                    component="infrastructure",
-                    details={
-                        "operation_id": operation_id,
-                        "verified_stopped": stop_verified,
-                        "states": {
-                            component: getattr(records.get(component), "state", None)
-                            for component in ("api", "live")
-                        },
-                    },
-                )
-                if not stop_verified:
-                    write_supervisor_lifecycle_event(
-                        self.project_root,
-                        operation="/restart",
-                        stage="restart_aborted",
-                        component="infrastructure",
-                        details={
-                            "operation_id": operation_id,
-                            "abort_reason": "existing supervised topology did not reach STOPPED",
-                        },
-                    )
-                    return (
-                        f"{stop_response}\n"
-                        "RESTART ABORTED — an existing supervised topology did not reach STOPPED."
-                    )
-                write_supervisor_lifecycle_event(
-                    self.project_root,
-                    operation="/restart",
-                    stage="restart_start_transition",
-                    component="infrastructure",
-                    details={"operation_id": operation_id},
-                )
-                response = await self._start_infrastructure_locked()
-                final_records = self.supervisor.status()
-                write_supervisor_lifecycle_event(
-                    self.project_root,
-                    operation="/restart",
-                    stage="restart_completed",
-                    component="infrastructure",
-                    details={
-                        "operation_id": operation_id,
-                        "final_states": {
-                            component: getattr(final_records.get(component), "state", None)
-                            for component in ("api", "live")
-                        },
-                    },
-                )
-                return response
+            return await self._restart_infrastructure()
         handlers = {
             "/status": self._status,
             "/health": self._health,
@@ -391,6 +351,82 @@ class TelegramControlService:
         if command == "/strategy":
             return self._strategy(text)
         return handlers[command]()
+
+    async def _restart_infrastructure(self) -> str:
+        async with self._operation_lock:
+            return await self._restart_infrastructure_locked()
+
+    async def _restart_infrastructure_locked(self) -> str:
+        operation_id = str(uuid4())
+        write_supervisor_lifecycle_event(
+            self.project_root,
+            operation="/restart",
+            stage="restart_started",
+            component="infrastructure",
+            details={"operation_id": operation_id},
+        )
+        stop_response = await self._stop_infrastructure_locked(
+            lifecycle_operation="restart",
+            operation_id=operation_id,
+        )
+        records = self.supervisor.status()
+        stop_verified = all(
+            records.get(component) is not None
+            and records[component].state == "STOPPED"
+            for component in ("api", "live")
+        )
+        write_supervisor_lifecycle_event(
+            self.project_root,
+            operation="/restart",
+            stage="restart_stop_verified",
+            component="infrastructure",
+            details={
+                "operation_id": operation_id,
+                "verified_stopped": stop_verified,
+                "states": {
+                    component: getattr(records.get(component), "state", None)
+                    for component in ("api", "live")
+                },
+            },
+        )
+        if not stop_verified:
+            write_supervisor_lifecycle_event(
+                self.project_root,
+                operation="/restart",
+                stage="restart_aborted",
+                component="infrastructure",
+                details={
+                    "operation_id": operation_id,
+                    "abort_reason": "existing supervised topology did not reach STOPPED",
+                },
+            )
+            return (
+                f"{stop_response}\n"
+                "RESTART ABORTED — an existing supervised topology did not reach STOPPED."
+            )
+        write_supervisor_lifecycle_event(
+            self.project_root,
+            operation="/restart",
+            stage="restart_start_transition",
+            component="infrastructure",
+            details={"operation_id": operation_id},
+        )
+        response = await self._start_infrastructure_locked()
+        final_records = self.supervisor.status()
+        write_supervisor_lifecycle_event(
+            self.project_root,
+            operation="/restart",
+            stage="restart_completed",
+            component="infrastructure",
+            details={
+                "operation_id": operation_id,
+                "final_states": {
+                    component: getattr(final_records.get(component), "state", None)
+                    for component in ("api", "live")
+                },
+            },
+        )
+        return response
 
     async def _start_infrastructure(self) -> str:
         async with self._operation_lock:
@@ -766,6 +802,132 @@ class TelegramControlService:
                 execution_disabled(),
             ]
         )
+
+    def _operator_status_payload(self) -> dict[str, object]:
+        """Return a structured operator view without adding a new state source."""
+
+        records = self.supervisor.status()
+        live_process = records.get("live")
+        runtime = self._latest_service_state("live_runtime")
+        live_state = (
+            "RUNNING"
+            if live_process is not None
+            and live_process.state == "RUNNING"
+            and runtime == "CONNECTED"
+            else runtime
+            if live_process is not None and live_process.state == "RUNNING"
+            else live_process.state
+            if live_process is not None
+            else "STOPPED"
+        )
+        with self.database.session() as session:
+            latest_session = session.scalar(
+                select(ForwardValidationSessionRecord)
+                .order_by(desc(ForwardValidationSessionRecord.started_at))
+                .limit(1)
+            )
+            latest_signal = session.scalar(
+                select(ForwardSignalRecord)
+                .order_by(desc(ForwardSignalRecord.timestamp), desc(ForwardSignalRecord.id))
+                .limit(1)
+            )
+        return {
+            "checked_at": datetime.now(UTC),
+            "control": "CONNECTED",
+            "supervisor": self._supervisor_state(records),
+            "api": records.get("api").state if records.get("api") else "STOPPED",
+            "live": live_state,
+            "mt5": self._latest_service_state("mt5"),
+            "database": "CONNECTED" if self.database.healthcheck() else "DISCONNECTED",
+            "telegram": self._telegram_state(),
+            "forward_shadow": self._forward_worker_state(),
+            "execution": {
+                "demo_execution_enabled": bool(self.settings.demo_execution_enabled),
+                "demo_kill_switch_armed": bool(demo_execution_armed(self.database)),
+                "real_money_execution": "DISABLED",
+            },
+            "strategy": {
+                # The durable forward tables retain canonical signals, not a
+                # mutable current-zone snapshot.  Do not relabel the latest
+                # historical signal as the current Pair Zone state.
+                "pair_zone_state": "UNKNOWN",
+                "current_direction": "UNKNOWN",
+                "latest_canonical_signal_id": getattr(latest_signal, "signal_id", None),
+                "latest_canonical_direction": getattr(latest_signal, "decision", None),
+                "latest_canonical_signal_at": getattr(latest_signal, "timestamp", None),
+                "latest_forward_session_id": getattr(latest_session, "session_id", None),
+            },
+        }
+
+    async def _handle_ipc_request(self, message: dict[str, str]) -> dict[str, object]:
+        """Handle the fixed Web command vocabulary inside the Control process."""
+
+        request = validate_ipc_request(message)
+        operation_id = request["operation_id"]
+        command = request["command"]
+        actor = request["actor"]
+        if command == "status":
+            return {
+                "ok": True,
+                "duplicate": False,
+                "operation_id": operation_id,
+                "command": command,
+                "message": self._status(),
+                "status": self._operator_status_payload(),
+            }
+        if command == "demo_status":
+            return {
+                "ok": True,
+                "duplicate": False,
+                "operation_id": operation_id,
+                "command": command,
+                "message": self._demo_status(),
+                "status": self._operator_status_payload(),
+            }
+        async with self._operation_lock:
+            existing = self.audit.find_by_correlation_id(operation_id)
+            if existing is not None:
+                return {
+                    "ok": existing.result == "SUCCEEDED",
+                    "duplicate": True,
+                    "operation_id": operation_id,
+                    "command": command,
+                    "message": "Operation already processed; inspect current status.",
+                }
+            try:
+                if command == "start":
+                    message_text = await self._start_infrastructure_locked()
+                elif command == "stop":
+                    message_text = await self._stop_infrastructure_locked()
+                elif command == "restart":
+                    message_text = await self._restart_infrastructure_locked()
+                elif command == "demo_on":
+                    message_text = self._demo_on()
+                elif command == "demo_off":
+                    message_text = self._demo_off()
+                else:
+                    raise ControlIpcError("IPC command is not allowlisted")
+                result = "SUCCEEDED"
+            except Exception:
+                self.logger.exception("Web Control command failed: %s", command)
+                message_text = "Operation failed; inspect /api/control/status for verified state."
+                result = "FAILED"
+            self._audit(
+                f"/{command}",
+                None,
+                actor,
+                True,
+                result,
+                operation_id,
+            )
+            return {
+                "ok": result == "SUCCEEDED",
+                "duplicate": False,
+                "operation_id": operation_id,
+                "command": command,
+                "message": message_text,
+                "status": self._operator_status_payload(),
+            }
 
     async def _wait_for_startup_verification(self) -> dict[str, object]:
         deadline = monotonic() + self.settings.supervisor_operation_timeout_seconds

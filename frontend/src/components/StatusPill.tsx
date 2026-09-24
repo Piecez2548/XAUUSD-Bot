@@ -1,6 +1,6 @@
 import type { ServiceState } from "../types";
 
-const healthy = new Set<ServiceState>(["ONLINE", "CONNECTED"]);
+const healthy = new Set<ServiceState>(["ONLINE", "CONNECTED", "RUNNING"]);
 const warning = new Set<ServiceState>(["DEGRADED", "UNKNOWN", "PLANNED"]);
 
 export function StatusPill({ label, state }: { label?: string; state: ServiceState }) {

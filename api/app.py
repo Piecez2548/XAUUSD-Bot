@@ -12,17 +12,21 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import Select, desc, func, or_, select
 
 from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
-from config.remote_read_only_policy import is_remote_path_allowed
-from config.settings import Settings, load_settings
 from api.static_dashboard import DashboardStaticFiles
+from config.remote_read_only_policy import (
+    is_private_control_path_allowed,
+    is_remote_path_allowed,
+)
+from config.settings import Settings, load_settings
 from persistence.database import Database
 from persistence.orm import (
     AccountRecord,
@@ -46,14 +50,15 @@ from persistence.orm import (
     ShadowDecisionRecord,
     ShadowOutcomeRecord,
     StrategyActivationRecord,
+    StrategyIntelligenceRecord,
     SymbolRecord,
     SystemEventRecord,
     SystemHealthRecord,
-    StrategyIntelligenceRecord,
     TradeEventRecord,
     TradeRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.control_ipc import ControlIpcClient, ControlIpcError
 from services.forward_shadow import (
     forward_health,
     forward_performance,
@@ -343,6 +348,7 @@ def _csv_response(filename: str, rows: list[dict[str, Any]]) -> StreamingRespons
 def create_app(
     settings: Settings | None = None,
     database: Database | None = None,
+    control_ipc: ControlIpcClient | None = None,
 ) -> FastAPI:
     runtime_settings = settings or load_settings()
     started_at = datetime.now(UTC)
@@ -364,12 +370,13 @@ def create_app(
     app = FastAPI(
         title="XAUUSD AI Trader Observatory API",
         version="1.6.0",
-        description="Read-only observability and analytics API. No trade execution endpoints.",
+        description="Read-only observability with a private fixed-command operator control surface. No trade execution endpoints.",
         lifespan=lifespan,
     )
     app.state.database = db
     app.state.settings = runtime_settings
     app.state.realtime = realtime
+    app.state.control_ipc = control_ipc or ControlIpcClient(PROJECT_ROOT)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(runtime_settings.cors_origins),
@@ -390,11 +397,76 @@ def create_app(
                 )
             path = request.url.path
             if path.startswith("/api/"):
-                if request.method != "GET" or not is_remote_path_allowed(path):
+                allowed_control = is_private_control_path_allowed(path, request.method)
+                allowed_read = request.method == "GET" and is_remote_path_allowed(path)
+                if not (allowed_control or allowed_read):
                     return JSONResponse({"detail": "Remote route denied"}, status_code=404)
             elif request.method not in {"GET", "HEAD"}:
                 return JSONResponse({"detail": "Remote method denied"}, status_code=405)
             return await call_next(request)
+
+    def _control_actor(request: Request) -> str:
+        if not runtime_settings.remote_dashboard_mode:
+            raise HTTPException(status_code=404, detail="Private control plane is disabled")
+        actor = request.headers.get("Tailscale-User-Login", "").strip()
+        if not actor:
+            raise HTTPException(status_code=401, detail="Tailscale identity required")
+        return actor[:128]
+
+    def _control_call(
+        request: Request,
+        command: str,
+        payload: dict[str, object] | None = None,
+    ) -> dict[str, Any]:
+        actor = _control_actor(request)
+        body = payload or {}
+        if set(body) != {"operation_id"}:
+            raise HTTPException(status_code=422, detail="only operation_id is accepted")
+        operation_id = body.get("operation_id")
+        if not isinstance(operation_id, str):
+            raise HTTPException(status_code=422, detail="operation_id is required")
+        try:
+            UUID(operation_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="operation_id must be a UUID") from None
+        try:
+            result = app.state.control_ipc.request(command, operation_id, actor=actor)
+        except ControlIpcError:
+            raise HTTPException(status_code=503, detail="Control process is unavailable") from None
+        if not result.get("ok"):
+            raise HTTPException(status_code=503, detail="Control operation failed")
+        return result
+
+    def _control_get(request: Request, command: str) -> dict[str, Any]:
+        return _control_call(request, command, {"operation_id": str(uuid4())})
+
+    @app.get("/api/control/status")
+    def control_status(request: Request) -> dict[str, Any]:
+        return _control_get(request, "status")
+
+    @app.post("/api/control/start")
+    def control_start(request: Request, body: Annotated[dict[str, object], Body()]) -> dict[str, Any]:
+        return _control_call(request, "start", body)
+
+    @app.post("/api/control/stop")
+    def control_stop(request: Request, body: Annotated[dict[str, object], Body()]) -> dict[str, Any]:
+        return _control_call(request, "stop", body)
+
+    @app.post("/api/control/restart")
+    def control_restart(request: Request, body: Annotated[dict[str, object], Body()]) -> dict[str, Any]:
+        return _control_call(request, "restart", body)
+
+    @app.get("/api/control/demo-status")
+    def control_demo_status(request: Request) -> dict[str, Any]:
+        return _control_get(request, "demo_status")
+
+    @app.post("/api/control/demo-on")
+    def control_demo_on(request: Request, body: Annotated[dict[str, object], Body()]) -> dict[str, Any]:
+        return _control_call(request, "demo_on", body)
+
+    @app.post("/api/control/demo-off")
+    def control_demo_off(request: Request, body: Annotated[dict[str, object], Body()]) -> dict[str, Any]:
+        return _control_call(request, "demo_off", body)
 
     def completed_trades() -> list[TradeRecord]:
         with db.session() as session:

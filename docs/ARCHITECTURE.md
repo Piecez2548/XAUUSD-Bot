@@ -21,7 +21,8 @@ SQLite / future PostgreSQL
         ├→ FastAPI GET/CSV routes
         ├→ database-backed WebSocket poller
         ├→ React Trading Observatory (served from `frontend/dist` in production)
-        └→ Telegram Control Service → Process Supervisor → API + Live Engine
+        ├→ Telegram Control Service → Process Supervisor → API + Live Engine
+        └→ authenticated Web Control → local named-pipe IPC → Control Service
 ```
 
 The existing `mt5` package remains the broker boundary. Higher layers consume validated domain models rather than the MT5 module. `services.collector` is the only Phase 1.5 adapter that composes connection and read services.
@@ -39,9 +40,10 @@ The existing `mt5` package remains the broker boundary. Higher layers consume va
 | `persistence` | SQLAlchemy engine, ORM schema, repositories, and Alembic runner |
 | `analytics` | Pure calculations over closed-trade samples |
 | `notifications` | Event-driven Telegram formatting and delivery |
-| `api` | Read-only FastAPI routes, CSV exports, health, and WebSocket fan-out |
+| `api` | Read-only FastAPI routes, private control allowlist, CSV exports, health, and WebSocket fan-out |
 | `frontend` | React/TypeScript/Tailwind/Recharts observability terminal |
-| `services.control` | Authenticated fixed-command Telegram control plane and polling |
+| `services.control` | Persistent fixed-command Control plane, Telegram polling, and Web IPC dispatch |
+| `services.control_ipc` | Windows-only authenticated named-pipe protocol with fixed commands and replay validation |
 | `services.supervisor` | Singleton process registry, lifecycle, and bounded crash recovery |
 
 ## Observation transaction and event order
@@ -82,6 +84,18 @@ offsets, and dispatches a fixed command map. The supervisor owns only the API
 and Live Data Engine children, uses an atomic local lock and sanitized registry,
 and allows at most three restarts in ten minutes by default. `/stop` terminates
 monitoring children without issuing any MT5 position operation.
+
+## Web Control Plane boundary
+
+The browser never calls Supervisor, MT5, or a shell. Tailscale identity is
+required before the exact `/api/control/*` method/path allowlist is reached.
+FastAPI forwards a UUID-tagged request through the local named pipe to the
+already-running Control process. Control serializes lifecycle operations with
+its existing lock, calls the same handlers used by Telegram, and records the
+operation ID in `control_audit` so a replay cannot execute the command twice.
+The API process can therefore fail without acquiring authority to kill or
+restart its own process tree. Demo controls only arm/disarm the existing
+persistent Demo gate; real-money execution remains permanently disabled.
 
 ## Phase 1.7.1 coherent live state
 

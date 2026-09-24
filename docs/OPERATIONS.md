@@ -31,6 +31,41 @@ being installed and does not prevent the API from starting without static assets
 The API binds to `127.0.0.1:8000` by default and CORS remains restricted to
 configured local origins.
 
+## Web Control Plane MVP
+
+The private dashboard's `/control` route is the Web operator surface. It is
+available only through the authenticated tailnet request boundary and exposes
+only these exact operations:
+
+```text
+GET  /api/control/status
+POST /api/control/start
+POST /api/control/stop
+POST /api/control/restart
+GET  /api/control/demo-status
+POST /api/control/demo-on
+POST /api/control/demo-off
+```
+
+FastAPI does not own the API/Live children. Each command crosses a local
+Windows named pipe to the persistent Control process, where the existing
+Supervisor handlers and lifecycle lock execute. The pipe accepts only the
+fixed command vocabulary, a UUID operation ID, and a bounded actor identity;
+replayed operation IDs are rejected after their first audited execution.
+There is no shell, arbitrary process, broker-write, or real-money enable
+operation in this surface. Telegram commands remain available and continue to
+use the same canonical Control handlers during this transition.
+
+The primary background task should be updated in place with
+`scripts/install_background_control_task.ps1`. It preserves hidden/logon
+startup and single-instance behavior while setting
+`StopIfGoingOnBatteries=false` (`-DontStopIfGoingOnBatteries`) and
+`StartWhenAvailable=true`. The script registers the accepted task name and
+does not start or stop the current runtime; inspect the task before and after
+an operator applies it. The historical Telegram task installer remains a
+separate compatibility script and must not be used to create a duplicate
+primary Control task.
+
 ## Phase 2.6 private live dashboard
 
 The approved no-custom-domain architecture separates the public static Vercel

@@ -16,6 +16,7 @@ import {
   FlaskConical,
   RadioTower,
   X,
+  SlidersHorizontal,
 } from "lucide-react";
 import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -40,6 +41,7 @@ const nav = [
   ["/health", "System Health", HeartPulse],
   ["/logs", "Logs", FileClock],
   ["/settings", "Settings", Settings],
+  ["/control", "Operator Control", SlidersHorizontal],
 ] as const;
 
 export function AppShell() {

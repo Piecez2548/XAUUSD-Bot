@@ -15,6 +15,7 @@ import {
 import { OverviewPage } from "./pages/OverviewPage";
 import { ResearchPage } from "./pages/ResearchPage";
 import { ForwardValidationPage } from "./pages/ForwardValidationPage";
+import { OperatorControlPage } from "./pages/OperatorControlPage";
 
 export const dashboardRoutes = [
   {
@@ -35,6 +36,7 @@ export const dashboardRoutes = [
       { path: "/health", element: <HealthPage /> },
       { path: "/logs", element: <LogsPage /> },
       { path: "/settings", element: <SettingsPage /> },
+      { path: "/control", element: <OperatorControlPage /> },
     ],
   },
 ];

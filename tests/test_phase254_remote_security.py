@@ -9,6 +9,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from api.app import create_app
+from config.remote_read_only_policy import is_private_control_path_allowed
 from config.settings import ConfigurationError, Settings, _origins
 from persistence.database import Database
 
@@ -52,13 +53,14 @@ def test_remote_api_surface_is_read_only_and_payloads_are_safe(remote_database: 
         settings=Settings(cors_origins=("https://dashboard.example",)),
         database=remote_database,
     )
-    route_methods = {
-        method
-        for route in app.routes
-        if isinstance(route, APIRoute) and route.path.startswith("/api/")
-        for method in route.methods
-    }
-    assert route_methods <= {"GET", "HEAD", "OPTIONS"}
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or not route.path.startswith("/api/"):
+            continue
+        for method in route.methods:
+            if method == "POST":
+                assert is_private_control_path_allowed(route.path, method)
+            else:
+                assert method in {"GET", "HEAD", "OPTIONS"}
 
     forbidden = {
         "telegram_bot_token", "telegram_chat_id", "mt5_password", "api_key", "database_url"

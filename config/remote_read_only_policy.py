@@ -8,10 +8,9 @@ route boundary testable without starting MT5, Telegram, or a real gateway.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from urllib.parse import unquote, urlsplit
-
 
 REMOTE_FRONTEND_ORIGIN = "https://xauusd-bot-mu.vercel.app"
 REMOTE_UPSTREAM_HOST = "127.0.0.1"
@@ -20,6 +19,21 @@ REMOTE_UPSTREAM_PORT = 8000
 # These are the only HTTP methods the edge may handle.  OPTIONS is a gateway
 # CORS preflight response and must never be forwarded to FastAPI.
 REMOTE_HTTP_METHODS = frozenset({"GET", "OPTIONS"})
+
+# These paths are private operator controls, not part of the public/read-only
+# gateway contract.  FastAPI may expose them only after its Tailscale identity
+# middleware has authenticated the request.
+PRIVATE_CONTROL_GET_PATHS = frozenset({
+    "/api/control/status",
+    "/api/control/demo-status",
+})
+PRIVATE_CONTROL_POST_PATHS = frozenset({
+    "/api/control/start",
+    "/api/control/stop",
+    "/api/control/restart",
+    "/api/control/demo-on",
+    "/api/control/demo-off",
+})
 
 # Exact paths are intentionally used instead of a prefix such as /api.  The
 # two path families below cover only identifiers used by the dashboard.
@@ -129,6 +143,18 @@ def is_remote_path_allowed(raw_target: str) -> bool:
     )
 
 
+def is_private_control_path_allowed(raw_target: str, method: str) -> bool:
+    """Allow only the exact private Web control path/method combinations."""
+
+    path = _safe_path(raw_target)
+    normalized_method = method.upper()
+    if normalized_method == "GET":
+        return path in PRIVATE_CONTROL_GET_PATHS
+    if normalized_method == "POST":
+        return path in PRIVATE_CONTROL_POST_PATHS
+    return False
+
+
 def authorize_remote_request(
     *,
     method: str,
@@ -164,7 +190,10 @@ __all__ = [
     "REMOTE_HTTP_METHODS",
     "REMOTE_UPSTREAM_HOST",
     "REMOTE_UPSTREAM_PORT",
+    "PRIVATE_CONTROL_GET_PATHS",
+    "PRIVATE_CONTROL_POST_PATHS",
     "RemoteBoundaryDecision",
     "authorize_remote_request",
+    "is_private_control_path_allowed",
     "is_remote_path_allowed",
 ]

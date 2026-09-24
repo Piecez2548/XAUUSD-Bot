@@ -61,6 +61,41 @@ export async function getJson<T>(path: string, signal?: AbortSignal): Promise<T>
   );
 }
 
+export async function postJson<T>(
+  path: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const config = {
+    apiBase: API_BASE,
+    privateDashboard: PRIVATE_DASHBOARD,
+    production: import.meta.env.PROD,
+  };
+  if (!isApiConfigured(config)) {
+    throw new Error("BACKEND_NOT_CONFIGURED");
+  }
+  const response = await fetcherForApi(path, config, body, signal);
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status})`);
+  }
+  return (await response.json()) as T;
+}
+
+async function fetcherForApi(
+  path: string,
+  config: ApiRuntimeConfig,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return fetch(apiUrl(path, config.apiBase), {
+    method: "POST",
+    credentials: config.apiBase ? "include" : "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
 export function websocketUrl(path = "/ws/live"): string {
   const configured = (import.meta.env.VITE_WS_URL as string | undefined)?.trim();
   if (configured) return configured;
