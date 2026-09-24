@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -167,10 +168,18 @@ def forward_performance_rows(rows: list[ForwardTradeRecord]) -> dict[str, Any]:
 class ForwardShadowWorker:
     """Durable forward Pair Zone evaluator with restart-safe idempotency."""
 
-    def __init__(self, settings, database, *, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        settings,
+        database,
+        *,
+        logger: logging.Logger,
+        execution_handler: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self.settings = settings
         self.database = database
         self.logger = logger
+        self.execution_handler = execution_handler
         self.health = SystemHealthRepository(database)
         self.strategy = PairZoneV1(settings)
         self.policy = EvaluationPolicy(horizon_bars=getattr(settings, "shadow_outcome_horizon_bars", 12))
@@ -375,6 +384,7 @@ class ForwardShadowWorker:
         # canonical behavior; intelligence is additive and execution-disabled.
         intelligence_available = True
         intelligence_record = None
+        provenance_linked = False
         try:
             from services.intelligence import (
                 StrategyIntelligenceEngine,
@@ -413,10 +423,25 @@ class ForwardShadowWorker:
                             forward_session_id=self.session.id,
                             forward_signal_id=record.id,
                         )
+                        provenance_linked = True
                     except Exception as exc:
                         intelligence_available = False
                         self.logger.exception(
                             "Strategy intelligence provenance unavailable; preserving Forward Shadow decision: %s",
+                            type(exc).__name__,
+                        )
+                if self.execution_handler is not None and provenance_linked:
+                    try:
+                        await self.execution_handler(
+                            signal=record,
+                            decision=decision,
+                            snapshot=item.snapshot,
+                            risk=item.risk,
+                            intelligence_record=intelligence_record,
+                        )
+                    except Exception as exc:
+                        self.logger.exception(
+                            "Demo execution handler failed; preserving Forward Shadow decision: %s",
                             type(exc).__name__,
                         )
         await self._evaluate_open_trades()

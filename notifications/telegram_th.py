@@ -156,6 +156,9 @@ def thai_help() -> str:
 
 🛠️ อื่น ๆ
 /dashboard — เปิด Dashboard
+/demo_on — เปิดใช้งานคำสั่ง Demo หลังผ่าน safety gates
+/demo_off — ปิดคำสั่ง Demo ใหม่ทันที
+/demo_status — ดูสถานะการอนุญาตคำสั่ง Demo
 /logs — ดูเหตุการณ์ล่าสุด
 /help — แสดงคำสั่งทั้งหมด
 

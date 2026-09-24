@@ -121,6 +121,10 @@ class Settings:
     )
     max_trade_risk_percent: float = 2.0
     max_aggregate_risk_percent: float = 6.0
+    demo_execution_enabled: bool = False
+    demo_execution_max_tick_age_seconds: float = 10.0
+    demo_execution_max_entry_deviation_points: int = 20
+    demo_execution_deviation_points: int = 20
     shadow_engine_enabled: bool = True
     shadow_strategy: str = "baseline_v1"
     shadow_decision_timeframe: str = "M5"
@@ -174,6 +178,16 @@ class Settings:
             raise ConfigurationError(
                 "MAX_TRADE_RISK_PERCENT cannot exceed MAX_AGGREGATE_RISK_PERCENT"
             )
+        if self.demo_execution_max_tick_age_seconds <= 0:
+            raise ConfigurationError(
+                "DEMO_EXECUTION_MAX_TICK_AGE_SECONDS must be greater than zero"
+            )
+        if self.demo_execution_max_entry_deviation_points < 0:
+            raise ConfigurationError(
+                "DEMO_EXECUTION_MAX_ENTRY_DEVIATION_POINTS cannot be negative"
+            )
+        if self.demo_execution_deviation_points < 0:
+            raise ConfigurationError("DEMO_EXECUTION_DEVIATION_POINTS cannot be negative")
         if self.shadow_decision_timeframe != "M5":
             raise ConfigurationError("SHADOW_DECISION_TIMEFRAME must be M5")
         if not self.shadow_strategy.strip():
@@ -267,6 +281,14 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         ),
         max_trade_risk_percent=float(os.getenv("MAX_TRADE_RISK_PERCENT", "2")),
         max_aggregate_risk_percent=float(os.getenv("MAX_AGGREGATE_RISK_PERCENT", "6")),
+        demo_execution_enabled=_boolean("DEMO_EXECUTION_ENABLED"),
+        demo_execution_max_tick_age_seconds=float(
+            os.getenv("DEMO_EXECUTION_MAX_TICK_AGE_SECONDS", "10")
+        ),
+        demo_execution_max_entry_deviation_points=_nonnegative_int(
+            "DEMO_EXECUTION_MAX_ENTRY_DEVIATION_POINTS", 20
+        ),
+        demo_execution_deviation_points=_nonnegative_int("DEMO_EXECUTION_DEVIATION_POINTS", 20),
         shadow_engine_enabled=_boolean("SHADOW_ENGINE_ENABLED", True),
         shadow_strategy=os.getenv("SHADOW_STRATEGY", "baseline_v1").strip(),
         shadow_decision_timeframe=os.getenv("SHADOW_DECISION_TIMEFRAME", "M5").upper(),

@@ -754,6 +754,61 @@ class ForwardTradeRecord(IdMixin, Base):
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class DemoExecutionControlRecord(IdMixin, TimestampMixin, Base):
+    """Persisted Demo-only execution arm/kill-switch state."""
+
+    __tablename__ = "demo_execution_controls"
+    __table_args__ = (UniqueConstraint("control_key", name="uq_demo_execution_control_key"),)
+
+    control_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    updated_by: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class DemoExecutionRecord(IdMixin, TimestampMixin, Base):
+    """One persistent, idempotent Demo execution attempt for a canonical signal."""
+
+    __tablename__ = "demo_execution_records"
+    __table_args__ = (
+        UniqueConstraint("forward_signal_id", name="uq_demo_execution_forward_signal"),
+        Index("ix_demo_execution_status_created", "status", "created_at"),
+        Index("ix_demo_execution_position", "broker_position_ticket"),
+    )
+
+    forward_signal_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_signals.id"), nullable=False
+    )
+    forward_session_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_sessions.id"), nullable=False
+    )
+    intelligence_candidate_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    pair_zone_event_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(8), nullable=False)
+    execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="DEMO")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(128))
+    gate_reasons_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    planned_entry: Mapped[float | None] = mapped_column(Float)
+    submitted_entry: Mapped[float | None] = mapped_column(Float)
+    stop_loss: Mapped[float | None] = mapped_column(Float)
+    take_profit: Mapped[float | None] = mapped_column(Float)
+    volume: Mapped[float | None] = mapped_column(Float)
+    risk_percent: Mapped[float | None] = mapped_column(Float)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    broker_retcode: Mapped[int | None] = mapped_column(Integer)
+    broker_order_ticket: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    broker_deal_ticket: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    broker_position_ticket: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    broker_comment: Mapped[str | None] = mapped_column(String(255))
+    submitted_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    acknowledged_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    terminal_outcome_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    terminal_status: Mapped[str | None] = mapped_column(String(32))
+
+
 class StrategyIntelligenceRecord(IdMixin, Base):
     """Versioned, append-only Phase 3 evidence snapshot.
 

@@ -44,6 +44,7 @@ from persistence.orm import (
     SystemHealthRecord,
 )
 from persistence.repositories import ControlAuditRepository, SystemHealthRepository
+from services.demo_execution import demo_execution_armed, set_demo_execution_enabled
 from services.shadow_outcome import OUTCOME_POLICY_VERSION, performance_summary
 from services.supervisor import (
     ProcessSupervisor,
@@ -83,6 +84,9 @@ COMMAND_HELP = {
     "/forwardtrades": "Show recent forward virtual trades",
     "/forwardperformance": "Show forward gross/net performance",
     "/dashboard": "Open the configured dashboard URL",
+    "/demo_on": "Arm Demo execution gates",
+    "/demo_off": "Disable new Demo orders",
+    "/demo_status": "Show Demo execution gate state",
     "/logs": "Show safe recent operational events",
     "/help": "Show available commands",
 }
@@ -376,6 +380,9 @@ class TelegramControlService:
             "/forwardtrades": self._forwardtrades,
             "/forwardperformance": self._forwardperformance,
             "/dashboard": self._dashboard,
+            "/demo_on": self._demo_on,
+            "/demo_off": self._demo_off,
+            "/demo_status": self._demo_status,
             "/logs": self._logs,
             "/help": self._help,
         }
@@ -1568,6 +1575,47 @@ class TelegramControlService:
     def _dashboard(self) -> str:
         url = self.settings.dashboard_public_url
         return f"🖥️ Dashboard\n{url or '⚪ ยังไม่ทราบสถานะ (DASHBOARD_PUBLIC_URL ยังไม่ได้ตั้งค่า)'}\n{execution_disabled()}"
+
+    def _demo_on(self) -> str:
+        if not self.settings.demo_execution_enabled:
+            return (
+                "DEMO execution remains DISABLED.\n"
+                "Set DEMO_EXECUTION_ENABLED=true and reload Control before arming."
+            )
+        set_demo_execution_enabled(
+            self.database,
+            True,
+            reason="OPERATOR_ARMED_DEMO_EXECUTION",
+            updated_by="telegram_control",
+        )
+        return (
+            "DEMO execution ARMED.\n"
+            "Each order still requires a verified DEMO account and every safety gate.\n"
+            "Real-money execution remains DISABLED."
+        )
+
+    def _demo_off(self) -> str:
+        set_demo_execution_enabled(
+            self.database,
+            False,
+            reason="OPERATOR_KILL_SWITCH",
+            updated_by="telegram_control",
+        )
+        return (
+            "DEMO execution KILL SWITCH ACTIVE.\n"
+            "No new Demo orders will be submitted.\n"
+            "Existing broker positions are not closed by this command."
+        )
+
+    def _demo_status(self) -> str:
+        configured = "true" if self.settings.demo_execution_enabled else "false"
+        armed = "true" if demo_execution_armed(self.database) else "false"
+        return (
+            "DEMO execution status\n"
+            f"DEMO_EXECUTION_ENABLED={configured}\n"
+            f"KILL_SWITCH_ARMED={armed}\n"
+            "REAL_MONEY_EXECUTION=DISABLED"
+        )
 
     def _snapshot_context(self):
         """Return the latest coherent risk/position view from one persisted cycle."""

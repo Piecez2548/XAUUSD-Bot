@@ -41,6 +41,7 @@ from mt5.market_data import read_all_candles, read_completed_candles
 from mt5.positions import read_open_positions
 from mt5.symbols import discover_symbol, read_symbol_specification, read_tick
 from persistence.repositories import HistoryRepository, SnapshotRepository, SystemHealthRepository
+from services.demo_execution import DemoExecutionService
 from services.forward_shadow import ForwardInput, ForwardShadowWorker
 from services.risk import (
     calculate_risk_snapshot,
@@ -91,7 +92,15 @@ class LiveDataEngine:
         self.health = SystemHealthRepository(database)
         self.shadow = ShadowDecisionWorker(settings, database, event_bus, logger=logger)
         self.shadow_outcome = ShadowOutcomeWorker(settings, database, logger=logger)
-        self.forward_shadow = ForwardShadowWorker(settings, database, logger=logger)
+        self.demo_execution = DemoExecutionService(
+            settings, database, self.gateway, logger=logger
+        )
+        self.forward_shadow = ForwardShadowWorker(
+            settings,
+            database,
+            logger=logger,
+            execution_handler=self.demo_execution.execute,
+        )
         self.state = _LiveState()
         self.runtime_state = RuntimeState.STARTING
         self.started_at = datetime.now(UTC)

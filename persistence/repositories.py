@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from domain.events import DomainEvent
@@ -23,6 +23,7 @@ from persistence.orm import (
     CandleCursorRecord,
     CandleRecord,
     ControlAuditRecord,
+    DemoExecutionRecord,
     HistoryCursorRecord,
     MarketSnapshotRecord,
     PositionRecord,
@@ -721,6 +722,7 @@ class HistoryRepository:
                         raw_payload=fact.raw_payload,
                     )
                 )
+                self._reconcile_demo_execution(session, fact)
                 inserted += 1
             latest = max(facts, key=lambda item: (item.timestamp, item.deal_ticket))
             cursor = session.scalar(
@@ -732,6 +734,35 @@ class HistoryRepository:
             cursor.last_timestamp = latest.timestamp
             cursor.last_identifier = latest.deal_ticket
             return inserted
+
+    @staticmethod
+    def _reconcile_demo_execution(session: Session, fact: DealFact) -> None:
+        """Attach observed broker identities/outcomes without issuing broker calls."""
+
+        predicates = [DemoExecutionRecord.broker_deal_ticket == fact.deal_ticket]
+        if fact.order_ticket is not None:
+            predicates.append(DemoExecutionRecord.broker_order_ticket == fact.order_ticket)
+        if fact.position_id is not None:
+            predicates.append(DemoExecutionRecord.broker_position_ticket == fact.position_id)
+        row = session.scalar(
+            select(DemoExecutionRecord).where(
+                DemoExecutionRecord.symbol == fact.symbol,
+                or_(*predicates),
+            )
+        )
+        if row is None:
+            return
+        if row.broker_deal_ticket is None:
+            row.broker_deal_ticket = fact.deal_ticket
+        if row.broker_order_ticket is None:
+            row.broker_order_ticket = fact.order_ticket
+        if row.broker_position_ticket is None:
+            row.broker_position_ticket = fact.position_id
+        entry_type = str(fact.entry_type or "").upper()
+        if entry_type in {"OUT", "CLOSE", "CLOSED"} and fact.timestamp > row.created_at:
+            row.terminal_outcome_at = fact.timestamp
+            row.terminal_status = str(fact.reason or "CLOSED")[:32]
+            row.status = "CLOSED"
 
     def cursor(self, scope: str):
         with self._database.session() as session:
