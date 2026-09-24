@@ -230,6 +230,6 @@ def test_start_does_not_rollback_verified_protected_api(
     finally:
         service.database.dispose()
 
-    assert response.startswith("🟢 ระบบพร้อมทำงาน")
+    assert response.startswith("🟢 SYSTEM STARTED")
     assert supervisor.started == ["api", "live"]
     assert supervisor.stopped == []

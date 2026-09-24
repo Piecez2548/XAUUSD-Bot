@@ -420,6 +420,7 @@ class TelegramControlService:
             details={"operation_id": operation_id},
         )
         response = await self._start_infrastructure_locked()
+        startup_boundary = getattr(self, "_startup_started_at", None)
         final_records = self.supervisor.status()
         write_supervisor_lifecycle_event(
             self.project_root,
@@ -434,13 +435,21 @@ class TelegramControlService:
                 },
             },
         )
-        return response
+        return (
+            self._lifecycle_summary("restart", startup_boundary=startup_boundary)
+            if self._lifecycle_operation_succeeded("restart")
+            and self._lifecycle_message_is_success("restart", response)
+            else response
+        )
 
     async def _start_infrastructure(self) -> str:
         async with self._operation_lock:
             return await self._start_infrastructure_locked()
 
     async def _start_infrastructure_locked(self) -> str:
+        # Risk context in the lifecycle summary must belong to this startup
+        # attempt, not merely be a recent snapshot from before a restart.
+        self._startup_started_at = datetime.now(UTC)
         try:
             self._reconcile_supervisor()
         except Exception as exc:
@@ -486,7 +495,6 @@ class TelegramControlService:
             )
         api_command = [supervised_python, str(self.project_root / "main.py"), "server"]
         live_command = [supervised_python, str(self.project_root / "main.py"), "live"]
-        self._startup_started_at = datetime.now(UTC)
         # API is the persistent control-plane child.  Only Live belongs to
         # the trading-runtime transaction and may be rolled back on failure.
         started_live_here: list[str] = []
@@ -663,36 +671,91 @@ class TelegramControlService:
         )
 
     def _system_ready_response(
-        self, result: MT5StartupResult, *, already_running: bool = False
+        self,
+        result: MT5StartupResult,
+        *,
+        already_running: bool = False,
+        startup_boundary: datetime | None = None,
     ) -> str:
-        session_id = "UNKNOWN"
-        try:
-            from services.forward_shadow import latest_forward_session
-
-            session = latest_forward_session(self.database)
-            if session is not None:
-                session_id = session.session_id
-        except Exception:
-            self.logger.exception("Unable to read forward session for /start response")
-        checks = result.checks
-        headline = "🟢 ระบบพร้อมทำงาน — ALREADY RUNNING" if already_running else "🟢 ระบบพร้อมทำงาน"
-        api_state = "CONNECTED" if checks.get("api") in {"OK", "CONNECTED"} else checks.get("api", "UNKNOWN")
-        live_state = "CONNECTED" if checks.get("live_runtime") == "CONNECTED" else checks.get("live_runtime", "UNKNOWN")
-        forward_state = checks.get("forward", self._forward_worker_state())
-        launch = "🟢 เปิดให้อัตโนมัติแล้ว" if result.launch_state == "STARTED" else "🟢 ใช้ MT5 ที่เปิดอยู่แล้ว"
-        return (
-            f"{headline}\n\n"
-            f"{status_line('MT5', checks.get('terminal', 'UNKNOWN'), connection=True)}\n"
-            f"{'บัญชี':<18}{'🟢 ตรวจสอบแล้ว (VERIFIED)' if checks.get('account') in {'OK', 'CONNECTED', 'VERIFIED'} else translate_health_state(checks.get('account', 'UNKNOWN'))}\n"
-            f"{'ข้อมูลตลาด':<18}{'🟢 พร้อม (READY)' if checks.get('market_data') in {'OK', 'CONNECTED', 'READY'} else translate_health_state(checks.get('market_data', 'UNKNOWN'))}\n"
-            f"{status_line('API', api_state, connection=True)}\n"
-            f"{status_line('Live Engine', live_state, connection=True)}\n"
-            f"{status_line('Forward Shadow', forward_state)}\n\n"
-            "โหมด: อ่านข้อมูล / จำลองการเทรด\n"
-            f"MT5: {launch}\n"
-            f"Forward Session: {session_id}\n"
-            f"{execution_disabled()}"
+        _ = result
+        return self._lifecycle_summary(
+            "start",
+            already_running=already_running,
+            startup_boundary=startup_boundary or getattr(self, "_startup_started_at", None),
         )
+
+    def _lifecycle_summary(
+        self,
+        command: str,
+        *,
+        already_running: bool = False,
+        startup_boundary: datetime | None = None,
+    ) -> str:
+        """Render one concise summary from the post-operation state."""
+
+        status = self._operator_status_payload()
+        execution = status.get("execution")
+        execution = execution if isinstance(execution, dict) else {}
+        real_money = execution.get("real_money_execution", "UNKNOWN")
+        if real_money == "DISABLED":
+            safety_line = "🔒 Real-money trading: Disabled"
+        else:
+            safety_line = f"🔒 Real-money trading: {real_money}"
+
+        if command in {"start", "restart"}:
+            risk_line = None
+            if startup_boundary is not None:
+                risk, _observed_at, freshness, _rows, _snapshot_id = self._snapshot_context(
+                    minimum_timestamp=startup_boundary
+                )
+                if risk is not None and freshness == "LIVE":
+                    risk_line = (
+                        f"{_format_percent(risk.open_risk_percent)} / "
+                        f"{_format_percent(risk.max_aggregate_risk_percent)}"
+                    )
+            headline = "🟢 SYSTEM ALREADY RUNNING" if already_running else (
+                "🔄 SYSTEM RESTARTED" if command == "restart" else "🟢 SYSTEM STARTED"
+            )
+            lines = [
+                headline,
+                "",
+                f"MT5: {self._summary_state(status.get('mt5'), connected=True)}",
+                f"Live Engine: {self._summary_state(status.get('live'), running=True)}",
+                f"Forward Shadow: {self._summary_state(status.get('forward_shadow'), connected=True)}",
+            ]
+            if risk_line is not None:
+                lines.append(f"Risk: {risk_line}")
+            lines.append(safety_line)
+            return "\n".join(lines)
+
+        if command == "stop":
+            return (
+                "🔴 SYSTEM STOPPED\n\n"
+                f"Live Engine: {self._summary_state(status.get('live'), stopped=True)}\n"
+                f"Control Plane: {self._summary_state(status.get('api'), online=True)}\n"
+                f"{safety_line}"
+            )
+        raise ValueError(f"unsupported lifecycle summary command: {command}")
+
+    @staticmethod
+    def _summary_state(
+        state: object,
+        *,
+        connected: bool = False,
+        running: bool = False,
+        stopped: bool = False,
+        online: bool = False,
+    ) -> str:
+        normalized = str(state or "UNKNOWN").upper()
+        if connected and normalized == "CONNECTED":
+            return "Connected"
+        if running and normalized == "RUNNING":
+            return "Running"
+        if stopped and normalized == "STOPPED":
+            return "Stopped"
+        if online and normalized == "RUNNING":
+            return "Online"
+        return normalized
 
     def _stop_failed_start(
         self,
@@ -752,15 +815,7 @@ class TelegramControlService:
                 "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
                 f"{execution_disabled()}"
             )
-        return (
-            "🔴 หยุดระบบติดตามตลาดแล้ว\n\n"
-            "Live Engine  ⚫ หยุดทำงาน (STOPPED)\nAPI           🟢 ทำงานอยู่ (RUNNING — Control Plane)\n\n"
-            "ไม่มีการแก้ไข Position ที่ Broker\nBroker positions were NOT modified.\n"
-            "Telegram Control ยังคงออนไลน์\n"
-            "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
-            "Execution         DISABLED\n"
-            f"{execution_disabled()}"
-        )
+        return self._lifecycle_summary("stop")
 
     def _stop_supervised_component(
         self,
@@ -901,6 +956,49 @@ class TelegramControlService:
             },
         }
 
+    def _lifecycle_operation_succeeded(self, command: str) -> bool:
+        try:
+            status = self._operator_status_payload()
+        except Exception:
+            self.logger.exception("Unable to verify lifecycle notification state")
+            return False
+        if status.get("supervisor") != "CONNECTED" or status.get("api") != "RUNNING":
+            return False
+        expected_live = "STOPPED" if command == "stop" else "RUNNING"
+        return status.get("live") == expected_live
+
+    @staticmethod
+    def _lifecycle_message_is_success(command: str, message: str) -> bool:
+        prefixes = {
+            "start": ("🟢 SYSTEM STARTED", "🟢 SYSTEM ALREADY RUNNING"),
+            "stop": ("🔴 SYSTEM STOPPED",),
+            "restart": (
+                "🔄 SYSTEM RESTARTED",
+                "🟢 SYSTEM STARTED",
+                "🟢 SYSTEM ALREADY RUNNING",
+            ),
+        }
+        return command in prefixes and message.startswith(prefixes[command])
+
+    async def _notify_lifecycle_summary(self, message: str) -> None:
+        """Push a Web-triggered summary without affecting lifecycle success."""
+
+        allowed = tuple(self.settings.telegram_allowed_chat_ids)
+        chat_id = next(
+            (
+                candidate
+                for candidate in (self.settings.telegram_chat_id, *allowed)
+                if candidate and candidate in allowed
+            ),
+            None,
+        )
+        if chat_id is None:
+            return
+        try:
+            await self.send_message(chat_id, message)
+        except Exception:
+            self.logger.exception("Telegram lifecycle summary delivery failed")
+
     async def _handle_ipc_request(self, message: dict[str, str]) -> dict[str, object]:
         """Handle the fixed Web command vocabulary inside the Control process."""
 
@@ -962,6 +1060,13 @@ class TelegramControlService:
                 result,
                 operation_id,
             )
+            if (
+                command in {"start", "stop", "restart"}
+                and result == "SUCCEEDED"
+                and self._lifecycle_message_is_success(command, message_text)
+                and self._lifecycle_operation_succeeded(command)
+            ):
+                await self._notify_lifecycle_summary(message_text)
             return {
                 "ok": result == "SUCCEEDED",
                 "duplicate": False,
@@ -1821,7 +1926,7 @@ class TelegramControlService:
             "REAL_MONEY_EXECUTION=DISABLED"
         )
 
-    def _snapshot_context(self):
+    def _snapshot_context(self, *, minimum_timestamp: datetime | None = None):
         """Return the latest coherent risk/position view from one persisted cycle."""
 
         with self.database.session() as session:
@@ -1835,12 +1940,30 @@ class TelegramControlService:
                 .order_by(desc(RiskSnapshotRecord.timestamp))
             ).all()
             latest_risk_any = session.scalar(
-                select(RiskSnapshotRecord).order_by(desc(RiskSnapshotRecord.timestamp)).limit(1)
+                select(RiskSnapshotRecord)
+                .where(
+                    RiskSnapshotRecord.timestamp >= minimum_timestamp
+                    if minimum_timestamp is not None
+                    else True
+                )
+                .order_by(desc(RiskSnapshotRecord.timestamp))
+                .limit(1)
             )
             latest_market_any = session.scalar(
-                select(MarketSnapshotRecord).order_by(desc(MarketSnapshotRecord.timestamp)).limit(1)
+                select(MarketSnapshotRecord)
+                .where(
+                    MarketSnapshotRecord.timestamp >= minimum_timestamp
+                    if minimum_timestamp is not None
+                    else True
+                )
+                .order_by(desc(MarketSnapshotRecord.timestamp))
+                .limit(1)
             )
             for risk, market in candidates:
+                if minimum_timestamp is not None and (
+                    risk.timestamp < minimum_timestamp or market.timestamp < minimum_timestamp
+                ):
+                    continue
                 snapshot_count = (
                     session.scalar(
                         select(func.count())
@@ -1875,10 +1998,24 @@ class TelegramControlService:
                 return risk, observed_at, freshness, tuple(rows), market.id
 
             risk = session.scalar(
-                select(RiskSnapshotRecord).order_by(desc(RiskSnapshotRecord.timestamp)).limit(1)
+                select(RiskSnapshotRecord)
+                .where(
+                    RiskSnapshotRecord.timestamp >= minimum_timestamp
+                    if minimum_timestamp is not None
+                    else True
+                )
+                .order_by(desc(RiskSnapshotRecord.timestamp))
+                .limit(1)
             )
             market = session.scalar(
-                select(MarketSnapshotRecord).order_by(desc(MarketSnapshotRecord.timestamp)).limit(1)
+                select(MarketSnapshotRecord)
+                .where(
+                    MarketSnapshotRecord.timestamp >= minimum_timestamp
+                    if minimum_timestamp is not None
+                    else True
+                )
+                .order_by(desc(MarketSnapshotRecord.timestamp))
+                .limit(1)
             )
             active = session.scalars(
                 select(PositionRecord)

@@ -10,7 +10,7 @@ from typing import Protocol
 
 import httpx
 
-from domain.events import DomainEvent, EventType
+from domain.events import DomainEvent, EventSeverity, EventType
 from notifications.templates import format_telegram_event, telegram_test_message
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -100,7 +100,30 @@ class TelegramNotifier:
     async def handle(self, event: DomainEvent) -> None:
         if not self.configured or event.event_type not in self.NOTIFIABLE_EVENT_TYPES:
             return
+        if self._is_routine_lifecycle_event(event):
+            return
         await self.send(format_telegram_event(event))
+
+    @staticmethod
+    def _is_routine_lifecycle_event(event: DomainEvent) -> bool:
+        """Keep expected startup/stop telemetry inside the lifecycle summary.
+
+        Persistence still receives every event through the database subscriber.
+        Only normal informational child notifications are coalesced here;
+        warnings, errors, disconnects and execution alerts remain independent.
+        """
+
+        if event.event_type in {
+            EventType.SYSTEM_LIVE_STARTED,
+            EventType.SYSTEM_LIVE_STOPPED,
+        }:
+            return True
+        if event.severity != EventSeverity.INFO:
+            return False
+        return event.event_type in {
+            EventType.MT5_CONNECTED,
+            EventType.RISK_SNAPSHOT_CREATED,
+        }
 
     async def send_test(self) -> bool:
         if not self.configured:
