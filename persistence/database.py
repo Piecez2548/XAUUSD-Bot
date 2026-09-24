@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from persistence.orm import AUTH_SCHEMA_TABLE_NAMES, Base
 
-AUTH_SCHEMA_MINIMUM_REVISION = "20260924_0014"
+AUTH_SCHEMA_MINIMUM_REVISION = "20260924_0015"
 
 
 class AuthSchemaError(RuntimeError):
@@ -99,6 +99,12 @@ class Database:
         database = cls(resolved_url, project_root=project_root)
         database._disposable_test_database = True
         return database
+
+    @property
+    def is_disposable_test_database(self) -> bool:
+        """Whether this instance was explicitly created for disposable tests."""
+
+        return self._disposable_test_database
 
     @staticmethod
     def _configure_sqlite(connection, _record) -> None:
@@ -205,6 +211,7 @@ class Database:
                 for table_name, column_name in (
                     ("auth_users", "normalized_login"),
                     ("auth_sessions", "token_hash"),
+                    ("auth_enrollments", "token_hash"),
                 ):
                     unique_columns = {
                         tuple(constraint.get("column_names") or ())
@@ -221,6 +228,16 @@ class Database:
                             f"{table_name}.{column_name} must be unique"
                         )
 
+                owner_guard = any(
+                    index.get("name") == "uq_auth_users_single_owner" and index.get("unique")
+                    for index in inspector.get_indexes("auth_users")
+                )
+                if not owner_guard:
+                    raise AuthSchemaError(
+                        "Private dashboard auth schema is incompatible; single-OWNER "
+                        "database invariant is missing"
+                    )
+
                 session_user_fk = any(
                     tuple(foreign_key.get("constrained_columns") or ()) == ("user_id",)
                     and foreign_key.get("referred_table") == "auth_users"
@@ -231,6 +248,27 @@ class Database:
                     raise AuthSchemaError(
                         "Private dashboard auth schema is incompatible; "
                         "auth_sessions.user_id must reference auth_users.id"
+                    )
+
+                enrollment_foreign_keys = {
+                    tuple(foreign_key.get("constrained_columns") or ()): (
+                        foreign_key.get("referred_table"),
+                        tuple(foreign_key.get("referred_columns") or ()),
+                    )
+                    for foreign_key in inspector.get_foreign_keys("auth_enrollments")
+                }
+                if enrollment_foreign_keys.get(("user_id",)) != ("auth_users", ("id",)):
+                    raise AuthSchemaError(
+                        "Private dashboard auth schema is incompatible; enrollment user "
+                        "must reference auth_users.id"
+                    )
+                if enrollment_foreign_keys.get(("created_by_user_id",)) != (
+                    "auth_users",
+                    ("id",),
+                ):
+                    raise AuthSchemaError(
+                        "Private dashboard auth schema is incompatible; enrollment issuer "
+                        "must reference auth_users.id"
                     )
         except AuthSchemaError:
             raise

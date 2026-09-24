@@ -8,17 +8,40 @@ import secrets
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from config.settings import Settings
 from persistence.database import Database
-from persistence.orm import AuthAuditRecord, AuthSessionRecord, AuthUserRecord, new_id
+from persistence.orm import (
+    AuthAuditRecord,
+    AuthEnrollmentRecord,
+    AuthSessionRecord,
+    AuthUserRecord,
+    new_id,
+)
 
 SESSION_COOKIE_NAME = "__Host-xauusd_session"
 ACTIVE_ROLES = frozenset({"OWNER", "ADMIN"})
+ENROLLMENT_TTL = timedelta(minutes=15)
+ENROLLMENT_SECRET_BYTES = 32
+
+
+class AuthRole(StrEnum):
+    OWNER = "OWNER"
+    ADMIN = "ADMIN"
+
+
+class AccountState(StrEnum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    DISABLED = "DISABLED"
+
+
 ACCOUNT_STATES = frozenset(
     {"PROVISIONED", "PENDING_APPROVAL", "ACTIVE", "LOCKED", "REVOKED"}
 )
@@ -62,8 +85,15 @@ class LoginResult:
     token: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class EnrollmentIssue:
+    account: dict[str, object]
+    secret: str
+    expires_at: datetime
+
+
 class AuthenticationService:
-    """Small DB-backed auth service; no provisioning or approval endpoints."""
+    """DB-backed authentication and owner-governed account provisioning."""
 
     def __init__(self, database: Database, settings: Settings) -> None:
         self.database = database
@@ -91,14 +121,16 @@ class AuthenticationService:
         state: str,
         bound_tailscale_login: str,
     ) -> str:
-        """Internal provisioning primitive; deliberately not exposed over HTTP."""
+        """Legacy test fixture helper; production account issuance uses invitations."""
 
+        if not self.database.is_disposable_test_database:
+            raise PermissionError("Fixture account provisioning is restricted to disposable tests")
         normalized = normalize_login(login)
         tailscale_login = normalize_login(bound_tailscale_login)
         if not normalized or len(normalized) > 254 or not tailscale_login:
             raise ValueError("Login and bound Tailscale identity are required")
-        if role not in ACTIVE_ROLES or state not in ACCOUNT_STATES:
-            raise ValueError("Unsupported account role or state")
+        if role != AuthRole.ADMIN.value or state not in ACCOUNT_STATES:
+            raise ValueError("Only test ADMIN fixtures may use this helper")
         user_id = new_id()
         with self.database.session() as session:
             session.add(
@@ -112,6 +144,437 @@ class AuthenticationService:
                 )
             )
         return user_id
+
+    @staticmethod
+    def _audit(
+        session,
+        *,
+        event_type: str,
+        outcome: str,
+        actor_id: str | None = None,
+        target_id: str | None = None,
+        login: str | None = None,
+        tailscale_login: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        session.add(
+            AuthAuditRecord(
+                event_type=event_type,
+                actor_user_id=actor_id,
+                user_id=target_id or actor_id,
+                normalized_login=login,
+                tailscale_login=tailscale_login,
+                outcome=outcome,
+                reason=reason,
+            )
+        )
+
+    def bootstrap_owner(self, *, login: str, password: str, bound_tailscale_login: str) -> str:
+        """Create the sole OWNER; DB uniqueness makes concurrent attempts safe."""
+
+        normalized = normalize_login(login)
+        identity = normalize_login(bound_tailscale_login)
+        if not normalized or len(normalized) > 254 or not identity or len(identity) > 254:
+            raise ValueError("A valid login and Tailscale identity are required")
+        password_hash = self.hash_password(password)
+        owner_id = new_id()
+        try:
+            with self.database.session() as session:
+                if session.scalar(
+                    select(AuthUserRecord.id)
+                    .where(AuthUserRecord.role == AuthRole.OWNER.value)
+                    .limit(1)
+                ):
+                    raise RuntimeError("First OWNER already exists")
+                session.add(
+                    AuthUserRecord(
+                        id=owner_id,
+                        normalized_login=normalized,
+                        password_hash=password_hash,
+                        role=AuthRole.OWNER.value,
+                        state="ACTIVE",
+                        bound_tailscale_login=identity,
+                    )
+                )
+                session.flush()
+                self._audit(
+                    session,
+                    event_type="OWNER_BOOTSTRAP",
+                    outcome="SUCCEEDED",
+                    actor_id=owner_id,
+                    target_id=owner_id,
+                    login=normalized,
+                    tailscale_login=identity,
+                    reason="LOCAL_INTERACTIVE_BOOTSTRAP",
+                )
+        except IntegrityError as exc:
+            # Unique login and the partial unique OWNER index resolve racing
+            # bootstrap attempts at the database boundary.
+            raise RuntimeError("OWNER bootstrap lost a uniqueness race") from exc
+        return owner_id
+
+    def owner_exists(self) -> bool:
+        """Read-only check used by the local bootstrap CLI before prompting."""
+
+        with self.database.session() as session:
+            return (
+                session.scalar(
+                    select(AuthUserRecord.id)
+                    .where(AuthUserRecord.role == AuthRole.OWNER.value)
+                    .limit(1)
+                )
+                is not None
+            )
+
+    @staticmethod
+    def _owner_in_session(session, actor_id: str, tailscale_login: str) -> AuthUserRecord:
+        actor = session.get(AuthUserRecord, actor_id)
+        identity = normalize_login(tailscale_login)
+        if (
+            actor is None
+            or actor.role != AuthRole.OWNER.value
+            or actor.state != "ACTIVE"
+            or not identity
+            or actor.bound_tailscale_login != identity
+        ):
+            raise PermissionError("Active identity-bound OWNER authorization required")
+        return actor
+
+    @staticmethod
+    def _safe_account(user: AuthUserRecord) -> dict[str, object]:
+        state = {
+            "PENDING_APPROVAL": AccountState.PENDING.value,
+            "PROVISIONED": AccountState.PENDING.value,
+            "ACTIVE": AccountState.ACTIVE.value,
+            "REVOKED": AccountState.DISABLED.value,
+            "LOCKED": AccountState.DISABLED.value,
+        }.get(user.state, "UNKNOWN")
+        return {
+            "id": user.id,
+            "login": user.normalized_login,
+            "role": user.role,
+            "state": state,
+            "bound_tailscale_identity": user.bound_tailscale_login,
+            "created_at": user.created_at.isoformat(),
+            "updated_at": user.updated_at.isoformat(),
+        }
+
+    def list_accounts(self, *, actor_id: str, tailscale_login: str) -> list[dict[str, object]]:
+        with self.database.session() as session:
+            self._owner_in_session(session, actor_id, tailscale_login)
+            users = session.scalars(
+                select(AuthUserRecord).order_by(AuthUserRecord.created_at, AuthUserRecord.id)
+            ).all()
+            return [self._safe_account(user) for user in users]
+
+    def create_invitation(
+        self,
+        *,
+        actor_id: str,
+        tailscale_login: str,
+        login: str,
+        role: str,
+        bound_tailscale_login: str,
+    ) -> EnrollmentIssue:
+        normalized = normalize_login(login)
+        bound_identity = normalize_login(bound_tailscale_login)
+        if (
+            not normalized
+            or len(normalized) > 254
+            or not bound_identity
+            or len(bound_identity) > 254
+        ):
+            raise ValueError("A valid account login and Tailscale identity are required")
+        if role not in {AuthRole.ADMIN.value}:
+            raise ValueError("Only the explicitly allowed ADMIN role may be invited")
+        secret = secrets.token_urlsafe(ENROLLMENT_SECRET_BYTES)
+        secret_hash = _token_hash(secret)
+        now = datetime.now(UTC)
+        expires_at = now + ENROLLMENT_TTL
+        # Pending accounts have no usable password. Enrollment sets one only
+        # after the secret and expected Tailscale identity are both verified.
+        unusable_password_hash = self.hash_password(secrets.token_urlsafe(48))
+        user_id = new_id()
+        try:
+            with self.database.session() as session:
+                actor = self._owner_in_session(session, actor_id, tailscale_login)
+                user = AuthUserRecord(
+                    id=user_id,
+                    normalized_login=normalized,
+                    password_hash=unusable_password_hash,
+                    role=role,
+                    state="PENDING_APPROVAL",
+                    bound_tailscale_login=bound_identity,
+                )
+                session.add(user)
+                session.flush()
+                session.add(
+                    AuthEnrollmentRecord(
+                        user_id=user_id,
+                        token_hash=secret_hash,
+                        created_by_user_id=actor.id,
+                        created_at=now,
+                        expires_at=expires_at,
+                    )
+                )
+                self._audit(
+                    session,
+                    event_type="ACCOUNT_CREATED",
+                    outcome="SUCCEEDED",
+                    actor_id=actor.id,
+                    target_id=user_id,
+                    login=normalized,
+                    tailscale_login=bound_identity,
+                    reason="ROLE_ADMIN;state=PENDING",
+                )
+                self._audit(
+                    session,
+                    event_type="ENROLLMENT_ISSUED",
+                    outcome="SUCCEEDED",
+                    actor_id=actor.id,
+                    target_id=user_id,
+                    login=normalized,
+                    tailscale_login=bound_identity,
+                    reason="TTL_15_MINUTES",
+                )
+                safe_account = self._safe_account(user)
+        except IntegrityError as exc:
+            raise ValueError("Account login is already provisioned") from exc
+        return EnrollmentIssue(safe_account, secret, expires_at)
+
+    def activate_enrollment(self, *, secret: str, password: str, tailscale_login: str) -> bool:
+        identity = normalize_login(tailscale_login)
+        if not identity or not isinstance(secret, str) or not 32 <= len(secret) <= 256:
+            self._record_enrollment_failure(identity, "INVALID_ENROLLMENT")
+            return False
+        try:
+            password_hash = self.hash_password(password)
+        except ValueError:
+            self._record_enrollment_failure(identity, "INVALID_PASSWORD")
+            return False
+        now = datetime.now(UTC)
+        digest = _token_hash(secret)
+        with self.database.session() as session:
+            enrollment = session.scalar(
+                select(AuthEnrollmentRecord).where(AuthEnrollmentRecord.token_hash == digest)
+            )
+            user = session.get(AuthUserRecord, enrollment.user_id) if enrollment else None
+            failure = None
+            if enrollment is None:
+                failure = "INVALID_ENROLLMENT"
+            elif enrollment.consumed_at is not None or enrollment.revoked_at is not None:
+                failure = "ENROLLMENT_ALREADY_USED"
+            elif enrollment.expires_at <= now:
+                failure = "ENROLLMENT_EXPIRED"
+            elif user is None or user.state != "PENDING_APPROVAL":
+                failure = "ACCOUNT_NOT_PENDING"
+            elif user.bound_tailscale_login != identity:
+                failure = "IDENTITY_MISMATCH"
+            if failure:
+                self._audit(
+                    session,
+                    event_type="ENROLLMENT_FAILURE",
+                    outcome="DENIED",
+                    target_id=user.id if user else None,
+                    login=user.normalized_login if user else None,
+                    tailscale_login=identity or None,
+                    reason=failure,
+                )
+                return False
+
+            consumed = session.execute(
+                update(AuthEnrollmentRecord)
+                .where(
+                    AuthEnrollmentRecord.id == enrollment.id,
+                    AuthEnrollmentRecord.consumed_at.is_(None),
+                    AuthEnrollmentRecord.revoked_at.is_(None),
+                    AuthEnrollmentRecord.expires_at > now,
+                )
+                .values(consumed_at=now)
+            )
+            if consumed.rowcount != 1:
+                self._audit(
+                    session,
+                    event_type="ENROLLMENT_FAILURE",
+                    outcome="DENIED",
+                    target_id=user.id,
+                    login=user.normalized_login,
+                    tailscale_login=identity,
+                    reason="ENROLLMENT_REPLAY",
+                )
+                return False
+            activated = session.execute(
+                update(AuthUserRecord)
+                .where(
+                    AuthUserRecord.id == user.id,
+                    AuthUserRecord.state == "PENDING_APPROVAL",
+                    AuthUserRecord.bound_tailscale_login == identity,
+                )
+                .values(state="ACTIVE", password_hash=password_hash, updated_at=now)
+            )
+            if activated.rowcount != 1:
+                # Raising rolls back the one-time consumption as well.
+                raise RuntimeError("Enrollment account changed during activation")
+            self._audit(
+                session,
+                event_type="ENROLLMENT_CONSUMED",
+                outcome="SUCCEEDED",
+                actor_id=user.id,
+                target_id=user.id,
+                login=user.normalized_login,
+                tailscale_login=identity,
+                reason="ACCOUNT_ACTIVATED",
+            )
+            self._audit(
+                session,
+                event_type="ACCOUNT_ACTIVATED",
+                outcome="SUCCEEDED",
+                actor_id=user.id,
+                target_id=user.id,
+                login=user.normalized_login,
+                tailscale_login=identity,
+                reason="OWNER_ISSUED_ENROLLMENT",
+            )
+            return True
+
+    def _record_enrollment_failure(self, identity: str, reason: str) -> None:
+        with self.database.session() as session:
+            self._audit(
+                session,
+                event_type="ENROLLMENT_FAILURE",
+                outcome="DENIED",
+                tailscale_login=identity or None,
+                reason=reason,
+            )
+
+    def disable_account(self, *, actor_id: str, tailscale_login: str, target_id: str) -> None:
+        now = datetime.now(UTC)
+        with self.database.session() as session:
+            actor = self._owner_in_session(session, actor_id, tailscale_login)
+            target = session.get(AuthUserRecord, target_id)
+            if target is None:
+                raise LookupError("Account not found")
+            if target.role == AuthRole.OWNER.value:
+                raise ValueError("The sole OWNER cannot be disabled")
+            if target.state == "REVOKED":
+                return
+            target.state = "REVOKED"
+            sessions = session.scalars(
+                select(AuthSessionRecord).where(
+                    AuthSessionRecord.user_id == target.id,
+                    AuthSessionRecord.revoked_at.is_(None),
+                )
+            ).all()
+            for auth_session in sessions:
+                auth_session.revoked_at = now
+                self._audit(
+                    session,
+                    event_type="SESSION_REVOKED",
+                    outcome="SUCCEEDED",
+                    actor_id=actor.id,
+                    target_id=target.id,
+                    login=target.normalized_login,
+                    tailscale_login=target.bound_tailscale_login,
+                    reason="ACCOUNT_DISABLED",
+                )
+            session.execute(
+                update(AuthEnrollmentRecord)
+                .where(
+                    AuthEnrollmentRecord.user_id == target.id,
+                    AuthEnrollmentRecord.consumed_at.is_(None),
+                    AuthEnrollmentRecord.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
+            self._audit(
+                session,
+                event_type="ACCOUNT_DISABLED",
+                outcome="SUCCEEDED",
+                actor_id=actor.id,
+                target_id=target.id,
+                login=target.normalized_login,
+                tailscale_login=target.bound_tailscale_login,
+                reason="OWNER_ACTION",
+            )
+
+    def list_account_sessions(
+        self, *, actor_id: str, tailscale_login: str, target_id: str
+    ) -> list[dict[str, object]]:
+        with self.database.session() as session:
+            self._owner_in_session(session, actor_id, tailscale_login)
+            target = session.get(AuthUserRecord, target_id)
+            if target is None:
+                raise LookupError("Account not found")
+            records = session.scalars(
+                select(AuthSessionRecord)
+                .where(AuthSessionRecord.user_id == target_id)
+                .order_by(AuthSessionRecord.created_at.desc())
+            ).all()
+            return [
+                {
+                    "id": item.id,
+                    "created_at": item.created_at.isoformat(),
+                    "last_seen_at": item.last_seen_at.isoformat(),
+                    "idle_expires_at": item.idle_expires_at.isoformat(),
+                    "absolute_expires_at": item.absolute_expires_at.isoformat(),
+                    "revoked": item.revoked_at is not None,
+                }
+                for item in records
+            ]
+
+    def revoke_account_session(
+        self, *, actor_id: str, tailscale_login: str, target_id: str, session_id: str
+    ) -> bool:
+        now = datetime.now(UTC)
+        with self.database.session() as session:
+            actor = self._owner_in_session(session, actor_id, tailscale_login)
+            target = session.get(AuthUserRecord, target_id)
+            record = session.get(AuthSessionRecord, session_id)
+            if target is None or record is None or record.user_id != target_id:
+                raise LookupError("Session not found")
+            if record.revoked_at is not None:
+                return False
+            record.revoked_at = now
+            self._audit(
+                session,
+                event_type="SESSION_REVOKED",
+                outcome="SUCCEEDED",
+                actor_id=actor.id,
+                target_id=target.id,
+                login=target.normalized_login,
+                tailscale_login=target.bound_tailscale_login,
+                reason="OWNER_SELECTED_SESSION",
+            )
+            return True
+
+    def revoke_all_account_sessions(
+        self, *, actor_id: str, tailscale_login: str, target_id: str
+    ) -> int:
+        now = datetime.now(UTC)
+        with self.database.session() as session:
+            actor = self._owner_in_session(session, actor_id, tailscale_login)
+            target = session.get(AuthUserRecord, target_id)
+            if target is None:
+                raise LookupError("Account not found")
+            changed = session.execute(
+                update(AuthSessionRecord)
+                .where(
+                    AuthSessionRecord.user_id == target.id,
+                    AuthSessionRecord.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            ).rowcount
+            self._audit(
+                session,
+                event_type="SESSIONS_REVOKED_ALL",
+                outcome="SUCCEEDED",
+                actor_id=actor.id,
+                target_id=target.id,
+                login=target.normalized_login,
+                tailscale_login=target.bound_tailscale_login,
+                reason=f"COUNT_{changed or 0}",
+            )
+            return int(changed or 0)
 
     def login(self, login: str, password: str, tailscale_login: str) -> LoginResult:
         normalized = normalize_login(login)[:254]

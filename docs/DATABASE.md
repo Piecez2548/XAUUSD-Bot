@@ -47,6 +47,14 @@ The historical bootstrap revisions use migration-local frozen schema definitions
 
 SQLite remains appropriate for the current single-node local observatory. PostgreSQL becomes preferable for multi-process writers, remote deployment, higher event volume, or operational HA.
 
+## Application authentication schema
+
+Revision `20260924_0014` introduced the application users, sessions, and auth
+audit tables. Revision `20260924_0015` adds one-time enrollment records, the
+single-OWNER unique invariant, and explicit audit actor provenance. The private
+dashboard requires revision 0015 or a known descendant. Its schema check is
+fail-closed; normal application startup never creates auth-owned tables.
+
 ## Retention
 
 No automatic deletion is enabled. A future retention job should preserve trades, decisions, version records, and material audit events while allowing policy-based compaction of high-frequency market/position snapshots. Retention must be explicit, backed up, and audited.

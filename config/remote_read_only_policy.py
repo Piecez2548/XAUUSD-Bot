@@ -38,7 +38,18 @@ AUTH_ROUTE_METHODS = {
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/session"),
+    ("POST", "/api/auth/enroll"),
 }
+AUTH_ADMIN_ROUTE_METHODS = {
+    ("GET", "/api/auth/admin/accounts"),
+    ("POST", "/api/auth/admin/accounts"),
+}
+_AUTH_ADMIN_ACCOUNT_ROUTE = re.compile(
+    r"^/api/auth/admin/accounts/[0-9a-fA-F-]{36}/(?:disable|sessions)$"
+)
+_AUTH_ADMIN_SESSION_ROUTE = re.compile(
+    r"^/api/auth/admin/accounts/[0-9a-fA-F-]{36}/sessions/[0-9a-fA-F-]{36}$"
+)
 
 # Exact paths are intentionally used instead of a prefix such as /api.  The
 # two path families below cover only identifiers used by the dashboard.
@@ -167,6 +178,27 @@ def is_auth_route_allowed(raw_target: str, method: str) -> bool:
     return (method.upper(), path) in AUTH_ROUTE_METHODS
 
 
+def is_auth_admin_route_allowed(raw_target: str, method: str) -> bool:
+    """Allow only the exact owner account/session management route shapes."""
+
+    path = _safe_path(raw_target)
+    normalized_method = method.upper()
+    if (normalized_method, path) in AUTH_ADMIN_ROUTE_METHODS:
+        return True
+    if path is None:
+        return False
+    if normalized_method == "POST":
+        return bool(_AUTH_ADMIN_ACCOUNT_ROUTE.fullmatch(path) and path.endswith("/disable"))
+    if normalized_method == "GET":
+        return bool(_AUTH_ADMIN_ACCOUNT_ROUTE.fullmatch(path) and path.endswith("/sessions"))
+    if normalized_method == "DELETE":
+        return bool(
+            (_AUTH_ADMIN_ACCOUNT_ROUTE.fullmatch(path) and path.endswith("/sessions"))
+            or _AUTH_ADMIN_SESSION_ROUTE.fullmatch(path)
+        )
+    return False
+
+
 def authorize_remote_request(
     *,
     method: str,
@@ -205,9 +237,11 @@ __all__ = [
     "PRIVATE_CONTROL_GET_PATHS",
     "PRIVATE_CONTROL_POST_PATHS",
     "AUTH_ROUTE_METHODS",
+    "AUTH_ADMIN_ROUTE_METHODS",
     "RemoteBoundaryDecision",
     "authorize_remote_request",
     "is_private_control_path_allowed",
     "is_auth_route_allowed",
+    "is_auth_admin_route_allowed",
     "is_remote_path_allowed",
 ]

@@ -23,6 +23,7 @@ from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
 from api.static_dashboard import DashboardStaticFiles
 from config.remote_read_only_policy import (
+    is_auth_admin_route_allowed,
     is_auth_route_allowed,
     is_private_control_path_allowed,
     is_remote_path_allowed,
@@ -372,7 +373,7 @@ def create_app(
                 raise RuntimeError(str(exc)) from exc
             raise RuntimeError(
                 "Private dashboard auth schema initialization failed; "
-                "verify database availability and Alembic revision 20260924_0014"
+                "verify database availability and Alembic revision 20260924_0015"
             ) from exc
         raise
     realtime = RealtimeHub(
@@ -422,7 +423,8 @@ def create_app(
                 allowed_control = is_private_control_path_allowed(path, request.method)
                 allowed_read = request.method == "GET" and is_remote_path_allowed(path)
                 allowed_auth = is_auth_route_allowed(path, request.method)
-                if not (allowed_control or allowed_read or allowed_auth):
+                allowed_auth_admin = is_auth_admin_route_allowed(path, request.method)
+                if not (allowed_control or allowed_read or allowed_auth or allowed_auth_admin):
                     return JSONResponse({"detail": "Remote route denied"}, status_code=404)
                 if not allowed_auth or path == "/api/auth/session":
                     identity = normalize_login(request.headers.get("Tailscale-User-Login", ""))
@@ -512,6 +514,173 @@ def create_app(
         if not isinstance(user, AuthenticatedUser):
             return {"authenticated": False}
         return user.safe_payload()
+
+    def _owner_actor(request: Request) -> AuthenticatedUser:
+        user = getattr(request.state, "authenticated_user", None)
+        if not isinstance(user, AuthenticatedUser) or user.state != "ACTIVE":
+            raise HTTPException(status_code=401, detail="Application session required")
+        if user.role != "OWNER":
+            raise HTTPException(status_code=403, detail="OWNER authorization required")
+        return user
+
+    async def _exact_json_object(request: Request, expected: set[str]) -> dict[str, object]:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid request") from None
+        if not isinstance(body, dict) or set(body) != expected:
+            raise HTTPException(status_code=422, detail="Invalid request fields")
+        return body
+
+    @app.post("/api/auth/enroll")
+    async def auth_enroll(request: Request) -> JSONResponse:
+        identity = _tailscale_actor(request)
+        body = await _exact_json_object(request, {"enrollment_secret", "password"})
+        if not all(isinstance(body[key], str) for key in body):
+            raise HTTPException(status_code=422, detail="Invalid enrollment request")
+        try:
+            activated = app.state.auth_service.activate_enrollment(
+                secret=body["enrollment_secret"],
+                password=body["password"],
+                tailscale_login=identity,
+            )
+        except Exception:
+            return JSONResponse({"detail": "Enrollment service unavailable"}, status_code=503)
+        if not activated:
+            return JSONResponse({"detail": "Enrollment could not be completed"}, status_code=400)
+        return JSONResponse({"activated": True})
+
+    @app.get("/api/auth/admin/accounts")
+    def auth_admin_list_accounts(request: Request) -> dict[str, object]:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        try:
+            return {
+                "accounts": app.state.auth_service.list_accounts(
+                    actor_id=actor.id, tailscale_login=identity
+                )
+            }
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except Exception:
+            return JSONResponse({"detail": "Account service unavailable"}, status_code=503)
+
+    @app.post("/api/auth/admin/accounts")
+    async def auth_admin_create_account(request: Request) -> JSONResponse:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        body = await _exact_json_object(request, {"login", "role", "bound_tailscale_identity"})
+        if not all(isinstance(body[key], str) for key in body):
+            raise HTTPException(status_code=422, detail="Invalid account request")
+        try:
+            issue = app.state.auth_service.create_invitation(
+                actor_id=actor.id,
+                tailscale_login=identity,
+                login=body["login"],
+                role=body["role"],
+                bound_tailscale_login=body["bound_tailscale_identity"],
+            )
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except Exception:
+            return JSONResponse({"detail": "Account service unavailable"}, status_code=503)
+        # Secret is returned once to the authorized OWNER; request/response
+        # bodies must not be logged by deployment middleware.
+        return JSONResponse(
+            {
+                "account": issue.account,
+                "enrollment_secret": issue.secret,
+                "expires_at": issue.expires_at.isoformat(),
+                "secret_disclosure": "one_time",
+            },
+            status_code=201,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/auth/admin/accounts/{account_id}/disable")
+    def auth_admin_disable_account(account_id: str, request: Request) -> JSONResponse:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        try:
+            UUID(account_id)
+            app.state.auth_service.disable_account(
+                actor_id=actor.id, tailscale_login=identity, target_id=account_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Account not found") from None
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except Exception:
+            return JSONResponse({"detail": "Account service unavailable"}, status_code=503)
+        return JSONResponse({"disabled": True})
+
+    @app.get("/api/auth/admin/accounts/{account_id}/sessions")
+    def auth_admin_list_sessions(account_id: str, request: Request) -> dict[str, object]:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        try:
+            UUID(account_id)
+            return {
+                "sessions": app.state.auth_service.list_account_sessions(
+                    actor_id=actor.id, tailscale_login=identity, target_id=account_id
+                )
+            }
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid account id") from None
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Account not found") from None
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except Exception:
+            return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
+
+    @app.delete("/api/auth/admin/accounts/{account_id}/sessions")
+    def auth_admin_revoke_all_sessions(account_id: str, request: Request) -> JSONResponse:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        try:
+            UUID(account_id)
+            count = app.state.auth_service.revoke_all_account_sessions(
+                actor_id=actor.id, tailscale_login=identity, target_id=account_id
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid account id") from None
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Account not found") from None
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except Exception:
+            return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
+        return JSONResponse({"revoked_count": count})
+
+    @app.delete("/api/auth/admin/accounts/{account_id}/sessions/{session_id}")
+    def auth_admin_revoke_session(
+        account_id: str, session_id: str, request: Request
+    ) -> JSONResponse:
+        actor = _owner_actor(request)
+        identity = _tailscale_actor(request)
+        try:
+            UUID(account_id)
+            UUID(session_id)
+            revoked = app.state.auth_service.revoke_account_session(
+                actor_id=actor.id,
+                tailscale_login=identity,
+                target_id=account_id,
+                session_id=session_id,
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid account or session id") from None
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Session not found") from None
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+        except Exception:
+            return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
+        return JSONResponse({"revoked": revoked})
 
     def _control_actor(request: Request) -> str:
         if not runtime_settings.remote_dashboard_mode:

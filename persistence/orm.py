@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -55,10 +56,10 @@ class Base(DeclarativeBase):
     pass
 
 
-# These tables are owned exclusively by Alembic revision 20260924_0014.
+# These tables are owned exclusively by Alembic auth revisions through 0015.
 # Legacy create_all bootstraps must not create them ahead of that revision.
 AUTH_SCHEMA_TABLE_NAMES = frozenset(
-    {"auth_users", "auth_sessions", "auth_audit_events"}
+    {"auth_users", "auth_sessions", "auth_audit_events", "auth_enrollments"}
 )
 
 
@@ -496,6 +497,13 @@ class AuthUserRecord(TimestampMixin, Base):
             name="ck_auth_users_state",
         ),
         Index("ix_auth_users_bound_tailscale_login", "bound_tailscale_login"),
+        Index(
+            "uq_auth_users_single_owner",
+            "role",
+            unique=True,
+            sqlite_where=text("role = 'OWNER'"),
+            postgresql_where=text("role = 'OWNER'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -537,17 +545,45 @@ class AuthAuditRecord(Base):
         Index("ix_auth_audit_events_timestamp", "timestamp"),
         Index("ix_auth_audit_events_user_id", "user_id"),
         Index("ix_auth_audit_events_event_type", "event_type"),
+        Index("ix_auth_audit_events_actor_user_id", "actor_user_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Intentionally denormalized safe provenance: audit history survives
+    # account retention/deletion and remains additive on SQLite.
+    actor_user_id: Mapped[str | None] = mapped_column(String(36))
     user_id: Mapped[str | None] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"))
     normalized_login: Mapped[str | None] = mapped_column(String(254))
     tailscale_login: Mapped[str | None] = mapped_column(String(254))
     session_id: Mapped[str | None] = mapped_column(String(36), index=True)
     outcome: Mapped[str] = mapped_column(String(24), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(64))
+
+
+class AuthEnrollmentRecord(Base):
+    """Single-use, expiring enrollment secret stored only as a digest."""
+
+    __tablename__ = "auth_enrollments"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_auth_enrollments_token_hash"),
+        Index("ix_auth_enrollments_user_id", "user_id"),
+        Index("ix_auth_enrollments_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
 
 class ConfigurationVersionRecord(IdMixin, Base):

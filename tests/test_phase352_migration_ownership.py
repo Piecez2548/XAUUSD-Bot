@@ -57,7 +57,7 @@ def test_startup_at_0013_does_not_create_auth_and_migration_then_initializes(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "revision-0013.db"
-    database = Database(f"sqlite:///{db_path.as_posix()}")
+    database = Database.for_test(f"sqlite:///{db_path.as_posix()}")
     database.create_schema()
     _stamp(database, PRE_AUTH_REVISION)
     try:
@@ -125,7 +125,7 @@ def test_fresh_alembic_bootstrap_defers_auth_tables_until_0014(tmp_path: Path) -
         database.dispose()
 
 
-def test_fresh_migration_replay_reaches_head_with_auth_owned_by_0014(
+def test_fresh_migration_replay_reaches_head_with_auth_owned_through_0015(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "fresh-head.db"
@@ -155,7 +155,7 @@ def test_fresh_migration_replay_reaches_head_with_auth_owned_by_0014(
         database.dispose()
 
 
-def test_migrated_0013_database_preserves_legacy_row_through_0014(tmp_path: Path) -> None:
+def test_migrated_0013_database_preserves_legacy_row_through_head(tmp_path: Path) -> None:
     db_path = tmp_path / "upgrade-0013-to-head.db"
     config = _config(db_path)
     command.upgrade(config, PRE_AUTH_REVISION)
@@ -306,6 +306,12 @@ def test_historical_revision_boundaries_preserve_schema_ownership(tmp_path: Path
         assert tables().isdisjoint(AUTH_SCHEMA_TABLE_NAMES)
 
         command.upgrade(config, "20260924_0014")
+        assert {"auth_users", "auth_sessions", "auth_audit_events"} <= tables()
+        assert "auth_enrollments" not in tables()
+        with pytest.raises(AuthSchemaError, match="behind Alembic revision"):
+            database.require_auth_schema()
+
+        command.upgrade(config, "20260924_0015")
         assert tables() >= AUTH_SCHEMA_TABLE_NAMES
         assert database.require_auth_schema() is None
     finally:
@@ -335,8 +341,8 @@ def test_historical_bootstraps_do_not_consult_current_orm_metadata(
     command.upgrade(config, "20260922_0003")
 
 
-def test_0014_initialization_keeps_auth_tables_valid(tmp_path: Path) -> None:
-    database = Database.for_test(f"sqlite:///{(tmp_path / 'revision-0014.db').as_posix()}")
+def test_0015_test_schema_keeps_auth_tables_valid(tmp_path: Path) -> None:
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'revision-0015.db').as_posix()}")
     database.create_test_schema()
     try:
         app = create_app(settings=Settings(remote_dashboard_mode=True), database=database)
@@ -459,6 +465,7 @@ def _create_auth_schema_fixture(database: Database, defect: str | None = None) -
         ("id", "VARCHAR(36) PRIMARY KEY"),
         ("timestamp", "DATETIME NOT NULL"),
         ("event_type", "VARCHAR(32) NOT NULL"),
+        ("actor_user_id", "VARCHAR(36)"),
         ("user_id", "VARCHAR(36)"),
         ("normalized_login", "VARCHAR(254)"),
         ("tailscale_login", "VARCHAR(254)"),
@@ -515,7 +522,20 @@ def _create_auth_schema_fixture(database: Database, defect: str | None = None) -
             "ON auth_users(bound_tailscale_login)"
         )
         connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX uq_auth_users_single_owner ON auth_users(role) "
+            "WHERE role = 'OWNER'"
+        )
+        connection.exec_driver_sql(
             "CREATE INDEX ix_auth_sessions_user_id ON auth_sessions(user_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE auth_enrollments ("
+            "id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) NOT NULL, "
+            "token_hash VARCHAR(64) NOT NULL UNIQUE, created_by_user_id VARCHAR(36) NOT NULL, "
+            "created_at DATETIME NOT NULL, expires_at DATETIME NOT NULL, "
+            "consumed_at DATETIME, revoked_at DATETIME, "
+            "FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(created_by_user_id) REFERENCES auth_users(id) ON DELETE RESTRICT)"
         )
 
 
