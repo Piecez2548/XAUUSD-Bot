@@ -93,6 +93,8 @@ def worker_health_payload(
         "last_failure": metadata.get("last_failure", metadata.get("error_category")),
         "error_category": metadata.get("error_category"),
         "session_id": metadata.get("session_id"),
+        "runtime_generation_id": metadata.get("runtime_generation_id"),
+        "pid": metadata.get("pid"),
         "last_closed_m5": metadata.get("last_closed_m5"),
         "last_closed_m15": metadata.get("last_closed_m15"),
         "last_closed_h1": metadata.get("last_closed_h1"),

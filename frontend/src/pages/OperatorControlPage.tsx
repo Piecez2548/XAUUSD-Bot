@@ -6,7 +6,7 @@ import { DataState } from "../components/DataState";
 import { useApi } from "../hooks/useApi";
 import { postJson } from "../lib/api";
 import { thaiDateTime } from "../lib/runtime";
-import type { ControlResponse, ControlStatus, ServiceState } from "../types";
+import type { ControlResponse, ControlStatus, PairZoneState, ServiceState } from "../types";
 
 type ControlCommand = "start" | "stop" | "restart" | "demo-on" | "demo-off";
 
@@ -54,6 +54,12 @@ function asBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+function asPairZoneState(value: unknown): PairZoneState {
+  return value === "ACTIVE_ZONE" || value === "HEALTHY_NO_ACTIVE_ZONE"
+    ? value
+    : "UNKNOWN";
+}
+
 function normalizeControlResponse(value: unknown): SafeControlStatus | null {
   if (!isRecord(value) || !isRecord(value.status)) return null;
   const raw = value.status;
@@ -75,8 +81,15 @@ function normalizeControlResponse(value: unknown): SafeControlStatus | null {
       real_money_execution: execution.real_money_execution === "DISABLED" ? "DISABLED" : undefined,
     } : undefined,
     strategy: strategy ? {
-      pair_zone_state: typeof strategy.pair_zone_state === "string" ? strategy.pair_zone_state : undefined,
+      pair_zone_state: asPairZoneState(strategy.pair_zone_state),
       current_direction: typeof strategy.current_direction === "string" ? strategy.current_direction : undefined,
+      pair_zone_reason: typeof strategy.pair_zone_reason === "string" ? strategy.pair_zone_reason : undefined,
+      pair_zone_evaluated_at: typeof strategy.pair_zone_evaluated_at === "string" ? strategy.pair_zone_evaluated_at : null,
+      pair_zone_evaluated_m5_timestamp: typeof strategy.pair_zone_evaluated_m5_timestamp === "string" ? strategy.pair_zone_evaluated_m5_timestamp : null,
+      pair_zone_evaluated_m15_timestamp: typeof strategy.pair_zone_evaluated_m15_timestamp === "string" ? strategy.pair_zone_evaluated_m15_timestamp : null,
+      pair_zone_id: typeof strategy.pair_zone_id === "string" ? strategy.pair_zone_id : null,
+      pair_zone_lower: typeof strategy.pair_zone_lower === "number" ? strategy.pair_zone_lower : null,
+      pair_zone_upper: typeof strategy.pair_zone_upper === "number" ? strategy.pair_zone_upper : null,
       latest_canonical_signal_id: typeof strategy.latest_canonical_signal_id === "string" ? strategy.latest_canonical_signal_id : null,
       latest_canonical_direction: typeof strategy.latest_canonical_direction === "string" ? strategy.latest_canonical_direction : null,
       latest_canonical_signal_at: typeof strategy.latest_canonical_signal_at === "string" ? strategy.latest_canonical_signal_at : null,
@@ -183,6 +196,8 @@ export function OperatorControlPage() {
         <div className="control-strategy-grid">
           <div><span>Pair Zone</span><strong>{status?.strategy?.pair_zone_state ?? "UNAVAILABLE"}</strong></div>
           <div><span>Direction</span><strong>{status?.strategy?.current_direction ?? "UNAVAILABLE"}</strong></div>
+          <div><span>Pair Zone reason</span><strong>{status?.strategy?.pair_zone_reason ?? "UNAVAILABLE"}</strong></div>
+          <div><span>Evaluated M15 candle</span><strong>{status?.strategy?.pair_zone_evaluated_m15_timestamp ? thaiDateTime(status.strategy.pair_zone_evaluated_m15_timestamp) : "UNAVAILABLE"}</strong></div>
           <div><span>Latest canonical signal</span><strong className="mono">{status?.strategy?.latest_canonical_signal_id ?? "—"}</strong></div>
           <div><span>Latest signal direction</span><strong>{status?.strategy?.latest_canonical_direction ?? "—"}</strong></div>
           <div><span>Forward session</span><strong className="mono">{status?.strategy?.latest_forward_session_id ?? "—"}</strong></div>

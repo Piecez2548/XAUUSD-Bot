@@ -901,7 +901,7 @@ class TelegramControlService:
         )
 
     def _operator_status_payload(self) -> dict[str, object]:
-        """Return a structured operator view without adding a new state source."""
+        """Return an operator view with generation-verified Pair Zone state."""
 
         records = self.supervisor.status()
         live_process = records.get("live")
@@ -928,6 +928,20 @@ class TelegramControlService:
                 .order_by(desc(ForwardSignalRecord.timestamp), desc(ForwardSignalRecord.id))
                 .limit(1)
             )
+        from services.forward_shadow import forward_health, pair_zone_status
+
+        forward_status = forward_health(self.database, self.settings)
+        pair_zone = pair_zone_status(
+            self.database,
+            self.settings,
+            session_id=getattr(latest_session, "session_id", None),
+            forward_health_payload=forward_status,
+            verified_live_process_identities=(
+                getattr(records.get("live"), "process_identities", ())
+                if live_process is not None and live_process.state == "RUNNING"
+                else ()
+            ),
+        )
         return {
             "checked_at": datetime.now(UTC),
             "control": "CONNECTED",
@@ -937,18 +951,22 @@ class TelegramControlService:
             "mt5": self._latest_service_state("mt5"),
             "database": "CONNECTED" if self.database.healthcheck() else "DISCONNECTED",
             "telegram": self._telegram_state(),
-            "forward_shadow": self._forward_worker_state(),
+            "forward_shadow": forward_status.get("state", "UNKNOWN"),
             "execution": {
                 "demo_execution_enabled": bool(self.settings.demo_execution_enabled),
                 "demo_kill_switch_armed": bool(demo_execution_armed(self.database)),
                 "real_money_execution": "DISABLED",
             },
             "strategy": {
-                # The durable forward tables retain canonical signals, not a
-                # mutable current-zone snapshot.  Do not relabel the latest
-                # historical signal as the current Pair Zone state.
-                "pair_zone_state": "UNKNOWN",
-                "current_direction": "UNKNOWN",
+                "pair_zone_state": pair_zone["state"],
+                "current_direction": pair_zone["current_direction"],
+                "pair_zone_reason": pair_zone["reason"],
+                "pair_zone_evaluated_at": pair_zone["evaluated_at"],
+                "pair_zone_evaluated_m5_timestamp": pair_zone["evaluated_m5_timestamp"],
+                "pair_zone_evaluated_m15_timestamp": pair_zone["evaluated_m15_timestamp"],
+                "pair_zone_id": pair_zone["zone_id"],
+                "pair_zone_lower": pair_zone["zone_lower"],
+                "pair_zone_upper": pair_zone["zone_upper"],
                 "latest_canonical_signal_id": getattr(latest_signal, "signal_id", None),
                 "latest_canonical_direction": getattr(latest_signal, "decision", None),
                 "latest_canonical_signal_at": getattr(latest_signal, "timestamp", None),

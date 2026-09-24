@@ -12,6 +12,11 @@ export type ServiceState =
   | "ERROR"
   | "UNKNOWN";
 
+export type PairZoneState =
+  | "ACTIVE_ZONE"
+  | "HEALTHY_NO_ACTIVE_ZONE"
+  | "UNKNOWN";
+
 export interface ControlStatus {
   checked_at: string;
   control: ServiceState;
@@ -28,8 +33,15 @@ export interface ControlStatus {
     real_money_execution: "DISABLED";
   };
   strategy: {
-    pair_zone_state: string;
+    pair_zone_state: PairZoneState;
     current_direction: string;
+    pair_zone_reason?: string;
+    pair_zone_evaluated_at?: string | null;
+    pair_zone_evaluated_m5_timestamp?: string | null;
+    pair_zone_evaluated_m15_timestamp?: string | null;
+    pair_zone_id?: string | null;
+    pair_zone_lower?: number | null;
+    pair_zone_upper?: number | null;
     latest_canonical_signal_id: string | null;
     latest_canonical_direction: string | null;
     latest_canonical_signal_at: string | null;

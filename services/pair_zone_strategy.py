@@ -59,7 +59,9 @@ class PairZoneV1:
         self._seen_zones: dict[str, PairZone] = {}
         self._touch_counts: dict[str, int] = {}
         self._confirmed: set[str] = set()
-        self._invalidated: set[str] = set()
+        # Canonical zone IDs bind the M15 pair timestamps and direction. Keep
+        # invalidation proof only until that zone's canonical age horizon ends.
+        self._invalidated: dict[str, Any] = {}
         self._expired: set[str] = set()
         self._touch_events = 0
         self.validate_config()
@@ -192,8 +194,12 @@ class PairZoneV1:
         return None
 
     def _lifecycle(self, zone: PairZone, m5: tuple[Candle, ...], timestamp) -> tuple[str, int, Candle | None]:
+        max_age = timedelta(minutes=int(self.config["zone_max_age_minutes"]))
+        self._prune_invalidated(timestamp)
         if timestamp < zone.created_at:
             return "CREATED", 0, None
+        if zone.zone_id in self._invalidated:
+            return "INVALIDATED", self._touch_counts.get(zone.zone_id, 0), None
         relevant = [c for c in m5 if zone.created_at < c.timestamp <= timestamp]
         touches = 0
         inside = False
@@ -214,7 +220,7 @@ class PairZoneV1:
                 wick = candle.high - max(candle.open, candle.close)
                 confirms = intersects and candle.close < zone.lower_bound and body > 0 and wick >= body * float(self.config["confirmation_wick_to_body"])
             if invalid:
-                self._invalidated.add(zone.zone_id)
+                self._invalidated[zone.zone_id] = zone.created_at + max_age
                 return "INVALIDATED", touches, None
             if first_confirmation is None and confirms:
                 first_confirmation = candle
@@ -229,10 +235,42 @@ class PairZoneV1:
             return "TOUCHED", touches, None
         return "ACTIVE", 0, None
 
+    def _prune_invalidated(self, timestamp) -> None:
+        """Forget invalidation only after canonical zone-age expiry."""
+
+        expired_ids = [
+            zone_id
+            for zone_id, relevant_until in self._invalidated.items()
+            if timestamp > relevant_until
+        ]
+        for zone_id in expired_ids:
+            del self._invalidated[zone_id]
+
+    @staticmethod
+    def _has_complete_zone_m5_history(
+        zone: PairZone, m5: tuple[Candle, ...], timestamp
+    ) -> bool:
+        """Verify the rolling M5 input covers every canonical lifecycle bar."""
+
+        expected_first = zone.created_at + timedelta(minutes=5)
+        if timestamp < expected_first:
+            return True
+        relevant = tuple(c for c in m5 if zone.created_at < c.timestamp <= timestamp)
+        return bool(
+            relevant
+            and relevant[0].timestamp == expected_first
+            and relevant[-1].timestamp == timestamp
+            and all(
+                right.timestamp - left.timestamp == timedelta(minutes=5)
+                for left, right in zip(relevant, relevant[1:], strict=False)
+            )
+        )
+
     def evaluate(self, snapshot: MarketSnapshot, *, market_snapshot_id=None, risk=None,
                  data_freshness="LIVE", mt5_state="CONNECTED", runtime_state="CONNECTED",
                  candles_are_closed=False):
         timestamp = ShadowDecisionEngine._m5_timestamp(snapshot, candles_are_closed=candles_are_closed)
+        self._prune_invalidated(timestamp)
         common = dict(market_snapshot_id=market_snapshot_id, symbol=snapshot.symbol.name,
                       m5_candle_timestamp=timestamp, strategy_name="pair_zone_v1",
                       strategy_version=self.metadata.strategy_version,
@@ -254,15 +292,32 @@ class PairZoneV1:
         candidates: list[tuple[PairZone, Candle]] = []
         h1_direction = self._h1_direction(snapshot, self.config)
         max_age = timedelta(minutes=int(self.config["zone_max_age_minutes"]))
+        m15_candles = snapshot.candles.get(Timeframe.M15, ())
+        coverage_cutoff = timestamp - max_age - timedelta(minutes=30)
+        relevant_m15 = tuple(c for c in m15_candles if c.timestamp >= coverage_cutoff)
+        coverage_starts_in_time = bool(
+            relevant_m15
+            and relevant_m15[0].timestamp - coverage_cutoff <= timedelta(minutes=15)
+        )
+        m15_coverage_complete = (
+            len(relevant_m15) >= 2
+            and coverage_starts_in_time
+            and all(
+                right.timestamp - left.timestamp == timedelta(minutes=15)
+                for left, right in zip(relevant_m15, relevant_m15[1:], strict=False)
+            )
+        )
         recent_zones = sorted(
             (zone for zone in zones if timestamp - zone.created_at <= max_age),
             key=lambda item: item.created_at,
             reverse=True,
         )[:24]
         htf_mismatch = False
+        observed_zones: list[tuple[PairZone, str, int]] = []
         for zone in recent_zones:
             already_confirmed = zone.zone_id in self._confirmed
             state, touches, confirmation = self._lifecycle(zone, m5, timestamp)
+            observed_zones.append((zone, state, touches))
             previous = self._touch_counts.get(zone.zone_id, 0)
             if touches > previous:
                 self._touch_events += touches - previous
@@ -274,25 +329,74 @@ class PairZoneV1:
                     continue
                 candidates.append((zone, confirmation))
         if not candidates:
+            active_zones = [
+                item for item in observed_zones
+                if item[1] in {"CREATED", "ACTIVE", "TOUCHED", "CONFIRMED"}
+            ]
+            selected_zone = active_zones[0] if active_zones else None
             if htf_mismatch or (zones and h1_direction is None):
-                return self._no_trade(common, "HTF_DIRECTION_MISMATCH", "HTF_DIRECTION")
-            if zones:
-                return self._no_trade(common, "ZONE_CONFIRMATION_MISSING", "ZONE_CONFIRMATION")
-            return self._no_trade(common, "NO_VALID_ZONE", "PAIR_ZONE")
+                reason = "HTF_DIRECTION_MISMATCH"
+                stage = "HTF_DIRECTION"
+            elif zones:
+                reason = "ZONE_CONFIRMATION_MISSING"
+                stage = "ZONE_CONFIRMATION"
+            else:
+                reason = "NO_VALID_ZONE"
+                stage = "PAIR_ZONE"
+            if selected_zone is not None:
+                if self._has_complete_zone_m5_history(
+                    selected_zone[0], m5, timestamp
+                ):
+                    observation = self._zone_observation(
+                        "ACTIVE_ZONE", reason, selected_zone[0], selected_zone[1]
+                    )
+                else:
+                    observation = self._zone_observation(
+                        "UNKNOWN", "INCOMPLETE_ZONE_M5_LIFECYCLE_COVERAGE"
+                    )
+            elif not m15_coverage_complete:
+                observation = self._zone_observation(
+                    "UNKNOWN",
+                    "INSUFFICIENT_M15_COVERAGE"
+                    if len(relevant_m15) < 2 or not coverage_starts_in_time
+                    else "M15_CANDLE_GAP",
+                )
+            else:
+                observation = self._zone_observation(
+                    "HEALTHY_NO_ACTIVE_ZONE",
+                    "NO_CURRENT_ACTIVE_ZONE" if zones else "NO_VALID_ZONE",
+                )
+            return self._no_trade(common, reason, stage, observation=observation)
         zone, confirmation = sorted(candidates, key=lambda item: item[0].zone_id)[0]
+        observation = (
+            self._zone_observation(
+                "ACTIVE_ZONE", "CANONICAL_SIGNAL_GENERATED", zone, "CONFIRMED"
+            )
+            if self._has_complete_zone_m5_history(zone, m5, timestamp)
+            else self._zone_observation(
+                "UNKNOWN", "INCOMPLETE_ZONE_M5_LIFECYCLE_COVERAGE"
+            )
+        )
         if zone.zone_id in self._confirmed and zone.zone_id in self._invalidated:
-            return self._no_trade(common, "ZONE_INVALIDATED", "ZONE_LIFECYCLE")
+            return self._no_trade(
+                common, "ZONE_INVALIDATED", "ZONE_LIFECYCLE",
+                observation=self._zone_observation(
+                    "HEALTHY_NO_ACTIVE_ZONE", "ZONE_INVALIDATED"
+                ),
+            )
         entry = confirmation.close
         stop = zone.lower_bound - float(self.config["stop_buffer_points"]) if zone.direction == ShadowAction.BUY else zone.upper_bound + float(self.config["stop_buffer_points"])
         distance = entry - stop if zone.direction == ShadowAction.BUY else stop - entry
         if distance <= snapshot.symbol.trade_tick_size:
-            return self._no_trade(common, "INVALID_SL", "GEOMETRY")
+            return self._no_trade(common, "INVALID_SL", "GEOMETRY", observation=observation)
         if snapshot.symbol.spread > int(self.config["max_spread_points"]):
-            return self._no_trade(common, "SPREAD_TOO_HIGH", "SPREAD")
+            return self._no_trade(common, "SPREAD_TOO_HIGH", "SPREAD", observation=observation)
         target = entry + distance * self.target_rr if zone.direction == ShadowAction.BUY else entry - distance * self.target_rr
         gate, volume = ShadowRiskGate(max_trade_risk_percent=2, max_aggregate_risk_percent=6).evaluate(snapshot, risk, entry=entry, stop=stop)
         if not gate.approved or volume is None:
-            return self._no_trade(common, gate.reason_codes[0], "RISK_GATE")
+            return self._no_trade(
+                common, gate.reason_codes[0], "RISK_GATE", observation=observation
+            )
         return ShadowDecision(
             **common, decision=zone.direction,
             market_regime="TREND_UP" if zone.direction == ShadowAction.BUY else "TREND_DOWN",
@@ -309,15 +413,35 @@ class PairZoneV1:
                              "pair_first_timestamp": zone.first_timestamp.isoformat(),
                              "pair_second_timestamp": zone.second_timestamp.isoformat(),
                              "zone_width": zone.zone_width, "displacement": zone.displacement,
-                             "overlap_ratio": zone.overlap_ratio},
+                             "overlap_ratio": zone.overlap_ratio,
+                             "pair_zone_observation": observation},
         )
 
     @staticmethod
-    def _no_trade(common, reason, stage):
+    def _zone_observation(state, reason, zone=None, lifecycle_state=None):
+        return {
+            "state": state,
+            "reason": reason,
+            "direction": zone.direction.value if zone is not None else None,
+            "zone_id": zone.zone_id if zone is not None else None,
+            "zone_lower": zone.lower_bound if zone is not None else None,
+            "zone_upper": zone.upper_bound if zone is not None else None,
+            "zone_lifecycle_state": lifecycle_state,
+        }
+
+    @staticmethod
+    def _no_trade(common, reason, stage, *, observation=None):
+        current_observation = observation or PairZoneV1._zone_observation(
+            "UNKNOWN", reason
+        )
         return ShadowDecision(
             **common, decision=ShadowAction.NO_TRADE, market_regime="UNCERTAIN",
             reason_codes=(reason,), human_readable_reason=reason.replace("_", " ").title(),
-            risk_gate_state="NOT_EVALUATED", feature_context={"rejection_stage": stage},
+            risk_gate_state="NOT_EVALUATED",
+            feature_context={
+                "rejection_stage": stage,
+                "pair_zone_observation": current_observation,
+            },
         )
 
     def explain(self) -> str:

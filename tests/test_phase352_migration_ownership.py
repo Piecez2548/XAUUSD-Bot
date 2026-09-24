@@ -19,6 +19,7 @@ from persistence.orm import (
 from services.authentication import AuthenticationService
 
 PRE_AUTH_REVISION = "20260924_0013"
+CURRENT_HEAD_REVISION = "20260924_0016"
 TAILSCALE = {
     "Tailscale-User-Login": "operator@example.test",
     "Origin": "https://dashboard.tailnet.test",
@@ -143,7 +144,7 @@ def test_fresh_migration_replay_reaches_head_with_auth_owned_through_0015(
     database = Database(f"sqlite:///{db_path.as_posix()}")
     try:
         revision, tables = _revision_and_tables(database)
-        assert revision == AUTH_SCHEMA_MINIMUM_REVISION
+        assert revision == CURRENT_HEAD_REVISION
         assert tables >= AUTH_SCHEMA_TABLE_NAMES
         inspector = inspect(database.engine)
         assert {"config_version", "config_hash"} <= {
@@ -159,6 +160,7 @@ def test_fresh_migration_replay_reaches_head_with_auth_owned_through_0015(
             "forward_validation_sessions",
             "strategy_intelligence_records",
             "demo_execution_controls",
+            "pair_zone_evaluations",
         } <= tables
         database.require_auth_schema()
     finally:
@@ -199,9 +201,11 @@ def test_migrated_0013_database_preserves_legacy_row_through_head(tmp_path: Path
                 ("legacy-config-id",),
             ).one()
         post_upgrade_tables = set(inspect(database.engine).get_table_names())
-        assert revision == AUTH_SCHEMA_MINIMUM_REVISION
+        assert revision == CURRENT_HEAD_REVISION
         assert pre_upgrade_tables <= post_upgrade_tables
-        assert post_upgrade_tables - pre_upgrade_tables == AUTH_SCHEMA_TABLE_NAMES
+        assert post_upgrade_tables - pre_upgrade_tables == (
+            AUTH_SCHEMA_TABLE_NAMES | {"pair_zone_evaluations"}
+        )
         assert tuple(row) == (
             "legacy-config-id",
             "legacy-0013",
@@ -210,6 +214,90 @@ def test_migrated_0013_database_preserves_legacy_row_through_head(tmp_path: Path
             1,
         )
         database.require_auth_schema()
+    finally:
+        database.dispose()
+
+
+def test_pair_zone_0015_0016_upgrade_downgrade_round_trip_preserves_existing_data(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "pair-zone-0015-0016-round-trip.db"
+    config = _config(db_path)
+    command.upgrade(config, "20260924_0015")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, tables = _revision_and_tables(database)
+        assert revision == "20260924_0015"
+        assert "pair_zone_evaluations" not in tables
+        with database.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO configuration_versions "
+                "(id, version, timestamp, configuration, checksum, active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "pre-pair-zone-config",
+                    "pre-pair-zone-0015",
+                    "2026-09-24 00:00:00",
+                    '{"preserve":"through-pair-zone-migration"}',
+                    "c" * 64,
+                    1,
+                ),
+            )
+    finally:
+        database.dispose()
+
+    command.upgrade(config, "20260924_0016")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, tables = _revision_and_tables(database)
+        assert revision == "20260924_0016"
+        assert "pair_zone_evaluations" in tables
+        assert "ix_pair_zone_evaluations_generation" in {
+            index["name"]
+            for index in inspect(database.engine).get_indexes("pair_zone_evaluations")
+        }
+        with database.engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT version, configuration, checksum, active "
+                "FROM configuration_versions WHERE id = ?",
+                ("pre-pair-zone-config",),
+            ).one()
+        assert tuple(row) == (
+            "pre-pair-zone-0015",
+            '{"preserve":"through-pair-zone-migration"}',
+            "c" * 64,
+            1,
+        )
+    finally:
+        database.dispose()
+
+    command.downgrade(config, "20260924_0015")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, tables = _revision_and_tables(database)
+        assert revision == "20260924_0015"
+        assert "pair_zone_evaluations" not in tables
+        with database.engine.connect() as connection:
+            preserved = connection.exec_driver_sql(
+                "SELECT configuration FROM configuration_versions WHERE id = ?",
+                ("pre-pair-zone-config",),
+            ).scalar_one()
+        assert preserved == '{"preserve":"through-pair-zone-migration"}'
+    finally:
+        database.dispose()
+
+    command.upgrade(config, "20260924_0016")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, tables = _revision_and_tables(database)
+        assert revision == "20260924_0016"
+        assert "pair_zone_evaluations" in tables
+        with database.engine.connect() as connection:
+            preserved = connection.exec_driver_sql(
+                "SELECT configuration FROM configuration_versions WHERE id = ?",
+                ("pre-pair-zone-config",),
+            ).scalar_one()
+        assert preserved == '{"preserve":"through-pair-zone-migration"}'
     finally:
         database.dispose()
 

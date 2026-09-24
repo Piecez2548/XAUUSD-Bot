@@ -77,6 +77,76 @@ describe("OperatorControlPage", () => {
     expect(screen.getByText("forward-test")).toBeTruthy();
   });
 
+  it("renders a verified healthy no-active-zone observation explicitly", () => {
+    hookState.data = {
+      ok: true,
+      status: {
+        ...status,
+        strategy: {
+          ...status.strategy,
+          pair_zone_state: "HEALTHY_NO_ACTIVE_ZONE",
+          current_direction: "NONE",
+          pair_zone_reason: "NO_VALID_ZONE",
+          pair_zone_evaluated_m15_timestamp: "2026-09-24T00:00:00Z",
+        },
+      },
+    };
+    render(<OperatorControlPage />);
+    expect(screen.getByText("HEALTHY_NO_ACTIVE_ZONE")).toBeTruthy();
+    expect(screen.getByText("NO_VALID_ZONE")).toBeTruthy();
+    expect(screen.getByText("Evaluated M15 candle")).toBeTruthy();
+  });
+
+  it("renders an active Pair Zone direction without substituting unknown data", () => {
+    hookState.data = {
+      ok: true,
+      status: {
+        ...status,
+        strategy: {
+          ...status.strategy,
+          pair_zone_state: "ACTIVE_ZONE",
+          current_direction: "BUY",
+          pair_zone_reason: "ZONE_CONFIRMATION_MISSING",
+          pair_zone_id: "pz-test",
+          pair_zone_lower: 2300,
+          pair_zone_upper: 2301,
+          pair_zone_evaluated_m15_timestamp: "2026-09-24T00:00:00Z",
+        },
+      },
+    };
+    render(<OperatorControlPage />);
+    expect(screen.getByText("ACTIVE_ZONE")).toBeTruthy();
+    expect(screen.getByText("BUY")).toBeTruthy();
+    expect(screen.getByText("ZONE_CONFIRMATION_MISSING")).toBeTruthy();
+  });
+
+  it.each([
+    ["ACTIVE_ZONE", "ACTIVE_ZONE"],
+    ["HEALTHY_NO_ACTIVE_ZONE", "HEALTHY_NO_ACTIVE_ZONE"],
+    ["UNKNOWN", "UNKNOWN"],
+    ["malformed", "UNKNOWN"],
+    [undefined, "UNKNOWN"],
+    [null, "UNKNOWN"],
+    ["UNRECOGNIZED_FUTURE_STATE", "UNKNOWN"],
+  ])("normalizes Pair Zone state %s to the exact fail-closed contract", (rawState, expected) => {
+    hookState.data = {
+      ok: true,
+      status: {
+        ...status,
+        strategy: { ...status.strategy, pair_zone_state: rawState },
+      },
+    };
+    render(<OperatorControlPage />);
+    if (expected === "UNKNOWN") {
+      expect(screen.getAllByText("UNKNOWN").length).toBeGreaterThan(0);
+    } else {
+      expect(screen.getByText(expected)).toBeTruthy();
+    }
+    if (typeof rawState === "string" && !["ACTIVE_ZONE", "HEALTHY_NO_ACTIVE_ZONE", "UNKNOWN"].includes(rawState)) {
+      expect(screen.queryByText(rawState)).toBeNull();
+    }
+  });
+
   it("confirms destructive actions and sends only the fixed control route", async () => {
     render(<OperatorControlPage />);
     fireEvent.click(screen.getByRole("button", { name: "STOP SYSTEM" }));

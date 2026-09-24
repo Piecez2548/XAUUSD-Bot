@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,6 +30,7 @@ from persistence.orm import (
     ForwardSignalRecord,
     ForwardTradeRecord,
     ForwardValidationSessionRecord,
+    PairZoneEvaluationRecord,
     SymbolRecord,
     SystemHealthRecord,
 )
@@ -45,6 +48,9 @@ from services.shadow_outcome import (
 
 EXPECTED_PAIR_ZONE_FILE_SHA256 = "fd2d73b9aa0d21004653e455263107caf727ac552fd204486f363cb7c25b7ded"
 FORWARD_COMPONENT = "worker:forward_shadow"
+PAIR_ZONE_EVALUATION_MAX_AGE_SECONDS = 900.0
+PAIR_ZONE_M5_DATA_MAX_AGE_SECONDS = 600.0
+PAIR_ZONE_M15_DATA_MAX_AGE_SECONDS = 900.0
 FORWARD_POLICY_VERSION = "forward_shadow_v1"
 FORWARD_STATUS_ACTIVE = "ACTIVE"
 FORWARD_STATUS_PAUSED = "PAUSED"
@@ -182,6 +188,7 @@ class ForwardShadowWorker:
         self.execution_handler = execution_handler
         self.health = SystemHealthRepository(database)
         self.strategy = PairZoneV1(settings)
+        self.runtime_generation_id = str(uuid4())
         self.policy = EvaluationPolicy(horizon_bars=getattr(settings, "shadow_outcome_horizon_bars", 12))
         self._task: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[ForwardInput] = asyncio.Queue(maxsize=8)
@@ -219,6 +226,9 @@ class ForwardShadowWorker:
         if self._task is None:
             self._initialize_session()
             if not self._drift_detected:
+                self._record_health(
+                    "STARTING", "Forward shadow generation initialized", force=True
+                )
                 self._stop.clear()
                 self._task = asyncio.create_task(self._run(), name="forward-shadow-worker")
 
@@ -371,14 +381,25 @@ class ForwardShadowWorker:
         if self.session is None:
             return
         now = datetime.now(UTC)
-        decision = self.strategy.evaluate(
-            item.snapshot, market_snapshot_id=item.market_snapshot_id, risk=item.risk, candles_are_closed=True
-        )
+        try:
+            decision = self.strategy.evaluate(
+                item.snapshot, market_snapshot_id=item.market_snapshot_id,
+                risk=item.risk, candles_are_closed=True,
+            )
+        except Exception:
+            self._persist_pair_zone_evaluation(
+                None, item.snapshot, reason_override="DETECTOR_EXCEPTION"
+            )
+            raise
         timestamp = decision.m5_candle_timestamp
         if timestamp <= self.session.started_at:
+            self._persist_pair_zone_evaluation(
+                decision, item.snapshot, reason_override="FORWARD_BOUNDARY_NOT_REACHED"
+            )
             await self._evaluate_open_trades()
             self._record_health("CONNECTED", "Historical context warmed; forward boundary not reached", force=True)
             return
+        self._persist_pair_zone_evaluation(decision, item.snapshot)
         # Phase 3 records a separate, versioned evidence snapshot. The
         # existing Pair Zone decision and Forward Shadow history remain the
         # canonical behavior; intelligence is additive and execution-disabled.
@@ -503,6 +524,100 @@ class ForwardShadowWorker:
             ))
             return row
 
+    def _persist_pair_zone_evaluation(
+        self,
+        decision: Any | None,
+        snapshot: MarketSnapshot,
+        *,
+        reason_override: str | None = None,
+    ) -> None:
+        """Replace the session's single current observation, not per-tick history."""
+
+        if self.session is None:
+            return
+        context = getattr(decision, "feature_context", None)
+        observation = context.get("pair_zone_observation") if isinstance(context, dict) else None
+        state = "UNKNOWN"
+        reason = reason_override or "AUTHORITATIVE_OBSERVATION_MISSING"
+        direction = zone_id = None
+        lower = upper = None
+        if reason_override is None and isinstance(observation, dict):
+            candidate_state = observation.get("state")
+            candidate_reason = observation.get("reason")
+            if candidate_state in {"ACTIVE_ZONE", "HEALTHY_NO_ACTIVE_ZONE", "UNKNOWN"}:
+                state = candidate_state
+                reason = str(candidate_reason or "UNSPECIFIED")[:100]
+                direction = observation.get("direction")
+                zone_id = observation.get("zone_id")
+                lower = observation.get("zone_lower")
+                upper = observation.get("zone_upper")
+                if state == "ACTIVE_ZONE" and (
+                    direction not in {"BUY", "SELL"}
+                    or not isinstance(zone_id, str)
+                    or not zone_id
+                    or not isinstance(lower, (int, float))
+                    or not isinstance(upper, (int, float))
+                    or not math.isfinite(lower)
+                    or not math.isfinite(upper)
+                    or lower >= upper
+                ):
+                    state = "UNKNOWN"
+                    reason = "ACTIVE_ZONE_PROVENANCE_INCOMPLETE"
+                    direction = zone_id = None
+                    lower = upper = None
+                elif state == "HEALTHY_NO_ACTIVE_ZONE" and any(
+                    value is not None for value in (direction, zone_id, lower, upper)
+                ):
+                    state = "UNKNOWN"
+                    reason = "NO_ZONE_PROVENANCE_INCONSISTENT"
+                    direction = zone_id = None
+                    lower = upper = None
+            else:
+                reason = "INVALID_OBSERVATION_STATE"
+
+        m5_candles = snapshot.candles.get(Timeframe.M5, ())
+        m15_candles = snapshot.candles.get(Timeframe.M15, ())
+        evaluated_m5 = (
+            getattr(decision, "m5_candle_timestamp", None)
+            or (m5_candles[-1].timestamp if m5_candles else None)
+        )
+        evaluated_m15 = m15_candles[-1].timestamp if m15_candles else None
+        config_hash = pair_zone_file_hash()
+        if config_hash != getattr(
+            self.session, "strategy_config_hash", EXPECTED_PAIR_ZONE_FILE_SHA256
+        ):
+            state = "UNKNOWN"
+            reason = "STRATEGY_CONFIG_MISMATCH"
+            direction = zone_id = None
+            lower = upper = None
+
+        values = {
+            "runtime_generation_id": self.runtime_generation_id,
+            "evaluation_at": datetime.now(UTC),
+            "evaluated_m5_timestamp": evaluated_m5,
+            "evaluated_m15_timestamp": evaluated_m15,
+            "strategy_id": self.strategy.metadata.strategy_id,
+            "strategy_version": self.strategy.metadata.strategy_version,
+            "config_hash": config_hash,
+            "state": state,
+            "reason": reason,
+            "direction": direction,
+            "zone_id": zone_id,
+            "zone_lower": lower,
+            "zone_upper": upper,
+        }
+        with self.database.session() as session:
+            if session.get(ForwardValidationSessionRecord, self.session.id) is None:
+                return
+            row = session.get(PairZoneEvaluationRecord, self.session.id)
+            if row is None:
+                session.add(PairZoneEvaluationRecord(
+                    forward_session_id=self.session.id, **values
+                ))
+            else:
+                for name, value in values.items():
+                    setattr(row, name, value)
+
     async def _evaluate_open_trades(self) -> None:
         if self.session is None:
             return
@@ -570,6 +685,8 @@ class ForwardShadowWorker:
                 open_trades = 0
         self.health.record(FORWARD_COMPONENT, state, message=message, metadata={
             "heartbeat_at": now.isoformat(), "session_id": session_id,
+            "runtime_generation_id": self.runtime_generation_id,
+            "pid": os.getpid(),
             "last_closed_m5": _iso(self._last_closed_m5), "last_closed_m15": _iso(self._last_closed_m15),
             "last_closed_h1": _iso(self._last_closed_h1), "last_zone_created": _iso(self._last_zone_created),
             "last_signal": _iso(self._last_signal), "open_shadow_trades": open_trades,
@@ -622,6 +739,144 @@ def forward_health(database, settings) -> dict[str, Any]:
     )
     payload.update({"worker": FORWARD_COMPONENT, "read_only": True, "execution_allowed": False, "checked_at": now})
     return payload
+
+
+def pair_zone_status(
+    database,
+    settings,
+    *,
+    session_id: str | None,
+    forward_health_payload: dict[str, Any],
+    verified_live_process_identities: tuple[tuple[int, str | None], ...],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Expose only fresh Pair Zone state from the current worker generation."""
+
+    unknown: dict[str, Any] = {
+        "state": "UNKNOWN", "current_direction": "UNKNOWN",
+        "reason": "AUTHORITATIVE_STATE_UNAVAILABLE", "evaluated_at": None,
+        "evaluated_m5_timestamp": None, "evaluated_m15_timestamp": None,
+        "zone_id": None, "zone_lower": None, "zone_upper": None,
+    }
+    if forward_health_payload.get("state") != "CONNECTED":
+        unknown["reason"] = "FORWARD_WORKER_NOT_CONNECTED"
+        return unknown
+    generation_id = forward_health_payload.get("runtime_generation_id")
+    if not session_id or not isinstance(generation_id, str) or not generation_id:
+        unknown["reason"] = "CURRENT_SESSION_OR_GENERATION_UNVERIFIED"
+        return unknown
+    worker_pid = forward_health_payload.get("pid")
+    if (
+        type(worker_pid) is not int
+        or not any(
+            pid == worker_pid and isinstance(create_time, str) and create_time
+            for pid, create_time in verified_live_process_identities
+        )
+    ):
+        unknown["reason"] = "WORKER_PROCESS_OWNERSHIP_UNVERIFIED"
+        return unknown
+    if forward_health_payload.get("session_id") != session_id:
+        unknown["reason"] = "FORWARD_SESSION_MISMATCH"
+        return unknown
+    try:
+        actual_hash = pair_zone_file_hash()
+        with database.session() as session:
+            forward_session = session.scalar(
+                select(ForwardValidationSessionRecord).where(
+                    ForwardValidationSessionRecord.session_id == session_id
+                )
+            )
+            row = session.get(
+                PairZoneEvaluationRecord,
+                forward_session.id if forward_session is not None else "",
+            )
+            if (
+                forward_session is None
+                or forward_session.status != FORWARD_STATUS_ACTIVE
+                or forward_session.strategy_id != "pair_zone_v1"
+                or forward_session.strategy_config_hash != EXPECTED_PAIR_ZONE_FILE_SHA256
+                or actual_hash != EXPECTED_PAIR_ZONE_FILE_SHA256
+                or row is None
+            ):
+                unknown["reason"] = "SESSION_CONFIG_OR_EVALUATION_UNVERIFIED"
+                return unknown
+            if (
+                row.runtime_generation_id != generation_id
+                or row.strategy_id != forward_session.strategy_id
+                or row.strategy_version != forward_session.strategy_version
+                or row.config_hash != actual_hash
+            ):
+                unknown["reason"] = "SESSION_GENERATION_OR_CONFIG_MISMATCH"
+                return unknown
+            if row.state not in {"ACTIVE_ZONE", "HEALTHY_NO_ACTIVE_ZONE", "UNKNOWN"}:
+                unknown["reason"] = "PERSISTED_STATE_INVALID"
+                return unknown
+            last_m5 = _parse_iso(forward_health_payload.get("last_closed_m5"))
+            last_m15 = _parse_iso(forward_health_payload.get("last_closed_m15"))
+            if (
+                row.evaluated_m5_timestamp is None
+                or row.evaluated_m15_timestamp is None
+                or row.evaluated_m5_timestamp != last_m5
+                or row.evaluated_m15_timestamp != last_m15
+            ):
+                unknown["reason"] = "EVALUATION_CANDLE_BOUNDARY_MISMATCH"
+                return unknown
+            current = now or datetime.now(UTC)
+            evaluated_at = row.evaluation_at
+            if evaluated_at.tzinfo is None:
+                evaluated_at = evaluated_at.replace(tzinfo=UTC)
+            max_age = max(
+                PAIR_ZONE_EVALUATION_MAX_AGE_SECONDS,
+                float(settings.live_candle_interval_seconds) * 4.0,
+            )
+            evaluation_age = (current - evaluated_at).total_seconds()
+            if evaluation_age < -60.0 or evaluation_age > max_age:
+                unknown["reason"] = "EVALUATION_STALE"
+                return unknown
+            m5_closed_at = row.evaluated_m5_timestamp + timedelta(minutes=5)
+            m15_closed_at = row.evaluated_m15_timestamp + timedelta(minutes=15)
+            for candle_closed_at, data_max_age in (
+                (m5_closed_at, PAIR_ZONE_M5_DATA_MAX_AGE_SECONDS),
+                (m15_closed_at, PAIR_ZONE_M15_DATA_MAX_AGE_SECONDS),
+            ):
+                candle_age = (current - candle_closed_at).total_seconds()
+                if candle_age < -60.0 or candle_age > data_max_age:
+                    unknown["reason"] = "EVALUATED_CANDLE_STALE_OR_FUTURE"
+                    return unknown
+            if row.state == "UNKNOWN":
+                unknown.update({
+                    "reason": row.reason,
+                    "evaluated_at": row.evaluation_at,
+                    "evaluated_m5_timestamp": row.evaluated_m5_timestamp,
+                    "evaluated_m15_timestamp": row.evaluated_m15_timestamp,
+                })
+                return unknown
+            if row.state == "ACTIVE_ZONE" and (
+                row.direction not in {"BUY", "SELL"}
+                or not row.zone_id
+                or row.zone_lower is None
+                or row.zone_upper is None
+                or not math.isfinite(row.zone_lower)
+                or not math.isfinite(row.zone_upper)
+                or row.zone_lower >= row.zone_upper
+            ):
+                unknown["reason"] = "ACTIVE_ZONE_PROVENANCE_INCOMPLETE"
+                return unknown
+            return {
+                "state": row.state,
+                "current_direction": row.direction or "NONE",
+                "reason": row.reason,
+                "evaluated_at": row.evaluation_at,
+                "evaluated_m5_timestamp": row.evaluated_m5_timestamp,
+                "evaluated_m15_timestamp": row.evaluated_m15_timestamp,
+                "zone_id": row.zone_id,
+                "zone_lower": row.zone_lower,
+                "zone_upper": row.zone_upper,
+            }
+    except Exception:
+        # Status must remain available while uncertain persisted state fails closed.
+        unknown["reason"] = "PAIR_ZONE_STATE_READ_FAILED"
+        return unknown
 
 
 def forward_signals(database, session_id: str | None = None, limit: int = 100) -> list[ForwardSignalRecord]:

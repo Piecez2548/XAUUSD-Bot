@@ -785,6 +785,38 @@ class ForwardValidationSessionRecord(IdMixin, Base):
     )
 
 
+class PairZoneEvaluationRecord(Base):
+    """Latest canonical Pair Zone observation for one forward session.
+
+    The row is replaced on each evaluation rather than appending per-candle
+    history. A generation identifier prevents an earlier Live worker result
+    from being mistaken for the current worker's state.
+    """
+
+    __tablename__ = "pair_zone_evaluations"
+    __table_args__ = (
+        Index("ix_pair_zone_evaluations_generation", "runtime_generation_id"),
+    )
+
+    forward_session_id: Mapped[str] = mapped_column(
+        ForeignKey("forward_validation_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    runtime_generation_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    evaluation_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    evaluated_m5_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    evaluated_m15_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    strategy_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    direction: Mapped[str | None] = mapped_column(String(8))
+    zone_id: Mapped[str | None] = mapped_column(String(100))
+    zone_lower: Mapped[float | None] = mapped_column(Float)
+    zone_upper: Mapped[float | None] = mapped_column(Float)
+
+
 class ForwardSignalRecord(IdMixin, Base):
     """One idempotent canonical signal generated after forward activation."""
 
