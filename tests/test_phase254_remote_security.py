@@ -9,7 +9,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from api.app import create_app
-from config.remote_read_only_policy import is_private_control_path_allowed
+from config.remote_read_only_policy import is_auth_route_allowed, is_private_control_path_allowed
 from config.settings import ConfigurationError, Settings, _origins
 from persistence.database import Database
 
@@ -58,7 +58,9 @@ def test_remote_api_surface_is_read_only_and_payloads_are_safe(remote_database: 
             continue
         for method in route.methods:
             if method == "POST":
-                assert is_private_control_path_allowed(route.path, method)
+                assert is_private_control_path_allowed(route.path, method) or is_auth_route_allowed(
+                    route.path, method
+                )
             else:
                 assert method in {"GET", "HEAD", "OPTIONS"}
 

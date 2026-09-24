@@ -26,6 +26,7 @@ import { backendState, stateLabel, thaiDateTime, workerState } from "../lib/runt
 import { BangkokClock } from "./BangkokClock";
 import { SystemHealthProvider } from "./SystemHealthProvider";
 import { useSystemHealth } from "./useSystemHealth";
+import { logoutRequest, PRIVATE_DASHBOARD } from "../lib/api";
 
 const nav = [
   ["/", "Overview", LayoutDashboard],
@@ -51,6 +52,15 @@ export function AppShell() {
 function AppShellContent() {
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
+  async function signOut() {
+    setLogoutError(null);
+    try {
+      await logoutRequest();
+    } catch {
+      setLogoutError("Sign out failed; session state is unknown. Retry sign out.");
+    }
+  }
   return (
     <div className={`app-shell ${compact ? "sidebar-compact" : ""}`}>
       <aside className={`sidebar ${mobileOpen ? "mobile-open" : ""}`}>
@@ -85,6 +95,8 @@ function AppShellContent() {
           <span className="mobile-safety">READ ONLY</span>
           <RuntimeStatus />
           <BangkokClock />
+          {PRIVATE_DASHBOARD && <button className="text-button" onClick={() => void signOut()}>SIGN OUT</button>}
+          {logoutError && <span role="alert">{logoutError}</span>}
         </header>
         <BackendStatusBanner />
         <main><Outlet /></main>

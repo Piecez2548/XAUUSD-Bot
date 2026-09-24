@@ -16,6 +16,7 @@ from config.remote_read_only_policy import is_private_control_path_allowed
 from config.settings import Settings
 from persistence.database import Database
 from persistence.orm import ControlAuditRecord
+from services.authentication import AuthenticationService
 from services.control import TelegramControlService
 from services.control_ipc import ControlIpcError, validate_ipc_request
 from services.demo_execution import demo_execution_armed
@@ -132,8 +133,8 @@ def _lifecycle_service(
 
 @pytest.fixture
 def control_database(tmp_path: Path) -> Database:
-    database = Database(f"sqlite:///{(tmp_path / 'web-control.db').as_posix()}")
-    database.create_schema()
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'web-control.db').as_posix()}")
+    database.create_test_schema()
     yield database
     database.dispose()
 
@@ -181,13 +182,25 @@ def test_authenticated_control_endpoints_and_unauthenticated_denial(
         database=control_database,
         control_ipc=fake,
     )
-    with TestClient(app) as client:
+    AuthenticationService(control_database, Settings()).create_user_for_admin(
+        login="operator@example.com",
+        password="correct horse battery staple 123!",
+        role="ADMIN",
+        state="ACTIVE",
+        bound_tailscale_login="operator@example.com",
+    )
+    with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
         assert client.get("/api/control/status").status_code == 401
         assert (
             client.post("/api/control/start", json={"operation_id": str(uuid4())}).status_code
             == 401
         )
         headers = {"Tailscale-User-Login": "operator@example.com"}
+        assert client.post(
+            "/api/auth/login",
+            headers=headers,
+            json={"login": "operator@example.com", "password": "correct horse battery staple 123!"},
+        ).status_code == 200
         status = client.get("/api/control/status", headers=headers)
         assert status.status_code == 200
         assert status.json()["status"]["execution"]["real_money_execution"] == "DISABLED"

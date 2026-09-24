@@ -10,6 +10,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -52,6 +53,13 @@ class UtcDateTime(TypeDecorator[datetime]):
 
 class Base(DeclarativeBase):
     pass
+
+
+# These tables are owned exclusively by Alembic revision 20260924_0014.
+# Legacy create_all bootstraps must not create them ahead of that revision.
+AUTH_SCHEMA_TABLE_NAMES = frozenset(
+    {"auth_users", "auth_sessions", "auth_audit_events"}
+)
 
 
 class IdMixin:
@@ -474,6 +482,72 @@ class ControlAuditRecord(IdMixin, Base):
     authorized: Mapped[bool] = mapped_column(Boolean, default=False)
     result: Mapped[str] = mapped_column(String(64))
     correlation_id: Mapped[str] = mapped_column(String(36), index=True)
+
+
+class AuthUserRecord(TimestampMixin, Base):
+    """Application-authenticated users; account creation is local/admin-only."""
+
+    __tablename__ = "auth_users"
+    __table_args__ = (
+        UniqueConstraint("normalized_login", name="uq_auth_users_normalized_login"),
+        CheckConstraint("role IN ('OWNER', 'ADMIN')", name="ck_auth_users_role"),
+        CheckConstraint(
+            "state IN ('PROVISIONED', 'PENDING_APPROVAL', 'ACTIVE', 'LOCKED', 'REVOKED')",
+            name="ck_auth_users_state",
+        ),
+        Index("ix_auth_users_bound_tailscale_login", "bound_tailscale_login"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    normalized_login: Mapped[str] = mapped_column(String(254), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False)
+    bound_tailscale_login: Mapped[str] = mapped_column(String(254), nullable=False)
+
+
+class AuthSessionRecord(Base):
+    """Revocable opaque browser session; only the token hash is persisted."""
+
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_auth_sessions_token_hash"),
+        Index("ix_auth_sessions_user_id", "user_id"),
+        Index("ix_auth_sessions_idle_expires_at", "idle_expires_at"),
+        Index("ix_auth_sessions_absolute_expires_at", "absolute_expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    idle_expires_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    absolute_expires_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+
+
+class AuthAuditRecord(Base):
+    """Minimal auth-core audit; never stores submitted or bearer secrets."""
+
+    __tablename__ = "auth_audit_events"
+    __table_args__ = (
+        Index("ix_auth_audit_events_timestamp", "timestamp"),
+        Index("ix_auth_audit_events_user_id", "user_id"),
+        Index("ix_auth_audit_events_event_type", "event_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("auth_users.id", ondelete="SET NULL"))
+    normalized_login: Mapped[str | None] = mapped_column(String(254))
+    tailscale_login: Mapped[str | None] = mapped_column(String(254))
+    session_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    outcome: Mapped[str] = mapped_column(String(24), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(64))
 
 
 class ConfigurationVersionRecord(IdMixin, Base):

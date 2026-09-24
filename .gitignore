@@ -11,6 +11,7 @@ data/*.db-*
 backups/*.db
 frontend/node_modules/
 frontend/dist/
+frontend/dist-validation/
 frontend/coverage/
 .impeccable/review/
 # Local secrets

@@ -23,11 +23,12 @@ from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
 from api.static_dashboard import DashboardStaticFiles
 from config.remote_read_only_policy import (
+    is_auth_route_allowed,
     is_private_control_path_allowed,
     is_remote_path_allowed,
 )
 from config.settings import Settings, load_settings
-from persistence.database import Database
+from persistence.database import AuthSchemaError, Database
 from persistence.orm import (
     AccountRecord,
     AccountSnapshotRecord,
@@ -58,6 +59,12 @@ from persistence.orm import (
     TradeRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.authentication import (
+    SESSION_COOKIE_NAME,
+    AuthenticatedUser,
+    AuthenticationService,
+    normalize_login,
+)
 from services.control_ipc import ControlIpcClient, ControlIpcError
 from services.forward_shadow import (
     forward_health,
@@ -353,7 +360,21 @@ def create_app(
     runtime_settings = settings or load_settings()
     started_at = datetime.now(UTC)
     db = database or Database(runtime_settings.database_url, project_root=PROJECT_ROOT)
-    db.create_schema()
+    try:
+        db.create_schema()
+        if runtime_settings.remote_dashboard_mode:
+            db.require_auth_schema()
+    except Exception as exc:
+        if runtime_settings.remote_dashboard_mode:
+            if database is None:
+                db.dispose()
+            if isinstance(exc, AuthSchemaError):
+                raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(
+                "Private dashboard auth schema initialization failed; "
+                "verify database availability and Alembic revision 20260924_0014"
+            ) from exc
+        raise
     realtime = RealtimeHub(
         db, history_interval_seconds=runtime_settings.live_history_interval_seconds
     )
@@ -377,6 +398,7 @@ def create_app(
     app.state.settings = runtime_settings
     app.state.realtime = realtime
     app.state.control_ipc = control_ipc or ControlIpcClient(PROJECT_ROOT)
+    app.state.auth_service = AuthenticationService(db, runtime_settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(runtime_settings.cors_origins),
@@ -399,19 +421,105 @@ def create_app(
             if path.startswith("/api/"):
                 allowed_control = is_private_control_path_allowed(path, request.method)
                 allowed_read = request.method == "GET" and is_remote_path_allowed(path)
-                if not (allowed_control or allowed_read):
+                allowed_auth = is_auth_route_allowed(path, request.method)
+                if not (allowed_control or allowed_read or allowed_auth):
                     return JSONResponse({"detail": "Remote route denied"}, status_code=404)
+                if not allowed_auth or path == "/api/auth/session":
+                    identity = normalize_login(request.headers.get("Tailscale-User-Login", ""))
+                    try:
+                        authenticated_user = app.state.auth_service.authenticate(
+                            request.cookies.get(SESSION_COOKIE_NAME), identity
+                        )
+                    except Exception:
+                        return JSONResponse(
+                            {"detail": "Authentication service unavailable"}, status_code=503
+                        )
+                    if authenticated_user is None and not allowed_auth:
+                        return JSONResponse(
+                            {"detail": "Application session required"}, status_code=401
+                        )
+                    if authenticated_user is not None:
+                        request.state.authenticated_user = authenticated_user
             elif request.method not in {"GET", "HEAD"}:
                 return JSONResponse({"detail": "Remote method denied"}, status_code=405)
-            return await call_next(request)
+            response = await call_next(request)
+            if path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store"
+            return response
+
+    def _tailscale_actor(request: Request) -> str:
+        actor = normalize_login(request.headers.get("Tailscale-User-Login", ""))
+        if not runtime_settings.remote_dashboard_mode or not actor:
+            raise HTTPException(status_code=404, detail="Private authentication is disabled")
+        return actor[:254]
+
+    @app.post("/api/auth/login")
+    async def auth_login(request: Request) -> JSONResponse:
+        identity = _tailscale_actor(request)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "Invalid login request"}, status_code=400)
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"login", "password"}
+            or not isinstance(body.get("login"), str)
+            or not isinstance(body.get("password"), str)
+            or not 1 <= len(body["login"]) <= 254
+            or not 1 <= len(body["password"]) <= 1024
+        ):
+            return JSONResponse({"detail": "Invalid login request"}, status_code=400)
+        try:
+            result = app.state.auth_service.login(body["login"], body["password"], identity)
+        except Exception:
+            return JSONResponse(
+                {"detail": "Authentication service unavailable"}, status_code=503
+            )
+        if result.user is None or result.token is None:
+            return JSONResponse({"detail": "Invalid login or password"}, status_code=401)
+        response = JSONResponse(result.user.safe_payload())
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=result.token,
+            max_age=runtime_settings.auth_session_absolute_hours * 60 * 60,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
+
+    @app.post("/api/auth/logout")
+    def auth_logout(request: Request) -> JSONResponse:
+        identity = _tailscale_actor(request)
+        try:
+            app.state.auth_service.revoke(request.cookies.get(SESSION_COOKIE_NAME), identity)
+        except Exception:
+            return JSONResponse({"detail": "Authentication service unavailable"}, status_code=503)
+        response = JSONResponse({"authenticated": False})
+        response.delete_cookie(
+            key=SESSION_COOKIE_NAME,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
+
+    @app.get("/api/auth/session")
+    def auth_session(request: Request) -> dict[str, object]:
+        user = getattr(request.state, "authenticated_user", None)
+        if not isinstance(user, AuthenticatedUser):
+            return {"authenticated": False}
+        return user.safe_payload()
 
     def _control_actor(request: Request) -> str:
         if not runtime_settings.remote_dashboard_mode:
             raise HTTPException(status_code=404, detail="Private control plane is disabled")
-        actor = request.headers.get("Tailscale-User-Login", "").strip()
-        if not actor:
-            raise HTTPException(status_code=401, detail="Tailscale identity required")
-        return actor[:128]
+        user = getattr(request.state, "authenticated_user", None)
+        if not isinstance(user, AuthenticatedUser) or user.state != "ACTIVE":
+            raise HTTPException(status_code=401, detail="Application session required")
+        return user.login[:128]
 
     def _control_call(
         request: Request,

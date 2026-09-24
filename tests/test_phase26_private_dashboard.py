@@ -9,12 +9,13 @@ from starlette.websockets import WebSocketDisconnect
 from api.app import create_app
 from config.settings import Settings
 from persistence.database import Database
+from services.authentication import AuthenticationService
 
 
 @pytest.fixture
 def private_database(tmp_path: Path) -> Database:
-    database = Database(f"sqlite:///{(tmp_path / 'private-dashboard.db').as_posix()}")
-    database.create_schema()
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'private-dashboard.db').as_posix()}")
+    database.create_test_schema()
     yield database
     database.dispose()
 
@@ -25,7 +26,7 @@ def private_client(private_database: Database) -> TestClient:
         settings=Settings(remote_dashboard_mode=True),
         database=private_database,
     )
-    with TestClient(app) as client:
+    with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
         yield client
 
 
@@ -39,6 +40,18 @@ def test_private_dashboard_allows_only_authenticated_allowlisted_get(
     private_client: TestClient,
 ) -> None:
     headers = {"Tailscale-User-Login": "operator@example.com"}
+    AuthenticationService(private_client.app.state.database, Settings()).create_user_for_admin(
+        login="operator@example.com",
+        password="correct horse battery staple 123!",
+        role="ADMIN",
+        state="ACTIVE",
+        bound_tailscale_login="operator@example.com",
+    )
+    assert private_client.post(
+        "/api/auth/login",
+        headers=headers,
+        json={"login": "operator@example.com", "password": "correct horse battery staple 123!"},
+    ).status_code == 200
     allowed = private_client.get("/api/system/health", headers=headers)
     denied = private_client.get("/api/health", headers=headers)
     unknown = private_client.get("/api/unknown", headers=headers)
@@ -62,10 +75,9 @@ def test_private_dashboard_denies_mutating_methods(
 def test_private_dashboard_denies_websocket_phase_until_wss_is_explicitly_secured(
     private_client: TestClient,
 ) -> None:
-    with pytest.raises(WebSocketDisconnect) as error:
-        with private_client.websocket_connect(
-            "/ws/live",
-            headers={"Tailscale-User-Login": "operator@example.com"},
-        ):
-            pass
+    with pytest.raises(WebSocketDisconnect) as error, private_client.websocket_connect(
+        "/ws/live",
+        headers={"Tailscale-User-Login": "operator@example.com"},
+    ):
+        pass
     assert error.value.code == 1008

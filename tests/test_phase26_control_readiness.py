@@ -41,8 +41,8 @@ class _Socket:
 
 
 def _service(tmp_path: Path, supervisor) -> TelegramControlService:
-    database = Database(f"sqlite:///{(tmp_path / 'readiness.db').as_posix()}")
-    database.create_schema()
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'readiness.db').as_posix()}")
+    database.create_test_schema()
     service = TelegramControlService(
         Settings(remote_dashboard_mode=True, api_host="127.0.0.1", api_port=8000),
         tmp_path,
@@ -53,8 +53,8 @@ def _service(tmp_path: Path, supervisor) -> TelegramControlService:
 
 
 def test_private_mode_unauthenticated_local_api_health_remains_401(tmp_path: Path) -> None:
-    database = Database(f"sqlite:///{(tmp_path / 'private-api.db').as_posix()}")
-    database.create_schema()
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'private-api.db').as_posix()}")
+    database.create_test_schema()
     try:
         with TestClient(
             create_app(

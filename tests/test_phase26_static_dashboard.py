@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 import api.app as app_module
 from config.settings import Settings
 from persistence.database import Database
+from services.authentication import AuthenticationService
 
 
 def _client(tmp_path: Path, *, private: bool = False) -> tuple[TestClient, Database]:
@@ -18,14 +19,18 @@ def _client(tmp_path: Path, *, private: bool = False) -> tuple[TestClient, Datab
     (tmp_path / "frontend" / "dist" / "assets" / "app.js").write_text(
         "console.log('test');", encoding="utf-8"
     )
-    database = Database(f"sqlite:///{(tmp_path / 'dashboard.db').as_posix()}")
-    database.create_schema()
+    database_factory = Database.for_test if private else Database
+    database = database_factory(f"sqlite:///{(tmp_path / 'dashboard.db').as_posix()}")
+    if private:
+        database.create_test_schema()
+    else:
+        database.create_schema()
     original_root = app_module.PROJECT_ROOT
     app_module.PROJECT_ROOT = tmp_path
     app = app_module.create_app(
         settings=Settings(remote_dashboard_mode=private), database=database
     )
-    client = TestClient(app)
+    client = TestClient(app, base_url="https://dashboard.tailnet.test")
     client._dashboard_original_root = original_root
     return client, database
 
@@ -99,6 +104,19 @@ def test_private_dashboard_auth_boundary_covers_static_and_api(
 
         headers = {"Tailscale-User-Login": "operator@example.com"}
         assert client.get("/", headers=headers).status_code == 200
+        assert client.get("/api/system/health", headers=headers).status_code == 401
+        AuthenticationService(database, Settings()).create_user_for_admin(
+            login="operator@example.com",
+            password="correct horse battery staple 123!",
+            role="ADMIN",
+            state="ACTIVE",
+            bound_tailscale_login="operator@example.com",
+        )
+        assert client.post(
+            "/api/auth/login",
+            headers=headers,
+            json={"login": "operator@example.com", "password": "correct horse battery staple 123!"},
+        ).status_code == 200
         assert client.get("/api/system/health", headers=headers).status_code == 200
         assert client.get("/api/health", headers=headers).status_code == 404
     finally:

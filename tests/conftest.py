@@ -16,6 +16,13 @@ from models.market import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_remote_dashboard_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep local operator dotenv settings from changing unrelated test behavior."""
+
+    monkeypatch.setenv("REMOTE_DASHBOARD_MODE", "false")
+
+
 @pytest.fixture
 def valid_frame() -> pd.DataFrame:
     return pd.DataFrame(

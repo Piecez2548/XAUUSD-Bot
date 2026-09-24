@@ -34,6 +34,11 @@ PRIVATE_CONTROL_POST_PATHS = frozenset({
     "/api/control/demo-on",
     "/api/control/demo-off",
 })
+AUTH_ROUTE_METHODS = {
+    ("POST", "/api/auth/login"),
+    ("POST", "/api/auth/logout"),
+    ("GET", "/api/auth/session"),
+}
 
 # Exact paths are intentionally used instead of a prefix such as /api.  The
 # two path families below cover only identifiers used by the dashboard.
@@ -155,6 +160,13 @@ def is_private_control_path_allowed(raw_target: str, method: str) -> bool:
     return False
 
 
+def is_auth_route_allowed(raw_target: str, method: str) -> bool:
+    """Allow only the three exact Tailscale-gated auth-core routes."""
+
+    path = _safe_path(raw_target)
+    return (method.upper(), path) in AUTH_ROUTE_METHODS
+
+
 def authorize_remote_request(
     *,
     method: str,
@@ -192,8 +204,10 @@ __all__ = [
     "REMOTE_UPSTREAM_PORT",
     "PRIVATE_CONTROL_GET_PATHS",
     "PRIVATE_CONTROL_POST_PATHS",
+    "AUTH_ROUTE_METHODS",
     "RemoteBoundaryDecision",
     "authorize_remote_request",
     "is_private_control_path_allowed",
+    "is_auth_route_allowed",
     "is_remote_path_allowed",
 ]

@@ -34,7 +34,7 @@ Every domain event includes UUID `event_id`, enum `event_type`, timezone-aware U
 python main.py migrate
 ```
 
-The initial revision creates the complete observatory schema. For production evolution, replace metadata-wide creation in later revisions with explicit additive Alembic operations and test upgrades against a backup copy.
+The historical bootstrap revisions use migration-local frozen schema definitions. **Versioned migrations must not depend on evolving current ORM metadata.** Future schema changes must use explicit Alembic operations or migration-local frozen definitions. `Base.metadata.create_all()` is reserved for explicitly disposable test-schema construction, not as migration authority. Test upgrades against disposable databases before considering a production migration.
 
 ## PostgreSQL migration path
 

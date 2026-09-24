@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $frontendRoot = Join-Path $ProjectRoot "frontend"
 $packageJson = Join-Path $frontendRoot "package.json"
+$validationDist = Join-Path $frontendRoot "dist-validation"
 
 if (-not (Test-Path -LiteralPath $packageJson)) {
     throw "Frontend package not found: $packageJson"
@@ -29,6 +30,8 @@ try {
     $env:VITE_PRIVATE_DASHBOARD = "true"
     $env:VITE_API_BASE_URL = ""
     $env:VITE_WS_URL = ""
+    # package.json routes all routine builds to dist-validation, never the
+    # frontend/dist directory currently mounted by the production API.
     & $npm.Source run build
     if ($LASTEXITCODE -ne 0) {
         throw "Frontend production build failed with exit code $LASTEXITCODE"
@@ -53,9 +56,9 @@ finally {
     Pop-Location
 }
 
-$dist = Join-Path $frontendRoot "dist"
-if (-not (Test-Path -LiteralPath (Join-Path $dist "index.html"))) {
-    throw "Frontend build completed without frontend/dist/index.html"
+$index = Join-Path $validationDist "index.html"
+if (-not (Test-Path -LiteralPath $index)) {
+    throw "Validation build completed without frontend/dist-validation/index.html"
 }
 
-Write-Host "Frontend production build ready at $dist"
+Write-Host "Frontend validation build ready at $validationDist; it was not published."

@@ -14,8 +14,8 @@ from config.settings import Settings
 from models.market import Timeframe
 from persistence.database import Database
 from persistence.orm import StrategyIntelligenceRecord
+from services.authentication import AuthenticationService
 from services.forward_shadow import ForwardInput, ForwardShadowWorker
-
 
 INTELLIGENCE_ROUTES = (
     "/api/intelligence/candidate",
@@ -27,8 +27,8 @@ TAILSCALE_HEADERS = {"Tailscale-User-Login": "operator@example.com"}
 
 
 def _database(tmp_path) -> Database:
-    database = Database(f"sqlite:///{(tmp_path / 'phase30-boundaries.db').as_posix()}")
-    database.create_schema()
+    database = Database.for_test(f"sqlite:///{(tmp_path / 'phase30-boundaries.db').as_posix()}")
+    database.create_test_schema()
     return database
 
 
@@ -94,8 +94,22 @@ def test_private_intelligence_boundary_requires_identity_and_allows_only_get(tmp
     database = _database(tmp_path)
     _insert_intelligence(database)
     settings = Settings(remote_dashboard_mode=True)
-    with TestClient(create_app(settings=settings, database=database)) as client:
+    app = create_app(settings=settings, database=database)
+    with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
+        AuthenticationService(database, settings).create_user_for_admin(
+            login="operator@example.com",
+            password="correct horse battery staple 123!",
+            role="ADMIN",
+            state="ACTIVE",
+            bound_tailscale_login="operator@example.com",
+        )
         assert client.get(path).status_code == 401
+        login_response = client.post(
+            "/api/auth/login",
+            headers=TAILSCALE_HEADERS,
+            json={"login": "operator@example.com", "password": "correct horse battery staple 123!"},
+        )
+        assert login_response.status_code == 200
         assert client.get(path, headers=TAILSCALE_HEADERS).status_code == 200
         assert client.post(path, headers=TAILSCALE_HEADERS).status_code == 404
     assert is_remote_path_allowed(path)

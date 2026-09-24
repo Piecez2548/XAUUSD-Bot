@@ -7,6 +7,75 @@ export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 export const PRIVATE_DASHBOARD =
   (import.meta.env.VITE_PRIVATE_DASHBOARD ?? "").trim().toLowerCase() === "true";
 
+export interface AuthSession {
+  authenticated: boolean;
+  user?: { id: string; login: string; role: "OWNER" | "ADMIN"; state: "ACTIVE" };
+  session?: { idle_expires_at: string; absolute_expires_at: string };
+}
+
+export function isAuthSession(value: unknown): value is AuthSession {
+  if (typeof value !== "object" || value === null || !("authenticated" in value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.authenticated === false) return true;
+  if (candidate.authenticated !== true) return false;
+  if (typeof candidate.user !== "object" || candidate.user === null) return false;
+  if (typeof candidate.session !== "object" || candidate.session === null) return false;
+  const user = candidate.user as Record<string, unknown>;
+  const session = candidate.session as Record<string, unknown>;
+  return (
+    typeof user.id === "string" && user.id.length > 0 &&
+    typeof user.login === "string" && user.login.length > 0 &&
+    (user.role === "OWNER" || user.role === "ADMIN") &&
+    user.state === "ACTIVE" &&
+    typeof session.idle_expires_at === "string" &&
+    !Number.isNaN(Date.parse(session.idle_expires_at)) &&
+    typeof session.absolute_expires_at === "string" &&
+    !Number.isNaN(Date.parse(session.absolute_expires_at))
+  );
+}
+
+function notifyUnauthorized(response: Response): void {
+  if (response.status === 401 && PRIVATE_DASHBOARD) {
+    window.dispatchEvent(new Event("xauusd:auth-required"));
+  }
+}
+
+export async function getAuthSession(): Promise<AuthSession> {
+  const response = await fetch("/api/auth/session", { credentials: "same-origin" });
+  if (!response.ok) {
+    notifyUnauthorized(response);
+    throw new Error(`Session check failed (${response.status})`);
+  }
+  const payload: unknown = await response.json();
+  if (!isAuthSession(payload)) throw new Error("Invalid session response");
+  return payload;
+}
+
+export async function loginRequest(login: string, password: string): Promise<void> {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ login, password }),
+  });
+  if (!response.ok) throw new Error("Invalid login or password");
+}
+
+export async function logoutRequest(): Promise<void> {
+  const response = await fetch("/api/auth/logout", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: "{}",
+  });
+  if (!response.ok) {
+    throw new Error("Sign out failed; server session state is unknown");
+  }
+  window.dispatchEvent(new Event("xauusd:auth-required"));
+}
+
 export interface ApiRuntimeConfig {
   apiBase: string;
   privateDashboard: boolean;
@@ -43,6 +112,7 @@ export async function requestJson<T>(
     credentials: config.apiBase ? "include" : "same-origin",
     signal,
   });
+  notifyUnauthorized(response);
   if (!response.ok) {
     throw new Error(`Request failed (${response.status})`);
   }
@@ -75,6 +145,7 @@ export async function postJson<T>(
     throw new Error("BACKEND_NOT_CONFIGURED");
   }
   const response = await fetcherForApi(path, config, body, signal);
+  notifyUnauthorized(response);
   if (!response.ok) {
     throw new Error(`Request failed (${response.status})`);
   }

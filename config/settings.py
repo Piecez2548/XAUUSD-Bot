@@ -115,6 +115,9 @@ class Settings:
     api_port: int = 8000
     remote_dashboard_mode: bool = False
     dashboard_public_url: str | None = None
+    auth_session_idle_minutes: int = 30
+    auth_session_absolute_hours: int = 12
+    auth_session_touch_seconds: int = 60
     cors_origins: tuple[str, ...] = (
         "http://localhost:5173",
         "http://127.0.0.1:5173",
@@ -168,6 +171,12 @@ class Settings:
             )
         if self.telegram_timeout_seconds <= 0:
             raise ConfigurationError("TELEGRAM_TIMEOUT_SECONDS must be greater than zero")
+        if self.auth_session_idle_minutes <= 0:
+            raise ConfigurationError("AUTH_SESSION_IDLE_MINUTES must be greater than zero")
+        if self.auth_session_absolute_hours <= 0:
+            raise ConfigurationError("AUTH_SESSION_ABSOLUTE_HOURS must be greater than zero")
+        if self.auth_session_touch_seconds <= 0:
+            raise ConfigurationError("AUTH_SESSION_TOUCH_SECONDS must be greater than zero")
         if self.mt5_startup_timeout_seconds <= 0:
             raise ConfigurationError("MT5_STARTUP_TIMEOUT_SECONDS must be greater than zero")
         if self.max_trade_risk_percent <= 0:
@@ -275,6 +284,9 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         api_port=_positive_int("API_PORT", 8000),
         remote_dashboard_mode=_boolean("REMOTE_DASHBOARD_MODE"),
         dashboard_public_url=os.getenv("DASHBOARD_PUBLIC_URL") or None,
+        auth_session_idle_minutes=_positive_int("AUTH_SESSION_IDLE_MINUTES", 30),
+        auth_session_absolute_hours=_positive_int("AUTH_SESSION_ABSOLUTE_HOURS", 12),
+        auth_session_touch_seconds=_positive_int("AUTH_SESSION_TOUCH_SECONDS", 60),
         cors_origins=_origins(
             "CORS_ORIGINS",
             ("http://localhost:5173", "http://127.0.0.1:5173"),
