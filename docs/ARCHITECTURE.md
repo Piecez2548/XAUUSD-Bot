@@ -80,10 +80,12 @@ AI, news, strategy, execution, and position-management services must publish typ
 
 The control service is a separate long-lived process. It authorizes only private
 messages matching both configured chat and user allowlists, persists update
-offsets, and dispatches a fixed command map. The supervisor owns only the API
-and Live Data Engine children, uses an atomic local lock and sanitized registry,
-and allows at most three restarts in ten minutes by default. `/stop` terminates
-monitoring children without issuing any MT5 position operation.
+offsets, and dispatches a fixed command map. The supervisor owns the persistent
+API/control-plane child and the Live Data Engine child, uses an atomic local
+lock and sanitized registry, and allows at most three restarts in ten minutes
+by default. `/stop` terminates only Live; the API remains available for
+authenticated Web control while trading runtime is stopped. No lifecycle
+operation issues any MT5 position operation.
 
 ## Web Control Plane boundary
 

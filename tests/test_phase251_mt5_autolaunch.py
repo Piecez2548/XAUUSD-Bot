@@ -309,7 +309,7 @@ def test_healthy_monitoring_start_is_idempotent_and_stop_does_not_touch_mt5(
     assert "ALREADY RUNNING" in response
     assert supervisor.started == []
     asyncio.run(service._stop_infrastructure_locked())
-    assert supervisor.stopped == ["live", "api"]
+    assert supervisor.stopped == ["live"]
     assert bootstrap.calls == 1
     database.dispose()
 

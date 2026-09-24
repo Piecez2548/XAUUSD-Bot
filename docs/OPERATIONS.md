@@ -111,8 +111,11 @@ python main.py control
 
 The authorized commands `/start`, `/stop`, `/restart`, `/status`, `/health`,
 `/account`, `/market`, `/positions`, `/risk`, `/logs`, and `/help` use fixed
-handlers. `/start` launches API and live monitoring; it never enables execution.
-The production dashboard is served locally at `http://127.0.0.1:8000/`.
+handlers. Control bootstraps and supervises the API/control plane independently;
+`/start` launches the Live monitoring runtime and never enables execution.
+`/stop` stops Live while keeping the API/control plane available, so the
+private `/control` page remains reachable. `/restart` restarts Live only. The
+production dashboard is served locally at `http://127.0.0.1:8000/`.
 
 Optional Task Scheduler scripts are explicit operator actions:
 `scripts/install_telegram_control_task.ps1`,

@@ -604,9 +604,9 @@ def test_successful_api_then_failed_verification_persists_rollback_reason(
 
     assert response.startswith("🟠 START INCOMPLETE")
     assert supervisor.started == ["api", "live"]
-    assert supervisor.stopped == ["api", "live"]
+    assert supervisor.stopped == ["live"]
     rollback = [event for event in events if event.get("stage") == "startup_rollback"]
-    assert {event["component"] for event in rollback} == {"api", "live"}
+    assert {event["component"] for event in rollback} == {"live"}
     assert all(event["details"]["final_state"] == "STOPPED" for event in rollback)
     assert all(
         "startup verification incomplete" in event["details"]["rollback_trigger"]

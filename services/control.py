@@ -168,6 +168,14 @@ class TelegramControlService:
             self.logger.exception("Local Web Control IPC could not start; Web mutations unavailable")
             self._ipc_server = None
 
+        # Keep the authenticated local API available while the trading
+        # runtime is intentionally stopped.  This bootstraps only the
+        # control-plane child; MT5 and Live remain explicit lifecycle work.
+        if not await self._ensure_control_plane_api():
+            self.logger.error(
+                "Control Plane API bootstrap did not reach a verified loopback listener"
+            )
+
         client = self._client
         if client is None and self.configured:
             client = httpx.AsyncClient(
@@ -372,8 +380,8 @@ class TelegramControlService:
         records = self.supervisor.status()
         stop_verified = all(
             records.get(component) is not None
-            and records[component].state == "STOPPED"
-            for component in ("api", "live")
+            and records[component].state == expected
+            for component, expected in (("api", "RUNNING"), ("live", "STOPPED"))
         )
         write_supervisor_lifecycle_event(
             self.project_root,
@@ -479,30 +487,25 @@ class TelegramControlService:
         api_command = [supervised_python, str(self.project_root / "main.py"), "server"]
         live_command = [supervised_python, str(self.project_root / "main.py"), "live"]
         self._startup_started_at = datetime.now(UTC)
-        started_here: list[str] = []
+        # API is the persistent control-plane child.  Only Live belongs to
+        # the trading-runtime transaction and may be rolled back on failure.
+        started_live_here: list[str] = []
         started_records: dict[str, object] = {}
         try:
             before = self.supervisor.status()
             api = self.supervisor.start_component("api", api_command)
             started_records["api"] = api
-            if self._start_spawned_by_request("api", before, api):
-                started_here.append("api")
             if api.state != "RUNNING":
-                self._stop_failed_start(
-                    started_here,
-                    reason=f"api verification failed: {api.last_error or api.state}",
-                    records=started_records,
-                )
                 return self._startup_incomplete_response(
                     {"api": api.state, "live": "NOT_STARTED"}, api.last_error
                 )
             live = self.supervisor.start_component("live", live_command)
             started_records["live"] = live
             if self._start_spawned_by_request("live", before, live):
-                started_here.append("live")
+                started_live_here.append("live")
             if live.state != "RUNNING":
                 self._stop_failed_start(
-                    started_here,
+                    started_live_here,
                     reason=f"live verification failed: {live.last_error or live.state}",
                     records=started_records,
                 )
@@ -513,7 +516,7 @@ class TelegramControlService:
             self.logger.exception("Supervised child startup failed before verification")
             self._write_startup_diagnostic("supervised_child_start", exc)
             self._stop_failed_start(
-                started_here,
+                started_live_here,
                 reason=f"supervised child startup exception: {type(exc).__name__}",
                 records=started_records,
             )
@@ -544,7 +547,7 @@ class TelegramControlService:
                 f"{name.upper()}={value}" for name, value in verification_checks.items()
             )
             self._stop_failed_start(
-                started_here,
+                started_live_here,
                 reason=f"startup verification incomplete: {checks}",
                 records=started_records,
             )
@@ -608,6 +611,14 @@ class TelegramControlService:
         records = records or self.supervisor.status()
         states = [records.get(name).state if records.get(name) else "STOPPED" for name in ("api", "live")]
         if all(state == "RUNNING" for state in states):
+            return "CONNECTED"
+        api = records.get("api")
+        live = records.get("live")
+        if (
+            getattr(api, "state", None) == "RUNNING"
+            and getattr(live, "state", None) == "STOPPED"
+            and getattr(live, "desired_state", "STOPPED") == "STOPPED"
+        ):
             return "CONNECTED"
         if any(state == "RUNNING" for state in states):
             return "DEGRADED"
@@ -690,7 +701,7 @@ class TelegramControlService:
         reason: str = "startup rollback",
         records: dict[str, object] | None = None,
     ) -> None:
-        targets = ("live", "api") if components is None else components
+        targets = ("live",) if components is None else components
         for component in targets:
             try:
                 before = (records or {}).get(component)
@@ -728,11 +739,14 @@ class TelegramControlService:
         operation_id: str | None = None,
     ) -> str:
         live = self._stop_supervised_component("live", lifecycle_operation, operation_id)
-        api = self._stop_supervised_component("api", lifecycle_operation, operation_id)
-        if live.state != "STOPPED" or api.state != "STOPPED":
+        # The API is the authenticated local Web Control Plane, so it remains
+        # supervised and reachable while the trading runtime is stopped.
+        api = self.supervisor.status().get("api")
+        api_state = getattr(api, "state", "STOPPED")
+        if live.state != "STOPPED" or api_state != "RUNNING":
             return (
                 "🟠 หยุดระบบติดตามได้ไม่ครบ\n\n"
-                f"Live Engine  {translate_health_state(live.state)}\nAPI           {translate_health_state(api.state)}\n"
+                f"Live Engine  {translate_health_state(live.state)}\nAPI           {translate_health_state(api_state)} (Control Plane)\n"
                 "ไม่มีการแก้ไข Position ที่ Broker\nBroker positions were NOT modified.\n"
                 "Telegram Control  🟢 ออนไลน์\n"
                 "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
@@ -740,7 +754,7 @@ class TelegramControlService:
             )
         return (
             "🔴 หยุดระบบติดตามตลาดแล้ว\n\n"
-            "Live Engine  ⚫ หยุดทำงาน (STOPPED)\nAPI           ⚫ หยุดทำงาน (STOPPED)\n\n"
+            "Live Engine  ⚫ หยุดทำงาน (STOPPED)\nAPI           🟢 ทำงานอยู่ (RUNNING — Control Plane)\n\n"
             "ไม่มีการแก้ไข Position ที่ Broker\nBroker positions were NOT modified.\n"
             "Telegram Control ยังคงออนไลน์\n"
             "MT5 ไม่ถูกปิดโดยคำสั่งนี้\n"
@@ -773,6 +787,34 @@ class TelegramControlService:
                 lifecycle_operation=lifecycle_operation,
             )
         return stop(component)
+
+    async def _ensure_control_plane_api(self) -> bool:
+        """Keep the authenticated local API available independently of Live."""
+
+        try:
+            records = self.supervisor.status()
+            api = records.get("api")
+            if api is None or api.state != "RUNNING":
+                api = self.supervisor.start_component(
+                    "api", self._supervised_commands()["api"]
+                )
+            if api.state != "RUNNING":
+                self.logger.error(
+                    "Control Plane API start failed: %s",
+                    getattr(api, "last_error", None) or api.state,
+                )
+                return False
+        except Exception:
+            self.logger.exception("Control Plane API bootstrap failed")
+            return False
+
+        deadline = monotonic() + self.settings.supervisor_operation_timeout_seconds
+        while True:
+            if await self._api_responsive():
+                return True
+            if monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
 
     def _status(self) -> str:
         records = self.supervisor.status()

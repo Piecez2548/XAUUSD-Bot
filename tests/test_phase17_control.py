@@ -146,7 +146,7 @@ def test_authorized_stop_is_graceful_and_read_only(
     )
     assert response is not None
     assert "Broker positions were NOT modified" in response
-    assert "Execution         DISABLED" in response
+    assert "การเทรดเงินจริง: ปิดอยู่" in response
 
 
 @pytest.mark.asyncio

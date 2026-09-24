@@ -92,3 +92,15 @@ Before enabling Web mutations in production, an operator must verify:
    money remains disabled.
 
 No commit or push is included in this report.
+
+## Bootstrap correction
+
+The initial MVP lifecycle treated API and Live as one stop transaction. That
+made the authenticated `/control` route unavailable after a clean stop because
+Tailscale Serve still had no loopback API listener. The corrected lifecycle
+bootstraps the verified API/control-plane child when persistent Control starts,
+keeps it running while Live is stopped, and limits Web START/STOP/RESTART to
+the Live trading runtime. Failed Live startup verification rolls back Live
+only; the API remains available for status and recovery. The named-pipe
+authority, exact private route policy, operation-id replay protection, Demo
+gate, and real-money-disabled invariant are unchanged.

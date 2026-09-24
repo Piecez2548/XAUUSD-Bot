@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -17,6 +18,7 @@ from persistence.database import Database
 from persistence.orm import ControlAuditRecord
 from services.control import TelegramControlService
 from services.control_ipc import ControlIpcError, validate_ipc_request
+from services.demo_execution import demo_execution_armed
 
 
 class FakeControlIpc:
@@ -34,8 +36,8 @@ class FakeControlIpc:
             "status": {
                 "checked_at": "2026-09-24T00:00:00+00:00",
                 "control": "CONNECTED",
-                "supervisor": "STOPPED",
-                "api": "STOPPED",
+                "supervisor": "CONNECTED",
+                "api": "RUNNING",
                 "live": "STOPPED",
                 "mt5": "CONNECTED",
                 "database": "CONNECTED",
@@ -56,6 +58,76 @@ class FakeControlIpc:
                 },
             },
         }
+
+
+class FakeLifecycleSupervisor:
+    def __init__(self, *, api_state: str = "RUNNING", live_state: str = "STOPPED",
+                 live_start_state: str = "RUNNING") -> None:
+        self.records = {
+            "api": SimpleNamespace(state=api_state, desired_state="RUNNING"),
+            "live": SimpleNamespace(state=live_state, desired_state="STOPPED"),
+        }
+        self.live_start_state = live_start_state
+        self.started: list[str] = []
+        self.stopped: list[str] = []
+        self.api_generations = 1 if api_state == "RUNNING" else 0
+        self.live_generations = 0
+        self._last_start_spawned: dict[str, bool] = {}
+
+    def status(self):
+        return self.records
+
+    def reconcile(self):
+        return self.status()
+
+    def start_component(self, component, _command):
+        self.started.append(component)
+        record = self.records[component]
+        was_running = record.state == "RUNNING"
+        record.desired_state = "RUNNING"
+        record.state = self.live_start_state if component == "live" else "RUNNING"
+        self._last_start_spawned[component] = component == "live"
+        if component == "api" and not was_running:
+            self.api_generations += 1
+        if component == "live" and record.state == "RUNNING":
+            self.live_generations += 1
+        return record
+
+    def last_start_spawned(self, component):
+        return self._last_start_spawned.get(component, False)
+
+    def stop_component(self, component, **_kwargs):
+        self.stopped.append(component)
+        record = self.records[component]
+        record.state = "STOPPED"
+        record.desired_state = "STOPPED"
+        return record
+
+
+class FakeBootstrap:
+    async def ensure_ready(self, _database):
+        return SimpleNamespace(
+            ready=True,
+            launch_state="REUSED",
+            pid=1,
+            checks={"terminal": "CONNECTED", "account": "VERIFIED", "market_data": "READY"},
+            verification={},
+        )
+
+
+def _lifecycle_service(
+    tmp_path: Path,
+    database: Database,
+    supervisor: FakeLifecycleSupervisor,
+) -> TelegramControlService:
+    service = TelegramControlService(
+        Settings(demo_execution_enabled=True, forward_shadow_enabled=False),
+        tmp_path,
+        database=database,
+        supervisor=supervisor,
+        mt5_bootstrap=FakeBootstrap(),
+    )
+    return service
 
 
 @pytest.fixture
@@ -253,6 +325,100 @@ def test_web_lifecycle_requests_are_serialized(
 
     asyncio.run(run_pair())
     assert maximum == 1
+
+
+def test_control_plane_bootstraps_api_without_starting_live(
+    control_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = FakeLifecycleSupervisor(api_state="STOPPED", live_state="STOPPED")
+    service = _lifecycle_service(tmp_path, control_database, supervisor)
+    monkeypatch.setattr(service, "_api_responsive", lambda: asyncio.sleep(0, result=True))
+
+    assert asyncio.run(service._ensure_control_plane_api()) is True
+    assert supervisor.started == ["api"]
+    assert supervisor.records["api"].state == "RUNNING"
+    assert supervisor.records["live"].state == "STOPPED"
+
+
+def test_web_start_stop_restart_preserve_one_api_control_plane(
+    control_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = FakeLifecycleSupervisor()
+    service = _lifecycle_service(tmp_path, control_database, supervisor)
+    monkeypatch.setattr(control_module, "migrate_database", lambda *_args: None)
+    service._monitoring_is_healthy = lambda: asyncio.sleep(0, result=False)
+    service._wait_for_startup_verification = lambda: asyncio.sleep(0, result={
+        "complete": True,
+        "checks": {
+            "api": "OK",
+            "live_runtime": "CONNECTED",
+            "mt5": "CONNECTED",
+            "snapshot": "COMPLETE",
+            "database": "CONNECTED",
+            "forward": "DISABLED",
+        },
+    })
+    service._system_ready_response = lambda *_args, **_kwargs: "READY"
+
+    operation_id = str(uuid4())
+    started = asyncio.run(
+        service._handle_ipc_request({"command": "start", "operation_id": operation_id})
+    )
+    replay = asyncio.run(
+        service._handle_ipc_request({"command": "start", "operation_id": operation_id})
+    )
+    assert started["ok"] is True
+    assert replay["duplicate"] is True
+    assert supervisor.live_generations == 1
+    assert supervisor.records["api"].state == "RUNNING"
+    assert supervisor.records["live"].state == "RUNNING"
+
+    stopped = asyncio.run(
+        service._handle_ipc_request({"command": "stop", "operation_id": str(uuid4())})
+    )
+    assert stopped["ok"] is True
+    assert supervisor.records["live"].state == "STOPPED"
+    assert supervisor.records["api"].state == "RUNNING"
+    assert supervisor.stopped == ["live"]
+    assert "Control Plane" in stopped["message"]
+    assert stopped["status"]["supervisor"] == "CONNECTED"
+
+    demo_on = asyncio.run(
+        service._handle_ipc_request({"command": "demo_on", "operation_id": str(uuid4())})
+    )
+    assert demo_on["ok"] is True
+    assert demo_execution_armed(control_database) is True
+    demo_off = asyncio.run(
+        service._handle_ipc_request({"command": "demo_off", "operation_id": str(uuid4())})
+    )
+    assert demo_off["ok"] is True
+    assert demo_execution_armed(control_database) is False
+
+    restarted = asyncio.run(
+        service._handle_ipc_request({"command": "restart", "operation_id": str(uuid4())})
+    )
+    assert restarted["ok"] is True
+    assert supervisor.live_generations == 2
+    assert supervisor.api_generations == 1
+    assert supervisor.records["api"].state == "RUNNING"
+    assert supervisor.records["live"].state == "RUNNING"
+    assert supervisor.stopped == ["live", "live"]
+
+
+def test_failed_live_start_rolls_back_live_only(
+    control_database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = FakeLifecycleSupervisor(live_start_state="ERROR")
+    service = _lifecycle_service(tmp_path, control_database, supervisor)
+    monkeypatch.setattr(control_module, "migrate_database", lambda *_args: None)
+    service._monitoring_is_healthy = lambda: asyncio.sleep(0, result=False)
+
+    response = asyncio.run(service._start_infrastructure_locked())
+
+    assert response.startswith("🟠 START INCOMPLETE")
+    assert supervisor.stopped == ["live"]
+    assert supervisor.records["api"].state == "RUNNING"
+    assert supervisor.records["live"].state == "STOPPED"
 
 
 def test_background_task_installer_preserves_single_hidden_control_and_battery_safety() -> None:
