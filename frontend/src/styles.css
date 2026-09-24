@@ -28,6 +28,68 @@
 .auth-card button { margin-top: 10px; }
 .auth-note { margin-top: 20px; font-size: 0.85rem; color: var(--muted); }
 
+.security-page { max-width: 1320px; }
+.security-section { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.security-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+.security-section-heading h2 { margin: 4px 0 0; font: 17px Bahnschrift, "Aptos Display", "Segoe UI Variable", sans-serif; }
+.security-actions, .security-account-actions, .security-dialog-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.security-overview-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.security-overview-card { min-width: 0; display: grid; align-content: start; gap: 7px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #111820; }
+.security-overview-card > span, .security-expiry > span { color: var(--dim); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.security-overview-card > strong { overflow-wrap: anywhere; font: 15px "Cascadia Code", Consolas, monospace; }
+.security-overview-card > small { color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.security-account-list { display: grid; gap: 9px; }
+.security-account-card, .security-session-card { min-width: 0; padding: 13px; border: 1px solid var(--line); border-radius: 8px; background: #111820; }
+.security-account-card.selected { border-color: #42617a; }
+.security-account-main { min-width: 0; }
+.security-account-title, .security-session-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.security-account-title > strong, .security-session-heading > strong { overflow-wrap: anywhere; font-size: 13px; }
+.security-state { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 999px; font-size: 9px; font-weight: 750; letter-spacing: .06em; }
+.security-state.active { color: var(--green); border-color: #315943; background: #102019; }
+.security-state.pending { color: var(--amber); border-color: #5c4a28; background: #211b10; }
+.security-state.disabled { color: #e89a9a; border-color: #5d3638; background: #211416; }
+.security-metadata { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 11px 18px; margin: 13px 0; }
+.security-metadata > div { min-width: 0; display: grid; gap: 4px; }
+.security-metadata dt { color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+.security-metadata dd { min-width: 0; margin: 0; color: var(--text); font-size: 10px; overflow-wrap: anywhere; }
+.security-account-actions { justify-content: flex-end; }
+.security-danger { color: #f0a0a0; border-color: #60383a; background: #211416; }
+.security-danger:disabled { opacity: .5; cursor: not-allowed; }
+.security-session-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.security-session-toolbar label, .security-form label, .security-confirm-label { color: var(--muted); font-size: 10px; }
+.security-session-toolbar select, .security-form input, .security-dialog input { min-height: 36px; max-width: 100%; padding: 7px 10px; color: var(--text); border: 1px solid var(--line-strong); border-radius: 6px; background: #10161d; }
+.security-session-card { margin-top: 8px; }
+.security-session-card > .text-button { margin-top: 2px; }
+.security-limitation, .security-copy, .security-audit-note p { margin: 12px 0 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.security-audit-note p { max-width: 850px; }
+.security-inline-status { margin: 10px 0 0; color: var(--amber); font-size: 10px; }
+.security-resource-state, .security-notice, .security-message { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.security-resource-state { margin: 7px 0; }
+.security-resource-state.loading { color: var(--blue); }
+.security-resource-state.error, .security-resource-state.unavailable, .security-notice { color: #efb4b4; border-color: #59383b; background: #1c1417; }
+.security-message { margin-bottom: 10px; }
+.security-message.success { color: #a8dfbb; border-color: #315943; background: #102019; }
+.security-message.error { color: #efb4b4; border-color: #59383b; background: #1c1417; }
+.security-notice { align-items: center; max-width: 650px; }
+.security-notice div { display: grid; gap: 4px; }
+.security-dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 16px; background: #03070bd9; }
+.security-dialog { width: min(100%, 540px); max-height: min(88vh, 760px); overflow: auto; padding: 17px; border: 1px solid #3a4654; border-radius: 11px; background: var(--panel-raised); box-shadow: 0 22px 70px #000b; }
+.security-dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.security-dialog-heading h2 { margin: 0; font: 18px Bahnschrift, "Aptos Display", "Segoe UI Variable", sans-serif; }
+.security-dialog-body { display: grid; gap: 12px; padding-top: 13px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.security-dialog-body p { margin: 0; }
+.security-dialog-body strong { color: var(--text); overflow-wrap: anywhere; }
+.security-dialog-body .security-dialog-actions { justify-content: flex-end; margin-top: 5px; }
+.security-form { display: grid; gap: 9px; }
+.security-form input, .security-dialog input { width: 100%; }
+.security-form p { margin: 0 0 4px; }
+.security-secret-warning { color: #f0c86b; font-size: 12px; font-weight: 800; letter-spacing: .07em; }
+.security-secret { display: block; padding: 12px; border: 1px solid #68572d; border-radius: 7px; background: #17150f; color: #f6dda0; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
+.security-expiry { display: flex; justify-content: space-between; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; }
+.security-expiry strong { text-align: right; }
+.security-expiry strong.expired { color: var(--red); }
+.security-confirm-label { display: grid; gap: 4px; }
+
 * { box-sizing: border-box; }
 html { background: var(--canvas); }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--canvas); color: var(--text); }
@@ -324,6 +386,22 @@ tbody tr:hover { background: #171e26; }
   .safety-footer { padding: 0 10px; }
   .safety-footer span { display: none; }
   .safety-footer strong { margin-left: auto; }
+  .security-page .page-heading { gap: 12px; }
+  .security-section { padding: 12px; }
+  .security-section-heading { align-items: flex-start; flex-direction: column; }
+  .security-overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .security-overview-card { padding: 10px; }
+  .security-overview-card > strong { font-size: 12px; }
+  .security-account-card, .security-session-card { padding: 10px; }
+  .security-metadata { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .security-account-actions { justify-content: flex-start; }
+  .security-session-toolbar > * { flex: 1 1 100%; }
+  .security-session-toolbar select { width: 100%; }
+  .security-actions { width: 100%; }
+  .security-actions .text-button { flex: 1 1 auto; justify-content: center; }
+  .security-dialog { padding: 13px; }
+  .security-dialog-body .security-dialog-actions { justify-content: stretch; }
+  .security-dialog-actions .text-button { flex: 1 1 auto; justify-content: center; min-height: 36px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

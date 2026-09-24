@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 
 import {
   getAuthSession,
@@ -7,6 +13,7 @@ import {
   PRIVATE_DASHBOARD,
   type AuthSession,
 } from "../lib/api";
+import { AuthSessionContext } from "./authSessionContext";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<AuthSession | null>(null);
@@ -47,7 +54,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
     await loginRequest(login, password);
     await refresh();
   }} />;
-  return <>{children}</>;
+  return (
+    <AuthSessionContext.Provider value={session}>
+      {children}
+    </AuthSessionContext.Provider>
+  );
 }
 
 function LoginPage({ onLogin }: { onLogin: (login: string, password: string) => Promise<void> }) {

@@ -93,6 +93,30 @@ describe("browser authentication API contract", () => {
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "xauusd:csrf-rejected" }));
   });
 
+  it("uses the centralized CSRF path for DELETE and does not retry rejection", async () => {
+    vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
+    vi.resetModules();
+    const csrf = "C".repeat(86);
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ csrf_token: csrf }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "CSRF_REJECTED" }), { status: 403 }));
+    vi.stubGlobal("fetch", fetcher);
+    const { deleteJson } = await import("./api");
+
+    await expect(deleteJson("/api/auth/admin/accounts/admin-1/sessions")).rejects.toThrow("CSRF_REJECTED");
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenNthCalledWith(2,
+      "/api/auth/admin/accounts/admin-1/sessions",
+      expect.objectContaining({
+        method: "DELETE",
+        headers: expect.objectContaining({ "X-CSRF-Token": csrf }),
+      }),
+    );
+    expect(window.localStorage.length).toBe(0);
+    expect(window.sessionStorage.length).toBe(0);
+  });
+
   it("keeps GET requests free of mutation-token acquisition", async () => {
     vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
     vi.resetModules();

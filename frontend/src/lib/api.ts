@@ -15,6 +15,26 @@ export interface AuthSession {
   session?: { idle_expires_at: string; absolute_expires_at: string };
 }
 
+export class ApiRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(code ?? `Request failed (${status})`);
+    this.name = "ApiRequestError";
+  }
+}
+
+async function responseError(response: Response): Promise<ApiRequestError> {
+  const payload: unknown = await response.clone().json().catch(() => null);
+  const code =
+    typeof payload === "object" && payload !== null && "code" in payload &&
+    typeof payload.code === "string"
+      ? payload.code
+      : undefined;
+  return new ApiRequestError(response.status, code);
+}
+
 export function isAuthSession(value: unknown): value is AuthSession {
   if (typeof value !== "object" || value === null || !("authenticated" in value)) {
     return false;
@@ -158,7 +178,7 @@ export async function requestJson<T>(
   });
   notifyUnauthorized(response);
   if (!response.ok) {
-    throw new Error(`Request failed (${response.status})`);
+    throw await responseError(response);
   }
   return (await response.json()) as T;
 }
@@ -188,11 +208,11 @@ export async function postJson<T>(
   if (!isApiConfigured(config)) {
     throw new Error("BACKEND_NOT_CONFIGURED");
   }
-  const response = await fetcherForApi(path, config, body, signal);
+  const response = await fetcherForApi(path, config, "POST", body, signal);
   notifyUnauthorized(response);
   await rejectCsrfIfNeeded(response);
   if (!response.ok) {
-    throw new Error(`Request failed (${response.status})`);
+    throw await responseError(response);
   }
   return (await response.json()) as T;
 }
@@ -200,21 +220,40 @@ export async function postJson<T>(
 async function fetcherForApi(
   path: string,
   config: ApiRuntimeConfig,
-  body: Record<string, unknown>,
+  method: "POST" | "DELETE",
+  body?: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<Response> {
   const csrfToken = PRIVATE_DASHBOARD ? await acquireCsrfToken() : null;
   return fetch(apiUrl(path, config.apiBase), {
-    method: "POST",
+    method,
     credentials: config.apiBase ? "include" : "same-origin",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
       ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
     },
-    body: JSON.stringify(body),
+    ...(body ? { body: JSON.stringify(body) } : {}),
     signal,
   });
+}
+
+export async function deleteJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const config = {
+    apiBase: API_BASE,
+    privateDashboard: PRIVATE_DASHBOARD,
+    production: import.meta.env.PROD,
+  };
+  if (!isApiConfigured(config)) {
+    throw new Error("BACKEND_NOT_CONFIGURED");
+  }
+  const response = await fetcherForApi(path, config, "DELETE", undefined, signal);
+  notifyUnauthorized(response);
+  await rejectCsrfIfNeeded(response);
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  return (await response.json()) as T;
 }
 
 export function websocketUrl(path = "/ws/live"): string {

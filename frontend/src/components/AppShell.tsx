@@ -17,6 +17,7 @@ import {
   RadioTower,
   X,
   SlidersHorizontal,
+  Shield,
 } from "lucide-react";
 import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -27,6 +28,7 @@ import { BangkokClock } from "./BangkokClock";
 import { SystemHealthProvider } from "./SystemHealthProvider";
 import { useSystemHealth } from "./useSystemHealth";
 import { logoutRequest, PRIVATE_DASHBOARD } from "../lib/api";
+import { useCurrentAuthSession } from "../auth/authSessionContext";
 
 const nav = [
   ["/", "Overview", LayoutDashboard],
@@ -43,6 +45,7 @@ const nav = [
   ["/logs", "Logs", FileClock],
   ["/settings", "Settings", Settings],
   ["/control", "Operator Control", SlidersHorizontal],
+  ["/security", "Security", Shield],
 ] as const;
 
 export function AppShell() {
@@ -50,6 +53,8 @@ export function AppShell() {
 }
 
 function AppShellContent() {
+  const authSession = useCurrentAuthSession();
+  const owner = authSession?.authenticated === true && authSession.user?.role === "OWNER";
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
@@ -77,7 +82,7 @@ function AppShellContent() {
           <small>Execution disabled</small>
         </div>
         <nav aria-label="Primary navigation">
-          {nav.map(([to, label, Icon]) => (
+          {nav.filter(([to]) => to !== "/security" || owner).map(([to, label, Icon]) => (
             <NavLink key={to} to={to} end={to === "/"} onClick={() => setMobileOpen(false)}>
               <Icon size={17} strokeWidth={1.7} aria-hidden="true" />
               <span>{label}</span>
