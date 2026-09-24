@@ -25,6 +25,15 @@ export class ApiRequestError extends Error {
   }
 }
 
+export type LoginFailureKind = "invalid_credentials" | "unavailable" | "malformed_response";
+
+export class LoginRequestError extends Error {
+  constructor(readonly kind: LoginFailureKind) {
+    super(kind);
+    this.name = "LoginRequestError";
+  }
+}
+
 async function responseError(response: Response): Promise<ApiRequestError> {
   const payload: unknown = await response.clone().json().catch(() => null);
   const code =
@@ -109,14 +118,36 @@ export async function getAuthSession(): Promise<AuthSession> {
 
 export async function loginRequest(login: string, password: string): Promise<void> {
   csrfTokenInMemory = null;
-  const response = await fetch("/api/auth/login", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ login, password }),
-  });
-  if (!response.ok) throw new Error("Invalid login or password");
-  if (PRIVATE_DASHBOARD) await acquireCsrfToken();
+  let response: Response;
+  try {
+    response = await fetch("/api/auth/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ login, password }),
+    });
+  } catch {
+    throw new LoginRequestError("unavailable");
+  }
+  if (response.status === 401) throw new LoginRequestError("invalid_credentials");
+  if (!response.ok) throw new LoginRequestError("unavailable");
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new LoginRequestError("malformed_response");
+  }
+  if (!isAuthSession(payload) || payload.authenticated !== true) {
+    throw new LoginRequestError("malformed_response");
+  }
+  if (PRIVATE_DASHBOARD) {
+    try {
+      await acquireCsrfToken();
+    } catch {
+      throw new LoginRequestError("unavailable");
+    }
+  }
 }
 
 export async function logoutRequest(): Promise<void> {

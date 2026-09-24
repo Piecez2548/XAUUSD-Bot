@@ -20,13 +20,71 @@
   --radius: 10px;
 }
 
-.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--canvas); }
-.auth-card { width: min(100%, 420px); padding: 28px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: 0 18px 54px #0005; }
-.auth-card h1 { margin: 8px 0; }
-.auth-card form { display: grid; gap: 10px; margin-top: 24px; }
-.auth-card input { min-height: 42px; padding: 8px 12px; color: inherit; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--canvas); }
-.auth-card button { margin-top: 10px; }
-.auth-note { margin-top: 20px; font-size: 0.85rem; color: var(--muted); }
+.auth-shell {
+  position: relative;
+  isolation: isolate;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: clamp(18px, 4vw, 44px);
+  overflow: hidden;
+  background: radial-gradient(ellipse at 50% 35%, #172532 0%, #0d151d 43%, var(--canvas) 78%);
+}
+.auth-shell::before, .auth-shell::after {
+  position: absolute;
+  z-index: -1;
+  width: min(56vw, 520px);
+  aspect-ratio: 1;
+  border: 1px solid #ffffff08;
+  border-radius: 50%;
+  content: "";
+  pointer-events: none;
+}
+.auth-shell::before { transform: scale(1.28); }
+.auth-shell::after { transform: scale(1.62); }
+.auth-card {
+  width: min(100%, 470px);
+  padding: clamp(24px, 5vw, 38px);
+  border: 1px solid #354250;
+  border-radius: 15px;
+  background: linear-gradient(150deg, #18212b 0%, #121920 75%);
+  box-shadow: 0 28px 90px #0008, inset 0 1px #ffffff0b;
+}
+.auth-brand { display: flex; align-items: center; gap: 12px; padding-bottom: 23px; border-bottom: 1px solid var(--line); }
+.auth-brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid #426174; border-radius: 9px; color: #8ac7e9; background: #142734; }
+.auth-brand-copy { display: grid; min-width: 0; gap: 3px; }
+.auth-brand-copy strong { color: #eaf1f7; font: 750 10px "Cascadia Code", Consolas, monospace; letter-spacing: .11em; }
+.auth-brand-copy > span { color: var(--muted); font-size: 11px; }
+.auth-private-badge { margin-left: auto; padding: 5px 8px; border: 1px solid #315943; border-radius: 999px; color: #8cdbb0; background: #102019; font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.auth-heading { padding-top: 29px; }
+.auth-eyebrow { color: #83b9dd; font: 750 9px "Cascadia Code", Consolas, monospace; letter-spacing: .12em; }
+.auth-heading h1 { margin: 9px 0 5px; color: #f0f4f8; font: 600 clamp(25px, 6vw, 30px) Bahnschrift, "Aptos Display", "Segoe UI Variable", sans-serif; letter-spacing: -.025em; }
+.auth-heading p { margin: 0; color: #aab6c3; font-size: 13px; line-height: 1.55; }
+.auth-form { display: grid; gap: 17px; margin-top: 27px; }
+.auth-field { display: grid; gap: 7px; }
+.auth-field label { color: #d1dae4; font-size: 11px; font-weight: 650; }
+.auth-card input { width: 100%; min-width: 0; min-height: 46px; padding: 10px 12px; border: 1px solid #3a4653; border-radius: 7px; outline: none; color: #edf2f7; background: #0c131a; font-size: 13px; transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
+.auth-card input:hover:not(:disabled) { border-color: #566879; }
+.auth-card input:focus-visible { border-color: #70b5df; background: #0e1720; box-shadow: 0 0 0 3px #69b9e522; }
+.auth-card input:disabled { opacity: .72; }
+.auth-password-field { position: relative; display: flex; align-items: center; }
+.auth-password-field input { padding-right: 48px; }
+.auth-password-toggle { position: absolute; right: 5px; width: 36px; height: 36px; display: grid; place-items: center; border: 0; border-radius: 5px; color: #9baaba; background: transparent; cursor: pointer; }
+.auth-password-toggle:hover:not(:disabled) { color: #d9e9f3; background: #ffffff0a; }
+.auth-password-toggle:disabled { opacity: .45; cursor: not-allowed; }
+.auth-error { margin: -3px 0 0; padding: 10px 11px; border: 1px solid #653b3e; border-radius: 7px; color: #ffc0c0; background: #291719; font-size: 11px; line-height: 1.5; }
+.auth-submit { min-height: 46px; display: flex; align-items: center; justify-content: center; gap: 9px; margin-top: 2px; border: 1px solid #4a87a7; border-radius: 7px; color: #f3f8fb; background: linear-gradient(180deg, #28617d, #1c4c65); box-shadow: inset 0 1px #ffffff18, 0 5px 18px #07101866; font: 800 10px "Cascadia Code", Consolas, monospace; letter-spacing: .11em; cursor: pointer; transition: filter .16s ease, transform .16s ease, opacity .16s ease; }
+.auth-submit:hover:not(:disabled) { filter: brightness(1.13); transform: translateY(-1px); }
+.auth-submit:disabled { opacity: .68; cursor: wait; }
+.auth-spinner { width: 13px; height: 13px; border: 2px solid #ffffff55; border-top-color: #fff; border-radius: 50%; animation: auth-spin .7s linear infinite; }
+@keyframes auth-spin { to { transform: rotate(360deg); } }
+.auth-footer { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 23px; padding-top: 17px; border-top: 1px solid var(--line); color: #91a0ae; font-size: 9px; }
+.auth-footer i { width: 3px; height: 3px; border-radius: 50%; background: #6e8294; }
+@media (max-width: 420px) {
+  .auth-shell { padding: 14px; }
+  .auth-card { padding: 22px 19px; }
+  .auth-footer { gap: 6px; font-size: 8px; }
+}
 
 .security-page { max-width: 1320px; }
 .security-section { margin-top: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }

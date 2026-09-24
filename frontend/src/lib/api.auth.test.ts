@@ -4,6 +4,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getAuthSession, logoutRequest } from "./api";
 
+const authenticatedPayload = {
+  authenticated: true,
+  user: { id: "owner-1", login: "owner@example.test", role: "OWNER", state: "ACTIVE" },
+  session: {
+    idle_expires_at: "2026-09-24T12:00:00Z",
+    absolute_expires_at: "2026-09-25T00:00:00Z",
+  },
+};
+
 describe("browser authentication API contract", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -48,7 +57,7 @@ describe("browser authentication API contract", () => {
     vi.resetModules();
     const csrf = "A".repeat(86);
     const fetcher = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(authenticatedPayload), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ csrf_token: csrf }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ authenticated: false }), { status: 200 }));
     vi.stubGlobal("fetch", fetcher);
@@ -69,6 +78,57 @@ describe("browser authentication API contract", () => {
     }));
     expect(window.localStorage.length).toBe(0);
     expect(window.sessionStorage.length).toBe(0);
+  });
+
+  it("maps invalid credentials to the generic authentication failure", async () => {
+    vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
+    vi.resetModules();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "account-specific detail" }), { status: 401 }),
+    ));
+    const { loginRequest: request } = await import("./api");
+    await expect(request("operator", "secret")).rejects.toMatchObject({
+      name: "LoginRequestError",
+      kind: "invalid_credentials",
+    });
+  });
+
+  it("maps network failures to an unavailable service without exposing details", async () => {
+    vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
+    vi.resetModules();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockRejectedValue(
+      new TypeError("sensitive transport diagnostic"),
+    ));
+    const { loginRequest: request } = await import("./api");
+    const failure = await request("operator", "secret").catch((error: unknown) => error);
+    expect(failure).toMatchObject({ kind: "unavailable" });
+    expect(failure).not.toHaveProperty("message", "sensitive transport diagnostic");
+  });
+
+  it("rejects malformed successful login response envelopes", async () => {
+    vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
+    vi.resetModules();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("not-json", { status: 200 }),
+    ));
+    const { loginRequest: request } = await import("./api");
+    await expect(request("operator", "secret")).rejects.toMatchObject({
+      kind: "malformed_response",
+    });
+  });
+
+  it("rejects structurally invalid login payloads before requesting CSRF authority", async () => {
+    vi.stubEnv("VITE_PRIVATE_DASHBOARD", "true");
+    vi.resetModules();
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ authenticated: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const { loginRequest: request } = await import("./api");
+    await expect(request("operator", "secret")).rejects.toMatchObject({
+      kind: "malformed_response",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("obtains in-memory CSRF authority before a private mutation and does not retry rejection", async () => {
