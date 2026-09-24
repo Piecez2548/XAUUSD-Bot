@@ -8,6 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from config.csrf_policy import origin_key
+
 DEFAULT_CANDLE_COUNTS: dict[str, int] = {
     "M5": 1_000,
     "M15": 1_000,
@@ -122,6 +124,7 @@ class Settings:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     )
+    csrf_trusted_origins: tuple[str, ...] = ()
     max_trade_risk_percent: float = 2.0
     max_aggregate_risk_percent: float = 6.0
     demo_execution_enabled: bool = False
@@ -161,6 +164,8 @@ class Settings:
     def __post_init__(self) -> None:
         if "*" in self.cors_origins:
             raise ConfigurationError("CORS_ORIGINS must not contain wildcard origins")
+        if any(origin_key(origin) is None for origin in self.csrf_trusted_origins):
+            raise ConfigurationError("CSRF_TRUSTED_ORIGINS must contain exact HTTP(S) origins")
         supplied = (self.mt5_login, self.mt5_server, self.mt5_password)
         if any(value is not None for value in supplied) and not all(
             value is not None for value in supplied
@@ -291,6 +296,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             "CORS_ORIGINS",
             ("http://localhost:5173", "http://127.0.0.1:5173"),
         ),
+        csrf_trusted_origins=_origins("CSRF_TRUSTED_ORIGINS", ()),
         max_trade_risk_percent=float(os.getenv("MAX_TRADE_RISK_PERCENT", "2")),
         max_aggregate_risk_percent=float(os.getenv("MAX_AGGREGATE_RISK_PERCENT", "6")),
         demo_execution_enabled=_boolean("DEMO_EXECUTION_ENABLED"),

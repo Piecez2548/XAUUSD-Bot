@@ -28,7 +28,11 @@ def _client(tmp_path: Path, *, private: bool = False) -> tuple[TestClient, Datab
     original_root = app_module.PROJECT_ROOT
     app_module.PROJECT_ROOT = tmp_path
     app = app_module.create_app(
-        settings=Settings(remote_dashboard_mode=private), database=database
+        settings=Settings(
+            remote_dashboard_mode=private,
+            csrf_trusted_origins=("https://dashboard.tailnet.test",) if private else (),
+        ),
+        database=database,
     )
     client = TestClient(app, base_url="https://dashboard.tailnet.test")
     client._dashboard_original_root = original_root
@@ -102,7 +106,10 @@ def test_private_dashboard_auth_boundary_covers_static_and_api(
         assert client.get("/").status_code == 401
         assert client.get("/api/health").status_code == 401
 
-        headers = {"Tailscale-User-Login": "operator@example.com"}
+        headers = {
+            "Tailscale-User-Login": "operator@example.com",
+            "Origin": "https://dashboard.tailnet.test",
+        }
         assert client.get("/", headers=headers).status_code == 200
         assert client.get("/api/system/health", headers=headers).status_code == 401
         AuthenticationService(database, Settings()).create_user_for_admin(

@@ -19,7 +19,17 @@ from persistence.orm import (
 from services.authentication import AuthenticationService
 
 PRE_AUTH_REVISION = "20260924_0013"
-TAILSCALE = {"Tailscale-User-Login": "operator@example.test"}
+TAILSCALE = {
+    "Tailscale-User-Login": "operator@example.test",
+    "Origin": "https://dashboard.tailnet.test",
+}
+
+
+def private_settings() -> Settings:
+    return Settings(
+        remote_dashboard_mode=True,
+        csrf_trusted_origins=("https://dashboard.tailnet.test",),
+    )
 PASSWORD = "Migration Ownership Test Password! 42"
 
 
@@ -71,7 +81,7 @@ def test_startup_at_0013_does_not_create_auth_and_migration_then_initializes(
                 )
             )
         with pytest.raises(RuntimeError, match="behind Alembic revision"):
-            create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+            create_app(settings=private_settings(), database=database)
 
         revision, tables = _revision_and_tables(database)
         assert revision == PRE_AUTH_REVISION
@@ -88,7 +98,7 @@ def test_startup_at_0013_does_not_create_auth_and_migration_then_initializes(
             assert preserved.configuration == {"preserve": True}
             assert preserved.checksum == "a" * 64
 
-        app = create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+        app = create_app(settings=private_settings(), database=database)
         with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
             assert client.get("/api/auth/session", headers=TAILSCALE).json() == {
                 "authenticated": False
@@ -345,7 +355,7 @@ def test_0015_test_schema_keeps_auth_tables_valid(tmp_path: Path) -> None:
     database = Database.for_test(f"sqlite:///{(tmp_path / 'revision-0015.db').as_posix()}")
     database.create_test_schema()
     try:
-        app = create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+        app = create_app(settings=private_settings(), database=database)
         with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
             assert client.get("/api/auth/session", headers=TAILSCALE).json() == {
                 "authenticated": False
@@ -367,7 +377,7 @@ def test_private_app_fails_closed_when_auth_tables_are_missing(
         _stamp(database, revision)
     try:
         with pytest.raises(RuntimeError, match="Alembic|auth schema"):
-            create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+            create_app(settings=private_settings(), database=database)
         _, tables = _revision_and_tables(database)
         assert not (AUTH_SCHEMA_TABLE_NAMES & tables)
     finally:
@@ -381,7 +391,7 @@ def test_private_app_fails_closed_on_partial_auth_schema(tmp_path: Path) -> None
     AuthUserRecord.__table__.create(database.engine)
     try:
         with pytest.raises(RuntimeError, match="auth schema is incomplete"):
-            create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+            create_app(settings=private_settings(), database=database)
         _, tables = _revision_and_tables(database)
         assert tables.isdisjoint(AUTH_SCHEMA_TABLE_NAMES - {"auth_users"})
     finally:
@@ -394,7 +404,7 @@ def test_private_app_fails_closed_when_database_is_unavailable(tmp_path: Path) -
     database = Database(f"sqlite:///{unavailable_path.as_posix()}")
     try:
         with pytest.raises(RuntimeError, match="auth schema initialization failed"):
-            create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+            create_app(settings=private_settings(), database=database)
     finally:
         database.dispose()
 
@@ -557,7 +567,7 @@ def test_private_startup_rejects_malformed_auth_schema(
     _create_auth_schema_fixture(database, defect)
     try:
         with pytest.raises(RuntimeError, match="auth schema is incompatible"):
-            create_app(settings=Settings(remote_dashboard_mode=True), database=database)
+            create_app(settings=private_settings(), database=database)
     finally:
         database.dispose()
 

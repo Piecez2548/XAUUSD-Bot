@@ -6,6 +6,8 @@
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 export const PRIVATE_DASHBOARD =
   (import.meta.env.VITE_PRIVATE_DASHBOARD ?? "").trim().toLowerCase() === "true";
+const CSRF_TOKEN_PATTERN = /^[A-Za-z0-9_-]{86}$/;
+let csrfTokenInMemory: string | null = null;
 
 export interface AuthSession {
   authenticated: boolean;
@@ -38,11 +40,42 @@ export function isAuthSession(value: unknown): value is AuthSession {
 
 function notifyUnauthorized(response: Response): void {
   if (response.status === 401 && PRIVATE_DASHBOARD) {
+    csrfTokenInMemory = null;
     window.dispatchEvent(new Event("xauusd:auth-required"));
   }
 }
 
+async function acquireCsrfToken(): Promise<string> {
+  if (!PRIVATE_DASHBOARD) throw new Error("CSRF token is available only in the private dashboard");
+  if (csrfTokenInMemory) return csrfTokenInMemory;
+  const response = await fetch("/api/auth/csrf", { credentials: "same-origin" });
+  notifyUnauthorized(response);
+  if (!response.ok) throw new Error("Unable to obtain mutation security token");
+  const payload: unknown = await response.json();
+  if (
+    typeof payload !== "object" || payload === null ||
+    !("csrf_token" in payload) || typeof payload.csrf_token !== "string" ||
+    !CSRF_TOKEN_PATTERN.test(payload.csrf_token)
+  ) {
+    throw new Error("Invalid mutation security token response");
+  }
+  csrfTokenInMemory = payload.csrf_token;
+  return csrfTokenInMemory;
+}
+
+async function rejectCsrfIfNeeded(response: Response): Promise<void> {
+  if (response.status !== 403) return;
+  const payload: unknown = await response.clone().json().catch(() => null);
+  if (typeof payload === "object" && payload !== null &&
+      "code" in payload && payload.code === "CSRF_REJECTED") {
+    csrfTokenInMemory = null;
+    window.dispatchEvent(new Event("xauusd:csrf-rejected"));
+    throw new Error("CSRF_REJECTED");
+  }
+}
+
 export async function getAuthSession(): Promise<AuthSession> {
+  csrfTokenInMemory = null;
   const response = await fetch("/api/auth/session", { credentials: "same-origin" });
   if (!response.ok) {
     notifyUnauthorized(response);
@@ -50,10 +83,12 @@ export async function getAuthSession(): Promise<AuthSession> {
   }
   const payload: unknown = await response.json();
   if (!isAuthSession(payload)) throw new Error("Invalid session response");
+  if (payload.authenticated && PRIVATE_DASHBOARD) await acquireCsrfToken();
   return payload;
 }
 
 export async function loginRequest(login: string, password: string): Promise<void> {
+  csrfTokenInMemory = null;
   const response = await fetch("/api/auth/login", {
     method: "POST",
     credentials: "same-origin",
@@ -61,18 +96,27 @@ export async function loginRequest(login: string, password: string): Promise<voi
     body: JSON.stringify({ login, password }),
   });
   if (!response.ok) throw new Error("Invalid login or password");
+  if (PRIVATE_DASHBOARD) await acquireCsrfToken();
 }
 
 export async function logoutRequest(): Promise<void> {
+  const csrfToken = PRIVATE_DASHBOARD ? await acquireCsrfToken() : null;
   const response = await fetch("/api/auth/logout", {
     method: "POST",
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+    },
     body: "{}",
   });
+  notifyUnauthorized(response);
+  await rejectCsrfIfNeeded(response);
   if (!response.ok) {
     throw new Error("Sign out failed; server session state is unknown");
   }
+  csrfTokenInMemory = null;
   window.dispatchEvent(new Event("xauusd:auth-required"));
 }
 
@@ -146,6 +190,7 @@ export async function postJson<T>(
   }
   const response = await fetcherForApi(path, config, body, signal);
   notifyUnauthorized(response);
+  await rejectCsrfIfNeeded(response);
   if (!response.ok) {
     throw new Error(`Request failed (${response.status})`);
   }
@@ -158,10 +203,15 @@ async function fetcherForApi(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<Response> {
+  const csrfToken = PRIVATE_DASHBOARD ? await acquireCsrfToken() : null;
   return fetch(apiUrl(path, config.apiBase), {
     method: "POST",
     credentials: config.apiBase ? "include" : "same-origin",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+    },
     body: JSON.stringify(body),
     signal,
   });

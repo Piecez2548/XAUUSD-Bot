@@ -178,7 +178,10 @@ def test_authenticated_control_endpoints_and_unauthenticated_denial(
 ) -> None:
     fake = FakeControlIpc()
     app = create_app(
-        settings=Settings(remote_dashboard_mode=True),
+        settings=Settings(
+            remote_dashboard_mode=True,
+            csrf_trusted_origins=("https://dashboard.tailnet.test",),
+        ),
         database=control_database,
         control_ipc=fake,
     )
@@ -195,7 +198,10 @@ def test_authenticated_control_endpoints_and_unauthenticated_denial(
             client.post("/api/control/start", json={"operation_id": str(uuid4())}).status_code
             == 401
         )
-        headers = {"Tailscale-User-Login": "operator@example.com"}
+        headers = {
+            "Tailscale-User-Login": "operator@example.com",
+            "Origin": "https://dashboard.tailnet.test",
+        }
         assert client.post(
             "/api/auth/login",
             headers=headers,
@@ -208,14 +214,24 @@ def test_authenticated_control_endpoints_and_unauthenticated_denial(
         assert (
             client.post(
                 "/api/control/start",
-                headers=headers,
+                headers={
+                    **headers,
+                    "X-CSRF-Token": client.get("/api/auth/csrf", headers=headers).json()[
+                        "csrf_token"
+                    ],
+                },
                 json={"operation_id": str(uuid4())},
             ).status_code
             == 200
         )
         assert client.post(
             "/api/control/start",
-            headers=headers,
+            headers={
+                **headers,
+                "X-CSRF-Token": client.get("/api/auth/csrf", headers=headers).json()[
+                    "csrf_token"
+                ],
+            },
             json={"operation_id": str(uuid4()), "command": "shell"},
         ).status_code == 422
         assert client.post(

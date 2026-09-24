@@ -23,7 +23,10 @@ INTELLIGENCE_ROUTES = (
     "/api/intelligence/evidence",
     "/api/intelligence/alerts",
 )
-TAILSCALE_HEADERS = {"Tailscale-User-Login": "operator@example.com"}
+TAILSCALE_HEADERS = {
+    "Tailscale-User-Login": "operator@example.com",
+    "Origin": "https://dashboard.tailnet.test",
+}
 
 
 def _database(tmp_path) -> Database:
@@ -93,7 +96,10 @@ def test_intelligence_routes_return_deterministic_read_only_schema(tmp_path) -> 
 def test_private_intelligence_boundary_requires_identity_and_allows_only_get(tmp_path, path: str) -> None:
     database = _database(tmp_path)
     _insert_intelligence(database)
-    settings = Settings(remote_dashboard_mode=True)
+    settings = Settings(
+        remote_dashboard_mode=True,
+        csrf_trusted_origins=("https://dashboard.tailnet.test",),
+    )
     app = create_app(settings=settings, database=database)
     with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
         AuthenticationService(database, settings).create_user_for_admin(
@@ -118,7 +124,10 @@ def test_private_intelligence_boundary_requires_identity_and_allows_only_get(tmp
 
 def test_private_intelligence_unknown_and_lifecycle_routes_remain_denied(tmp_path) -> None:
     database = _database(tmp_path)
-    settings = Settings(remote_dashboard_mode=True)
+    settings = Settings(
+        remote_dashboard_mode=True,
+        csrf_trusted_origins=("https://dashboard.tailnet.test",),
+    )
     with TestClient(create_app(settings=settings, database=database)) as client:
         assert client.get("/api/intelligence/unknown", headers=TAILSCALE_HEADERS).status_code == 404
         for lifecycle_path in ("/api/start", "/api/stop", "/api/restart"):

@@ -30,8 +30,9 @@ ADMIN_IDENTITY = "admin@tailnet.example"
 OWNER_LOGIN = "owner@example.test"
 ADMIN_LOGIN = "admin@example.test"
 PASSWORD = "Correct Horse Battery Staple 42!"
-TAILSCALE_OWNER = {"Tailscale-User-Login": OWNER_IDENTITY}
-TAILSCALE_ADMIN = {"Tailscale-User-Login": ADMIN_IDENTITY}
+ORIGIN = "https://dashboard.tailnet.test"
+TAILSCALE_OWNER = {"Tailscale-User-Login": OWNER_IDENTITY, "Origin": ORIGIN}
+TAILSCALE_ADMIN = {"Tailscale-User-Login": ADMIN_IDENTITY, "Origin": ORIGIN}
 
 
 @pytest.fixture
@@ -56,7 +57,10 @@ def bootstrap_owner(database: Database) -> str:
 
 def client(database: Database) -> TestClient:
     return TestClient(
-        create_app(settings=Settings(remote_dashboard_mode=True), database=database),
+        create_app(
+            settings=Settings(remote_dashboard_mode=True, csrf_trusted_origins=(ORIGIN,)),
+            database=database,
+        ),
         base_url="https://dashboard.tailnet.test",
     )
 
@@ -64,10 +68,16 @@ def client(database: Database) -> TestClient:
 def login(client_: TestClient, login_name: str, password: str, identity: str) -> None:
     response = client_.post(
         "/api/auth/login",
-        headers={"Tailscale-User-Login": identity},
+        headers={"Tailscale-User-Login": identity, "Origin": ORIGIN},
         json={"login": login_name, "password": password},
     )
     assert response.status_code == 200, response.text
+
+
+def mutation_headers(client_: TestClient, identity: dict[str, str]) -> dict[str, str]:
+    response = client_.get("/api/auth/csrf", headers=identity)
+    assert response.status_code == 200, response.text
+    return {**identity, "X-CSRF-Token": response.json()["csrf_token"]}
 
 
 def invite_admin(database: Database, owner_id: str, *, target_identity=ADMIN_IDENTITY):
@@ -154,7 +164,7 @@ def test_concurrent_first_owner_bootstrap_has_one_winner(database: Database) -> 
 
 def test_unknown_user_and_registration_routes_never_create_accounts(database: Database) -> None:
     with client(database) as app:
-        identity = {"Tailscale-User-Login": OWNER_IDENTITY}
+        identity = {"Tailscale-User-Login": OWNER_IDENTITY, "Origin": ORIGIN}
         for path in ("/api/auth/register", "/api/auth/signup"):
             assert app.post(path, headers=identity, json={"login": OWNER_LOGIN}).status_code == 404
         assert (
@@ -242,7 +252,7 @@ def test_owner_only_api_and_admin_is_denied(database: Database) -> None:
         assert app.get("/api/auth/admin/accounts", headers=TAILSCALE_ADMIN).status_code == 403
         escalation = app.post(
             "/api/auth/admin/accounts",
-            headers=TAILSCALE_ADMIN,
+            headers=mutation_headers(app, TAILSCALE_ADMIN),
             json={
                 "login": "new-owner@example.test",
                 "role": "OWNER",
@@ -261,7 +271,7 @@ def test_owner_invitation_returns_secret_once_and_never_persists_plaintext(
         login(app, OWNER_LOGIN, PASSWORD, OWNER_IDENTITY)
         response = app.post(
             "/api/auth/admin/accounts",
-            headers=TAILSCALE_OWNER,
+            headers=mutation_headers(app, TAILSCALE_OWNER),
             json={
                 "login": ADMIN_LOGIN,
                 "role": "ADMIN",
@@ -301,7 +311,10 @@ def test_owner_invitation_returns_secret_once_and_never_persists_plaintext(
             assert admin_session_token not in listed.text
             assert hashlib.sha256(admin_session_token.encode()).hexdigest() not in listed.text
             assert len(listed.json()["sessions"]) == 1
-            revoked = app.delete(sessions_path, headers=TAILSCALE_OWNER)
+            revoked = app.delete(
+                sessions_path,
+                headers=mutation_headers(app, TAILSCALE_OWNER),
+            )
             assert revoked.status_code == 200 and revoked.json()["revoked_count"] == 1
             assert admin_app.get(
                 "/api/auth/session", headers=TAILSCALE_ADMIN

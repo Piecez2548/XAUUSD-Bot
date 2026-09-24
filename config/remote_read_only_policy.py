@@ -38,6 +38,7 @@ AUTH_ROUTE_METHODS = {
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/session"),
+    ("GET", "/api/auth/csrf"),
     ("POST", "/api/auth/enroll"),
 }
 AUTH_ADMIN_ROUTE_METHODS = {
@@ -172,7 +173,7 @@ def is_private_control_path_allowed(raw_target: str, method: str) -> bool:
 
 
 def is_auth_route_allowed(raw_target: str, method: str) -> bool:
-    """Allow only the three exact Tailscale-gated auth-core routes."""
+    """Allow only the exact Tailscale-gated authentication routes."""
 
     path = _safe_path(raw_target)
     return (method.upper(), path) in AUTH_ROUTE_METHODS

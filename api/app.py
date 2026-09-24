@@ -22,6 +22,12 @@ from sqlalchemy import Select, desc, func, or_, select
 from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
 from api.static_dashboard import DashboardStaticFiles
+from config.csrf_policy import (
+    MutationClass,
+    classify_mutation,
+    fetch_metadata_is_acceptable,
+    is_trusted_origin,
+)
 from config.remote_read_only_policy import (
     is_auth_admin_route_allowed,
     is_auth_route_allowed,
@@ -67,6 +73,7 @@ from services.authentication import (
     normalize_login,
 )
 from services.control_ipc import ControlIpcClient, ControlIpcError
+from services.csrf import issue_csrf_token, validate_csrf_token
 from services.forward_shadow import (
     forward_health,
     forward_performance,
@@ -412,7 +419,7 @@ def create_app(
 
         @app.middleware("http")
         async def enforce_private_dashboard_boundary(request: Request, call_next):
-            """Require Tailscale Serve identity and the Phase 2.6 route contract."""
+            """Apply Tailscale, session, CSRF, and route-policy checks centrally."""
 
             if not request.headers.get("Tailscale-User-Login"):
                 return JSONResponse(
@@ -426,7 +433,37 @@ def create_app(
                 allowed_auth_admin = is_auth_admin_route_allowed(path, request.method)
                 if not (allowed_control or allowed_read or allowed_auth or allowed_auth_admin):
                     return JSONResponse({"detail": "Remote route denied"}, status_code=404)
-                if not allowed_auth or path == "/api/auth/session":
+
+                method = request.method.upper()
+                mutation_class = classify_mutation(method, path)
+                if method not in {"GET", "HEAD", "OPTIONS"} and mutation_class is None:
+                    return JSONResponse({"detail": "Remote route denied"}, status_code=404)
+
+                if (
+                    mutation_class
+                    in {MutationClass.CSRF_REQUIRED, MutationClass.PRE_AUTH_EXCEPTION}
+                    and (
+                        not is_trusted_origin(
+                            request.headers.get("origin"), runtime_settings.csrf_trusted_origins
+                        )
+                        or not fetch_metadata_is_acceptable(
+                            request.headers.get("sec-fetch-site")
+                        )
+                    )
+                ):
+                    return JSONResponse({"code": "CSRF_REJECTED"}, status_code=403)
+
+                pre_auth = mutation_class == MutationClass.PRE_AUTH_EXCEPTION
+                should_lookup_session = (
+                    not allowed_auth
+                    or path in {"/api/auth/session", "/api/auth/csrf"}
+                    or mutation_class == MutationClass.CSRF_REQUIRED
+                )
+                session_required = (
+                    path != "/api/auth/session"
+                    and (not allowed_auth or mutation_class == MutationClass.CSRF_REQUIRED)
+                )
+                if should_lookup_session and not pre_auth:
                     identity = normalize_login(request.headers.get("Tailscale-User-Login", ""))
                     try:
                         authenticated_user = app.state.auth_service.authenticate(
@@ -436,12 +473,15 @@ def create_app(
                         return JSONResponse(
                             {"detail": "Authentication service unavailable"}, status_code=503
                         )
-                    if authenticated_user is None and not allowed_auth:
-                        return JSONResponse(
-                            {"detail": "Application session required"}, status_code=401
-                        )
+                    if authenticated_user is None and session_required:
+                        return JSONResponse({"code": "AUTH_REQUIRED"}, status_code=401)
                     if authenticated_user is not None:
                         request.state.authenticated_user = authenticated_user
+                    if mutation_class == MutationClass.CSRF_REQUIRED and not validate_csrf_token(
+                        request.cookies.get(SESSION_COOKIE_NAME),
+                        request.headers.get("x-csrf-token"),
+                    ):
+                        return JSONResponse({"code": "CSRF_REJECTED"}, status_code=403)
             elif request.method not in {"GET", "HEAD"}:
                 return JSONResponse({"detail": "Remote method denied"}, status_code=405)
             response = await call_next(request)
@@ -515,12 +555,23 @@ def create_app(
             return {"authenticated": False}
         return user.safe_payload()
 
+    @app.get("/api/auth/csrf")
+    def auth_csrf(request: Request) -> JSONResponse:
+        user = getattr(request.state, "authenticated_user", None)
+        session_token = request.cookies.get(SESSION_COOKIE_NAME)
+        if not isinstance(user, AuthenticatedUser) or user.state != "ACTIVE" or not session_token:
+            return JSONResponse({"code": "AUTH_REQUIRED"}, status_code=401)
+        return JSONResponse(
+            {"csrf_token": issue_csrf_token(session_token)},
+            headers={"Cache-Control": "no-store"},
+        )
+
     def _owner_actor(request: Request) -> AuthenticatedUser:
         user = getattr(request.state, "authenticated_user", None)
         if not isinstance(user, AuthenticatedUser) or user.state != "ACTIVE":
-            raise HTTPException(status_code=401, detail="Application session required")
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
         if user.role != "OWNER":
-            raise HTTPException(status_code=403, detail="OWNER authorization required")
+            raise HTTPException(status_code=403, detail="FORBIDDEN")
         return user
 
     async def _exact_json_object(request: Request, expected: set[str]) -> dict[str, object]:
@@ -561,7 +612,7 @@ def create_app(
                 )
             }
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except Exception:
             return JSONResponse({"detail": "Account service unavailable"}, status_code=503)
 
@@ -581,7 +632,7 @@ def create_app(
                 bound_tailscale_login=body["bound_tailscale_identity"],
             )
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except Exception:
@@ -613,7 +664,7 @@ def create_app(
         except LookupError:
             raise HTTPException(status_code=404, detail="Account not found") from None
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except Exception:
             return JSONResponse({"detail": "Account service unavailable"}, status_code=503)
         return JSONResponse({"disabled": True})
@@ -634,7 +685,7 @@ def create_app(
         except LookupError:
             raise HTTPException(status_code=404, detail="Account not found") from None
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except Exception:
             return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
 
@@ -652,7 +703,7 @@ def create_app(
         except LookupError:
             raise HTTPException(status_code=404, detail="Account not found") from None
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except Exception:
             return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
         return JSONResponse({"revoked_count": count})
@@ -677,7 +728,7 @@ def create_app(
         except LookupError:
             raise HTTPException(status_code=404, detail="Session not found") from None
         except PermissionError:
-            raise HTTPException(status_code=403, detail="OWNER authorization required") from None
+            raise HTTPException(status_code=403, detail="FORBIDDEN") from None
         except Exception:
             return JSONResponse({"detail": "Session service unavailable"}, status_code=503)
         return JSONResponse({"revoked": revoked})
@@ -687,7 +738,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Private control plane is disabled")
         user = getattr(request.state, "authenticated_user", None)
         if not isinstance(user, AuthenticatedUser) or user.state != "ACTIVE":
-            raise HTTPException(status_code=401, detail="Application session required")
+            raise HTTPException(status_code=401, detail="AUTH_REQUIRED")
         return user.login[:128]
 
     def _control_call(

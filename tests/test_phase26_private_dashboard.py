@@ -23,7 +23,10 @@ def private_database(tmp_path: Path) -> Database:
 @pytest.fixture
 def private_client(private_database: Database) -> TestClient:
     app = create_app(
-        settings=Settings(remote_dashboard_mode=True),
+        settings=Settings(
+            remote_dashboard_mode=True,
+            csrf_trusted_origins=("https://dashboard.tailnet.test",),
+        ),
         database=private_database,
     )
     with TestClient(app, base_url="https://dashboard.tailnet.test") as client:
@@ -39,7 +42,10 @@ def test_private_dashboard_requires_tailscale_identity(private_client: TestClien
 def test_private_dashboard_allows_only_authenticated_allowlisted_get(
     private_client: TestClient,
 ) -> None:
-    headers = {"Tailscale-User-Login": "operator@example.com"}
+    headers = {
+        "Tailscale-User-Login": "operator@example.com",
+        "Origin": "https://dashboard.tailnet.test",
+    }
     AuthenticationService(private_client.app.state.database, Settings()).create_user_for_admin(
         login="operator@example.com",
         password="correct horse battery staple 123!",

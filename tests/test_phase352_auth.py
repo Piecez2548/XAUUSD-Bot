@@ -19,7 +19,10 @@ from services.authentication import (
     AuthenticationService,
 )
 
-TAILSCALE = {"Tailscale-User-Login": "operator@example-tailnet.test"}
+TAILSCALE = {
+    "Tailscale-User-Login": "operator@example-tailnet.test",
+    "Origin": "https://dashboard.tailnet.test",
+}
 PASSWORD = "Correct Horse Battery Staple 42!"
 
 
@@ -60,7 +63,10 @@ def create_active_user(database: Database, *, state: str = "ACTIVE") -> str:
 def make_client(database: Database, ipc=None) -> TestClient:
     return TestClient(
         create_app(
-            settings=Settings(remote_dashboard_mode=True),
+            settings=Settings(
+                remote_dashboard_mode=True,
+                csrf_trusted_origins=("https://dashboard.tailnet.test",),
+            ),
             database=database,
             control_ipc=ipc,
         ),
@@ -74,6 +80,12 @@ def login(client: TestClient, password: str = PASSWORD):
         headers=TAILSCALE,
         json={"login": " OPERATOR@example.test ", "password": password},
     )
+
+
+def mutation_headers(client: TestClient) -> dict[str, str]:
+    response = client.get("/api/auth/csrf", headers=TAILSCALE)
+    assert response.status_code == 200
+    return {**TAILSCALE, "X-CSRF-Token": response.json()["csrf_token"]}
 
 
 def test_argon2id_password_hash_and_verification(auth_database: Database) -> None:
@@ -133,7 +145,10 @@ def test_login_requires_matching_tailscale_identity(auth_database: Database) -> 
     with make_client(auth_database) as client:
         response = client.post(
             "/api/auth/login",
-            headers={"Tailscale-User-Login": "different@example-tailnet.test"},
+            headers={
+                "Tailscale-User-Login": "different@example-tailnet.test",
+                "Origin": "https://dashboard.tailnet.test",
+            },
             json={"login": "operator@example.test", "password": PASSWORD},
         )
     assert response.status_code == 401
@@ -176,7 +191,9 @@ def test_private_read_and_control_routes_require_app_session(auth_database: Data
         assert client.get("/api/system/health", headers=TAILSCALE).status_code == 200
         assert client.get("/api/control/status", headers=TAILSCALE).status_code == 200
         started = client.post(
-            "/api/control/start", headers=TAILSCALE, json={"operation_id": str(uuid4())}
+            "/api/control/start",
+            headers=mutation_headers(client),
+            json={"operation_id": str(uuid4())},
         )
         assert started.status_code == 200
         assert ipc.calls[0][0] == "status"
@@ -187,7 +204,10 @@ def test_private_read_and_control_routes_require_app_session(auth_database: Data
 def test_auth_database_lookup_failure_fails_closed(auth_database: Database, monkeypatch) -> None:
     create_active_user(auth_database)
     app = create_app(
-        settings=Settings(remote_dashboard_mode=True),
+            settings=Settings(
+                remote_dashboard_mode=True,
+                csrf_trusted_origins=("https://dashboard.tailnet.test",),
+            ),
         database=auth_database,
     )
 
@@ -275,7 +295,7 @@ def test_revoked_session_user_state_change_and_identity_mismatch_deny(
             user = session.get(AuthUserRecord, user_id)
             assert user
             user.state = "ACTIVE"
-        client.post("/api/auth/logout", headers=TAILSCALE)
+        client.post("/api/auth/logout", headers=mutation_headers(client))
         assert client.get("/api/system/health", headers=TAILSCALE).status_code == 401
         assert client.get("/api/auth/session", headers=TAILSCALE).json() == {"authenticated": False}
 
@@ -296,7 +316,9 @@ def test_login_logout_audit_contains_no_password_or_token(auth_database: Databas
         assert login(client).status_code == 200
         token = client.cookies.get(SESSION_COOKIE_NAME)
         assert token
-        assert client.post("/api/auth/logout", headers=TAILSCALE).status_code == 200
+        assert client.post(
+            "/api/auth/logout", headers=mutation_headers(client)
+        ).status_code == 200
     with auth_database.session() as session:
         events = list(session.scalars(select(AuthAuditRecord)))
         assert {event.event_type for event in events} >= {
