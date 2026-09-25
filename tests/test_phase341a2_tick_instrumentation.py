@@ -5,6 +5,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from mt5.gateway import MT5Gateway
 from persistence.database import Database
 from persistence.orm import SystemEventRecord
 from persistence.repositories import EventRepository
+from services.event_loop_diagnostics import EventLoopLagDiagnostics
 from services.live import LiveDataEngine
 from services.tick_diagnostics import TickPollingDiagnostics
 
@@ -268,7 +270,11 @@ async def test_stale_transition_carries_sparse_diagnostics_without_changing_thre
             return now if tz else now.replace(tzinfo=None)
 
     class FakeHealth:
+        def __init__(self):
+            self.records = []
+
         def record(self, *_args, **_kwargs):
+            self.records.append((_args, _kwargs))
             return "health-id"
 
     database = Database(f"sqlite:///{(tmp_path / 'tick-stale.db').as_posix()}")
@@ -283,6 +289,16 @@ async def test_stale_transition_carries_sparse_diagnostics_without_changing_thre
     bus.subscribe("database", EventRepository(database).handle, critical=True)
     engine = LiveDataEngine(Settings(), database, bus, logger=logging.getLogger("tick-watchdog"))
     engine.health = FakeHealth()
+    engine._event_loop_diagnostics.record_sample(
+        expected_wake_monotonic=10,
+        actual_wake_monotonic=10.020,
+        observed_at=now - timedelta(seconds=2),
+    )
+    engine._event_loop_diagnostics.record_sample(
+        expected_wake_monotonic=11,
+        actual_wake_monotonic=11.005,
+        observed_at=now - timedelta(seconds=1),
+    )
     engine.state.last_tick_observed = now - timedelta(seconds=11)
     engine._tick_diagnostics.seed_observation(
         now - timedelta(seconds=11), now - timedelta(seconds=35)
@@ -299,6 +315,17 @@ async def test_stale_transition_carries_sparse_diagnostics_without_changing_thre
         assert len(stale) == 1
         assert stale[0].payload.diagnostics["threshold_seconds"] == 10
         assert stale[0].payload.diagnostics["diagnostic_classification"] == "POLL_DELAY"
+        assert "event_loop" in stale[0].payload.diagnostics
+        assert "shadow" in stale[0].payload.diagnostics
+        event_loop = stale[0].payload.diagnostics["event_loop"]
+        assert event_loop["latest_event_loop_lag_ms"] == pytest.approx(5)
+        assert event_loop["latest_event_loop_lag_observed_at"] == (
+            now - timedelta(seconds=1)
+        ).isoformat()
+        assert event_loop["max_event_loop_lag_ms"] == pytest.approx(20)
+        assert event_loop["max_event_loop_lag_observed_at"] == (
+            now - timedelta(seconds=2)
+        ).isoformat()
         with database.session() as session:
             row = session.query(SystemEventRecord).one()
             assert row.payload["diagnostics"]["threshold_seconds"] == 10
@@ -309,9 +336,186 @@ async def test_stale_transition_carries_sparse_diagnostics_without_changing_thre
         engine.state.last_tick_observed = now
         await engine._watchdog_loop()
         assert "tick" not in engine._stale_components
+        tick_health = [
+            args[1]
+            for args, _kwargs in engine.health.records
+            if len(args) > 1 and args[0] == "data:tick"
+        ]
+        assert tick_health == ["STALE", "CONNECTED"]
+        engine._stop = asyncio.Event()
+        await engine._watchdog_loop()
+        tick_health = [
+            args[1]
+            for args, _kwargs in engine.health.records
+            if len(args) > 1 and args[0] == "data:tick"
+        ]
+        assert tick_health == ["STALE", "CONNECTED"]
+        engine.state.last_tick_observed = None
+        engine._stop = asyncio.Event()
+        await engine._watchdog_loop()
+        assert "tick" not in engine._stale_components
+        assert [
+            args[1]
+            for args, _kwargs in engine.health.records
+            if len(args) > 1 and args[0] == "data:tick"
+        ] == ["STALE", "CONNECTED"]
         engine._stop = asyncio.Event()
         engine.state.last_tick_observed = now - timedelta(seconds=11)
         await engine._watchdog_loop()
         assert len([event for event in captured if event.event_type is EventType.DATA_STALE]) == 2
+        tick_health = [
+            args[1]
+            for args, _kwargs in engine.health.records
+            if len(args) > 1 and args[0] == "data:tick"
+        ]
+        assert tick_health == ["STALE", "CONNECTED", "STALE"]
     finally:
         database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_missing_or_old_tick_observation_cannot_recover_stale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 9, 24, 10, 0, tzinfo=UTC)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz else now.replace(tzinfo=None)
+
+    class FakeHealth:
+        def __init__(self):
+            self.records = []
+
+        def record(self, *args, **kwargs):
+            self.records.append((args, kwargs))
+
+    database = Database(f"sqlite:///{(tmp_path / 'tick-recovery-guard.db').as_posix()}")
+    database.create_schema()
+    engine = LiveDataEngine(
+        Settings(),
+        database,
+        EventBus(logging.getLogger("tick-recovery-guard")),
+        logger=logging.getLogger("tick-recovery-guard"),
+    )
+    engine.health = FakeHealth()
+    engine._stale_components.add("tick")
+    monkeypatch.setattr(live_module, "datetime", FrozenDateTime)
+
+    async def stop_after_iteration(_seconds):
+        engine._stop.set()
+
+    monkeypatch.setattr(live_module.asyncio, "sleep", stop_after_iteration)
+    try:
+        # A healthy generation with no tick observation is unknown, not recovered.
+        await engine._watchdog_loop()
+        assert not [
+            args
+            for args, _kwargs in engine.health.records
+            if args and args[0] == "data:tick"
+        ]
+
+        engine._stale_components.add("tick")
+        engine._stop = asyncio.Event()
+        await engine._watchdog_loop()
+        assert "tick" in engine._stale_components
+        assert not [
+            args
+            for args, _kwargs in engine.health.records
+            if args and args[0] == "data:tick"
+        ]
+
+        engine._stop = asyncio.Event()
+        engine.state.last_tick_observed = now - timedelta(seconds=11)
+        await engine._watchdog_loop()
+        assert "tick" in engine._stale_components
+        assert not [
+            args
+            for args, _kwargs in engine.health.records
+            if len(args) > 1 and args[0] == "data:tick" and args[1] == "CONNECTED"
+        ]
+    finally:
+        database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_incident_survives_shadow_diagnostic_failure(
+    tmp_path, monkeypatch, caplog
+):
+    now = datetime.now(UTC)
+
+    class FakeState:
+        last_tick_observed = now - timedelta(seconds=11)
+
+    class FakeHealth:
+        def record(self, *_args, **_kwargs):
+            return "health-id"
+
+    class FakeEventBus:
+        def __init__(self):
+            self.events = []
+
+        async def publish(self, event):
+            self.events.append(event)
+
+    class FakeShadow:
+        def diagnostic_snapshot(self):
+            raise RuntimeError("synthetic secret shadow diagnostics traceback")
+
+    database = Database(f"sqlite:///{(tmp_path / 'tick-shadow-diagnostic-failure.db').as_posix()}")
+    database.create_schema()
+    events = FakeEventBus()
+    engine = LiveDataEngine.__new__(LiveDataEngine)
+    engine.settings = SimpleNamespace(
+        data_stale_tick_seconds=10,
+        data_stale_account_seconds=30,
+        data_stale_position_seconds=30,
+        data_stale_history_seconds=30,
+        live_tick_interval_seconds=1,
+    )
+    engine.state = FakeState()
+    engine.state.last_account_observed = None
+    engine.state.last_position_observed = None
+    engine.health = FakeHealth()
+    engine.events = events
+    engine.database = database
+    engine.shadow = FakeShadow()
+    engine.logger = logging.getLogger("tick-shadow-diagnostic-failure")
+    engine._stop = asyncio.Event()
+    engine._stale_components = set()
+    engine._workers = {}
+    engine._last_watchdog_started_monotonic = None
+    engine._record_runtime_heartbeat = lambda: None
+    engine._event_loop_diagnostics = EventLoopLagDiagnostics(
+        interval_ms=250, threshold_ms=1_000
+    )
+    engine._event_loop_diagnostics.record_sample(
+        expected_wake_monotonic=1.0,
+        actual_wake_monotonic=1.1,
+        observed_at=now,
+    )
+    engine._tick_diag = lambda *_args, default=None, **_kwargs: {
+        "diagnostic_classification": "NORMAL"
+    }
+
+    async def stop_after_iteration(_seconds):
+        engine._stop.set()
+
+    monkeypatch.setattr(live_module.asyncio, "sleep", stop_after_iteration)
+
+    with caplog.at_level(logging.DEBUG, logger="tick-shadow-diagnostic-failure"):
+        try:
+            await engine._watchdog_loop()
+        finally:
+            database.dispose()
+
+    assert len(events.events) == 1
+    payload = events.events[0].payload
+    assert payload.diagnostics["diagnostic_classification"] == "NORMAL"
+    assert "event_loop" in payload.diagnostics
+    assert "shadow" not in payload.diagnostics
+    assert "synthetic secret" not in caplog.text
+    assert "traceback" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text

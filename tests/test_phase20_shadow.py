@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
+import services.shadow_service as shadow_service_module
 from api.app import create_app
 from api.realtime import RealtimeHub
 from config.settings import Settings
@@ -17,7 +18,7 @@ from events.bus import EventBus
 from models.market import Candle, MarketSnapshot, Timeframe
 from models.shadow import ShadowAction
 from persistence.database import Database
-from persistence.orm import ShadowDecisionRecord, SystemHealthRecord
+from persistence.orm import ShadowDecisionRecord, SystemEventRecord, SystemHealthRecord
 from persistence.repositories import ShadowDecisionRepository, SystemHealthRepository
 from services.control import TelegramControlService
 from services.features import FeatureValidationError, extract_features
@@ -343,6 +344,10 @@ async def test_shadow_worker_strategy_exception_recovers_on_next_candle(
             .limit(1)
         )
     assert health is not None and health.status == "CONNECTED"
+    diagnostic = worker.diagnostic_snapshot()
+    assert "current_operation" not in diagnostic
+    assert diagnostic["timings"]["DECISION_EVALUATION"]["ownership"] == "ON_EVENT_LOOP"
+    assert diagnostic["timings"]["TOTAL_ITEM_PROCESSING"]["ownership"] == "ON_EVENT_LOOP"
 
 
 def test_shadow_queue_full_is_observable_not_silent(shadow_database, model_parts):
@@ -380,6 +385,202 @@ def test_shadow_queue_full_is_observable_not_silent(shadow_database, model_parts
         )
     assert health is not None and health.status == "DEGRADED"
     assert health.metadata_json["error_category"] == "QueueFull"
+    diagnostics = worker.diagnostic_snapshot()
+    assert diagnostics["queue_size"] == 8
+    assert diagnostics["queue_capacity"] == 8
+    assert diagnostics["backlog_count"] == 9
+    assert diagnostics["queue_full_count_since_start"] == 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_timings_are_bounded_and_diagnostic_only(
+    shadow_database, model_parts, monkeypatch
+):
+    events = []
+    bus = EventBus(logging.getLogger("shadow-diagnostics"))
+
+    async def capture(event):
+        events.append(event)
+
+    bus.subscribe("capture", capture)
+    settings = Settings(shadow_notify_no_trade=True)
+    worker = ShadowDecisionWorker(
+        settings, shadow_database, bus, logger=logging.getLogger("shadow-diagnostics")
+    )
+    active_evaluation_snapshots = []
+    original_evaluate = worker.strategy.evaluate
+
+    def capture_active_evaluation(*args, **kwargs):
+        active_evaluation_snapshots.append(worker.diagnostic_snapshot())
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(worker.strategy, "evaluate", capture_active_evaluation)
+    snapshot = _trend_snapshot(model_parts)
+    for index in range(3):
+        shifted = snapshot.model_copy(
+            update={
+                "candles": {
+                    timeframe: tuple(
+                        candle.model_copy(
+                            update={"timestamp": candle.timestamp + timedelta(minutes=5 * index)}
+                        )
+                        for candle in values
+                    )
+                    for timeframe, values in snapshot.candles.items()
+                }
+            }
+        )
+        await worker._process(ShadowInput(shifted, None, _engine_risk(shifted), True))
+
+    diagnostics = worker.diagnostic_snapshot()
+    assert len(events) == 3
+    assert len(active_evaluation_snapshots) == 3
+    assert all(
+        snapshot["current_operation"] == "DECISION_EVALUATION"
+        for snapshot in active_evaluation_snapshots
+    )
+    assert diagnostics["timings"]["DECISION_EVALUATION"]["latest_duration_ms"] >= 0
+    assert diagnostics["timings"]["DECISION_PERSISTENCE"]["latest_duration_ms"] >= 0
+    assert diagnostics["timings"]["EVENT_PUBLISH"]["ownership"] == "ON_EVENT_LOOP"
+    assert diagnostics["timings"]["TOTAL_ITEM_PROCESSING"]["max_duration_ms"] >= 0
+    assert "current_operation" not in diagnostics
+    with shadow_database.session() as session:
+        assert session.scalar(select(func.count()).select_from(SystemEventRecord)) == 0
+
+
+@pytest.mark.asyncio
+async def test_shadow_catch_up_records_offloaded_load_and_loop_processing(
+    shadow_database, monkeypatch
+):
+    worker = ShadowDecisionWorker(
+        Settings(), shadow_database, EventBus(logging.getLogger("shadow-catchup-diagnostics")),
+        logger=logging.getLogger("shadow-catchup-diagnostics"),
+    )
+    monkeypatch.setattr(shadow_service_module, "load_persisted_snapshots", lambda *_a, **_k: [])
+    monkeypatch.setattr(worker, "_existing_decision_keys", lambda: set())
+    worker._needs_catchup = True
+
+    await worker._catch_up()
+
+    timings = worker.diagnostic_snapshot()["timings"]
+    assert timings["CATCH_UP_LOAD"]["ownership"] == "OFFLOADED_WORKER"
+    assert timings["CATCH_UP_PROCESSING"]["ownership"] == "ON_EVENT_LOOP"
+    assert "current_operation" not in worker.diagnostic_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_shadow_queue_wait_is_measured_without_changing_processing(
+    shadow_database, model_parts, monkeypatch
+):
+    worker = ShadowDecisionWorker(
+        Settings(), shadow_database, EventBus(logging.getLogger("shadow-queue-wait")),
+        logger=logging.getLogger("shadow-queue-wait"),
+    )
+    snapshot = _trend_snapshot(model_parts)
+    item = ShadowInput(snapshot, None, _engine_risk(snapshot), True)
+    worker._needs_catchup = False
+    worker.submit(item)
+
+    async def finish_after_item(_item):
+        worker._stop.set()
+
+    monkeypatch.setattr(worker, "_process", finish_after_item)
+    await worker._run()
+
+    timing = worker.diagnostic_snapshot()["timings"]["QUEUE_WAIT"]
+    assert timing["ownership"] == "ON_EVENT_LOOP"
+    assert timing["latest_duration_ms"] >= 0
+    assert timing["last_started_at"] <= timing["last_completed_at"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_instrumentation_is_not_persisted_per_operation(
+    shadow_database, model_parts
+):
+    worker = ShadowDecisionWorker(
+        Settings(), shadow_database, EventBus(logging.getLogger("shadow-no-spam")),
+        logger=logging.getLogger("shadow-no-spam"),
+    )
+    snapshot = _trend_snapshot(model_parts)
+    for index in range(4):
+        shifted = snapshot.model_copy(
+            update={
+                "candles": {
+                    timeframe: tuple(
+                        candle.model_copy(
+                            update={"timestamp": candle.timestamp + timedelta(minutes=index * 5)}
+                        )
+                        for candle in values
+                    )
+                    for timeframe, values in snapshot.candles.items()
+                }
+            }
+        )
+        await worker._process(ShadowInput(shifted, None, _engine_risk(shifted), True))
+
+    with shadow_database.session() as session:
+        assert session.scalar(select(func.count()).select_from(SystemEventRecord)) == 0
+        persisted_diagnostic_rows = session.scalar(
+            select(func.count()).select_from(SystemHealthRecord).where(
+                SystemHealthRecord.component.like("%diagnostic%")
+            )
+        )
+    assert persisted_diagnostic_rows == 0
+    assert len(worker.diagnostic_snapshot()["timings"]) <= len(worker._diagnostics.OPERATIONS)
+
+
+@pytest.mark.asyncio
+async def test_shadow_diagnostic_failure_does_not_break_processing_or_leak_secret(
+    shadow_database, model_parts, monkeypatch, caplog
+):
+    secret = "synthetic-shadow-diagnostic-secret"
+    worker = ShadowDecisionWorker(
+        Settings(), shadow_database, EventBus(logging.getLogger("shadow-safe-diagnostics")),
+        logger=logging.getLogger("shadow-safe-diagnostics"),
+    )
+
+    def fail_diagnostic(*_args, **_kwargs):
+        raise RuntimeError(f"{secret} with traceback-only details")
+
+    monkeypatch.setattr(worker._diagnostics, "begin", fail_diagnostic)
+    snapshot = _trend_snapshot(model_parts)
+    with caplog.at_level(logging.DEBUG, logger="shadow-safe-diagnostics"):
+        await worker._process(ShadowInput(snapshot, None, _engine_risk(snapshot), True))
+
+    assert ShadowDecisionRepository(shadow_database).latest() is not None
+    assert secret not in caplog.text
+    assert "traceback-only details" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shadow_finish_diagnostic_failure_clears_current_operation_and_continues(
+    shadow_database, model_parts, monkeypatch, caplog
+):
+    secret = "synthetic-finish-diagnostic-secret"
+    worker = ShadowDecisionWorker(
+        Settings(),
+        shadow_database,
+        EventBus(logging.getLogger("shadow-finish-safe-diagnostics")),
+        logger=logging.getLogger("shadow-finish-safe-diagnostics"),
+    )
+
+    def fail_finish(*_args, **_kwargs):
+        raise RuntimeError(f"{secret} traceback-only details")
+
+    monkeypatch.setattr(worker._diagnostics, "finish", fail_finish)
+    snapshot = _trend_snapshot(model_parts)
+    with caplog.at_level(logging.DEBUG, logger="shadow-finish-safe-diagnostics"):
+        await worker._process(ShadowInput(snapshot, None, _engine_risk(snapshot), True))
+
+    assert ShadowDecisionRepository(shadow_database).latest() is not None
+    diagnostics = worker.diagnostic_snapshot()
+    assert "current_operation" not in diagnostics
+    assert secret not in caplog.text
+    assert "traceback-only details" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -151,6 +151,8 @@ class Settings:
     mt5_reconnect_max_seconds: float = 30.0
     data_stale_tick_seconds: float = 10.0
     tick_diagnostic_slow_seconds: float = 2.0
+    live_event_loop_diagnostic_interval_ms: float = 250.0
+    live_event_loop_diagnostic_threshold_ms: float = 1_000.0
     data_stale_account_seconds: float = 30.0
     data_stale_position_seconds: float = 30.0
     websocket_tick_throttle_ms: int = 500
@@ -253,6 +255,14 @@ class Settings:
             raise ConfigurationError(
                 "SUPERVISOR_OPERATION_TIMEOUT_SECONDS must be greater than zero"
             )
+        if self.live_event_loop_diagnostic_interval_ms <= 0:
+            raise ConfigurationError(
+                "LIVE_EVENT_LOOP_DIAGNOSTIC_INTERVAL_MS must be greater than zero"
+            )
+        if self.live_event_loop_diagnostic_threshold_ms <= 0:
+            raise ConfigurationError(
+                "LIVE_EVENT_LOOP_DIAGNOSTIC_THRESHOLD_MS must be greater than zero"
+            )
 
 
 def load_settings(env_file: str | Path | None = None) -> Settings:
@@ -330,6 +340,12 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         mt5_reconnect_max_seconds=float(os.getenv("MT5_RECONNECT_MAX_SECONDS", "30")),
         data_stale_tick_seconds=float(os.getenv("DATA_STALE_TICK_SECONDS", "10")),
         tick_diagnostic_slow_seconds=float(os.getenv("TICK_DIAGNOSTIC_SLOW_SECONDS", "2")),
+        live_event_loop_diagnostic_interval_ms=float(
+            os.getenv("LIVE_EVENT_LOOP_DIAGNOSTIC_INTERVAL_MS", "250")
+        ),
+        live_event_loop_diagnostic_threshold_ms=float(
+            os.getenv("LIVE_EVENT_LOOP_DIAGNOSTIC_THRESHOLD_MS", "1000")
+        ),
         data_stale_account_seconds=float(os.getenv("DATA_STALE_ACCOUNT_SECONDS", "30")),
         data_stale_position_seconds=float(os.getenv("DATA_STALE_POSITION_SECONDS", "30")),
         websocket_tick_throttle_ms=_nonnegative_int("LIVE_WEBSOCKET_TICK_THROTTLE_MS", 500),

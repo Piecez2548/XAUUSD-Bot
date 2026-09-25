@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -79,7 +79,7 @@ class SystemStatusPayload(PayloadModel):
     message: str
     component: str | None = None
     status: str | None = None
-    diagnostics: dict[str, str | int | float] | None = None
+    diagnostics: dict[str, Any] | None = None
 
 
 class SnapshotCreatedPayload(PayloadModel):

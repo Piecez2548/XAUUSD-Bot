@@ -42,6 +42,7 @@ from mt5.positions import read_open_positions
 from mt5.symbols import discover_symbol, read_symbol_specification, read_tick
 from persistence.repositories import HistoryRepository, SnapshotRepository, SystemHealthRepository
 from services.demo_execution import DemoExecutionService
+from services.event_loop_diagnostics import EventLoopLagDiagnostics
 from services.forward_shadow import ForwardInput, ForwardShadowWorker
 from services.risk import (
     calculate_risk_snapshot,
@@ -115,6 +116,10 @@ class LiveDataEngine:
             stale_threshold_seconds=settings.data_stale_tick_seconds,
             slow_threshold_seconds=settings.tick_diagnostic_slow_seconds,
         )
+        self._event_loop_diagnostics = EventLoopLagDiagnostics(
+            interval_ms=settings.live_event_loop_diagnostic_interval_ms,
+            threshold_ms=settings.live_event_loop_diagnostic_threshold_ms,
+        )
         self._last_watchdog_started_monotonic: float | None = None
         self._last_risk_state = None
         self._history_health_state = "HEALTHY"
@@ -151,6 +156,9 @@ class LiveDataEngine:
                     self._worker("history", self._history_loop), name="live-history"
                 ),
                 asyncio.create_task(self._watchdog_loop(), name="live-watchdog"),
+                asyncio.create_task(
+                    self._event_loop_probe(), name="live-event-loop-diagnostics"
+                ),
             ]
             self.shadow.start()
             self.shadow_outcome.start()
@@ -768,20 +776,61 @@ class LiveDataEngine:
                             component=component,
                             status="STALE",
                             diagnostics=(
-                                self._tick_diag(
-                                    "snapshot",
-                                    now=now,
-                                    monotonic=watchdog_started,
-                                    default={},
-                                )
+                                self._incident_diagnostics(now, watchdog_started)
                                 if component == "tick"
                                 else None
                             ),
                         ),
                     )
                 elif not stale:
-                    self._stale_components.discard(component)
+                    if component == "tick":
+                        # Missing observation is unknown, not proof of recovery.
+                        if observed is not None:
+                            was_stale = component in self._stale_components
+                            self._stale_components.discard(component)
+                            if was_stale:
+                                self.health.record(
+                                    "data:tick",
+                                    "CONNECTED",
+                                    message="tick data freshness recovered",
+                                )
+                    else:
+                        self._stale_components.discard(component)
             await asyncio.sleep(max(1.0, min(5.0, self.settings.live_tick_interval_seconds)))
+
+    async def _event_loop_probe(self) -> None:
+        try:
+            await self._event_loop_diagnostics.run(self._stop)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A diagnostic probe must never fail the Live runtime.
+            with contextlib.suppress(Exception):
+                self.logger.debug("Event-loop diagnostic probe failed")
+
+    def _incident_diagnostics(self, now: datetime, monotonic: float) -> dict[str, Any]:
+        result = self._tick_diag(
+            "snapshot", now=now, monotonic=monotonic, default={}
+        )
+        if not isinstance(result, dict):
+            result = {}
+        try:
+            event_loop = self._event_loop_diagnostics.snapshot()
+        except Exception:
+            event_loop = None
+            with contextlib.suppress(Exception):
+                self.logger.debug("Event-loop diagnostic snapshot failed")
+        try:
+            shadow = self.shadow.diagnostic_snapshot()
+        except Exception:
+            shadow = None
+            with contextlib.suppress(Exception):
+                self.logger.debug("Shadow diagnostic snapshot failed")
+        if isinstance(event_loop, dict):
+            result["event_loop"] = event_loop
+        if isinstance(shadow, dict) and shadow:
+            result["shadow"] = shadow
+        return result
 
     async def _reconnect(self) -> None:
         async with self._reconnect_lock:

@@ -7,6 +7,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import perf_counter
 from uuid import UUID
 
 from sqlalchemy import desc, select
@@ -20,6 +21,7 @@ from persistence.repositories import (
     StrategyActivationRepository,
     SystemHealthRepository,
 )
+from services.shadow_diagnostics import OperationToken, ShadowDiagnostics
 from services.shadow_engine import ShadowDecisionEngine
 from services.shadow_replay import load_persisted_snapshots
 from services.strategy_platform import StrategyRegistry
@@ -49,6 +51,8 @@ class ShadowDecisionWorker:
         self.activations = StrategyActivationRepository(database)
         self._record_strategy_activation()
         self._queue: asyncio.Queue[ShadowInput] = asyncio.Queue(maxsize=8)
+        self._diagnostics = ShadowDiagnostics()
+        self._queued_at: dict[tuple[str, datetime, str], tuple[datetime, float]] = {}
         self._deferred_keys: set[tuple[str, datetime, str]] = set()
         self._queued_keys: set[tuple[str, datetime, str]] = set()
         self._processing_keys: set[tuple[str, datetime, str]] = set()
@@ -114,6 +118,81 @@ class ShadowDecisionWorker:
     def total_backlog(self) -> int:
         return self.queue_depth + self.deferred_count + self.catchup_pending_count
 
+    def _diagnostic_call(self, method: str, *args, default=None, **kwargs):
+        try:
+            return getattr(self._diagnostics, method)(*args, **kwargs)
+        except Exception:
+            self._log_diagnostic_failure()
+            return default
+
+    def _log_diagnostic_failure(self) -> None:
+        # Do not include exception text, args, or traceback in diagnostic logs.
+        with contextlib.suppress(Exception):
+            self.logger.debug("Shadow diagnostic collection failed")
+
+    def _diagnostic_begin(self, operation: str, ownership: str) -> OperationToken | None:
+        try:
+            return self._diagnostic_call(
+                "begin", operation, started_at=datetime.now(UTC), ownership=ownership
+            )
+        except Exception:
+            self._log_diagnostic_failure()
+            return None
+
+    def _diagnostic_finish(self, token: OperationToken | None) -> None:
+        if token is not None:
+            try:
+                self._diagnostics.finish(token, completed_at=datetime.now(UTC))
+            except Exception:
+                self._log_diagnostic_failure()
+                self._diagnostic_call("abort", token)
+
+    def _record_queue_wait(self, key: tuple[str, datetime, str]) -> None:
+        try:
+            queued_at = self._queued_at.pop(key, None)
+            if queued_at is None:
+                return
+            started_at, started_monotonic = queued_at
+            self._diagnostic_call(
+                "record_duration",
+                "QUEUE_WAIT",
+                duration_ms=max(0.0, (perf_counter() - started_monotonic) * 1_000),
+                started_at=started_at,
+                completed_at=datetime.now(UTC),
+                ownership="ON_EVENT_LOOP",
+            )
+        except Exception:
+            self._log_diagnostic_failure()
+
+    def _update_diagnostic_pressure(self) -> None:
+        try:
+            now = perf_counter()
+            oldest_queued_age = (
+                max(0.0, now - min(started for _started_at, started in self._queued_at.values()))
+                if self._queued_at
+                else None
+            )
+            self._diagnostic_call(
+                "record_pressure",
+                queue_size=self.queue_depth,
+                queue_capacity=self._queue.maxsize,
+                backlog_count=self.total_backlog,
+                catch_up_count=self.catchup_pending_count,
+                processing_lag_seconds=self._processing_lag_seconds(),
+                oldest_queued_age_seconds=oldest_queued_age,
+            )
+        except Exception:
+            self._log_diagnostic_failure()
+
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        try:
+            self._update_diagnostic_pressure()
+            result = self._diagnostic_call("snapshot", default={})
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            self._log_diagnostic_failure()
+            return {}
+
     @property
     def state(self) -> str:
         if not self.settings.shadow_engine_enabled:
@@ -167,16 +246,21 @@ class ShadowDecisionWorker:
         try:
             self._queue.put_nowait(item)
             self._queued_keys.add(key)
+            with contextlib.suppress(Exception):
+                self._queued_at[key] = (datetime.now(UTC), perf_counter())
         except asyncio.QueueFull:
             # The snapshot is already durable. Defer it and let catch-up read
             # the persisted snapshot instead of silently dropping work.
             self._deferred_keys.add(key)
             self._needs_catchup = True
+            self._diagnostic_call("record_queue_full")
             self._record_health(
                 "DEGRADED",
                 "Shadow queue is full; persisted snapshots will be caught up",
                 error_category="QueueFull",
             )
+        finally:
+            self._update_diagnostic_pressure()
 
     async def _run(self) -> None:
         self._record_health("CONNECTED", "Shadow decision worker started", force=True)
@@ -187,11 +271,15 @@ class ShadowDecisionWorker:
                 try:
                     item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 except TimeoutError:
+                    item = None
+                if item is None:
                     if self._needs_catchup:
                         await self._catch_up()
                     continue
                 key = self._key(item)
+                self._record_queue_wait(key)
                 self._queued_keys.discard(key)
+                self._update_diagnostic_pressure()
                 await self._process(item)
                 if self._needs_catchup:
                     await self._catch_up()
@@ -204,17 +292,28 @@ class ShadowDecisionWorker:
             self._record_health("DEGRADED", "Shadow decision worker stopped")
 
     async def _process(self, item: ShadowInput) -> None:
+        total_token = self._diagnostic_begin("TOTAL_ITEM_PROCESSING", "ON_EVENT_LOOP")
         key = self._key(item)
         self._processing_keys.add(key)
         completed = False
         try:
-            decision = self.strategy.evaluate(
-                item.snapshot,
-                market_snapshot_id=item.market_snapshot_id,
-                risk=item.risk,
-                candles_are_closed=item.candles_are_closed,
+            evaluation_token = self._diagnostic_begin("DECISION_EVALUATION", "ON_EVENT_LOOP")
+            try:
+                decision = self.strategy.evaluate(
+                    item.snapshot,
+                    market_snapshot_id=item.market_snapshot_id,
+                    risk=item.risk,
+                    candles_are_closed=item.candles_are_closed,
+                )
+            finally:
+                self._diagnostic_finish(evaluation_token)
+            persistence_token = self._diagnostic_begin(
+                "DECISION_PERSISTENCE", "ON_EVENT_LOOP"
             )
-            record = self.repository.persist(decision)
+            try:
+                record = self.repository.persist(decision)
+            finally:
+                self._diagnostic_finish(persistence_token)
             now = datetime.now(UTC)
             self._set_max("_last_processed_candle", decision.m5_candle_timestamp)
             self._set_max("_last_decision_candle", record.m5_candle_timestamp)
@@ -237,25 +336,29 @@ class ShadowDecisionWorker:
             )
             if notify:
                 with contextlib.suppress(Exception):
-                    await self.events.publish(
-                        DomainEvent(
-                            event_type=EventType.SHADOW_DECISION_CREATED,
-                            source="shadow_engine",
-                            severity=(
-                                EventSeverity.INFO
-                                if record.decision == "NO_TRADE"
-                                else EventSeverity.WARNING
-                            ),
-                            payload=AiDecisionEventPayload(
-                                decision_id=UUID(record.id),
-                                symbol=record.symbol,
-                                action=record.decision,
-                                confidence=record.confidence,
-                                validation_status="SHADOW_ONLY",
-                                execution_status="DISABLED",
+                    publish_token = self._diagnostic_begin("EVENT_PUBLISH", "ON_EVENT_LOOP")
+                    try:
+                        await self.events.publish(
+                            DomainEvent(
+                                event_type=EventType.SHADOW_DECISION_CREATED,
+                                source="shadow_engine",
+                                severity=(
+                                    EventSeverity.INFO
+                                    if record.decision == "NO_TRADE"
+                                    else EventSeverity.WARNING
+                                ),
+                                payload=AiDecisionEventPayload(
+                                    decision_id=UUID(record.id),
+                                    symbol=record.symbol,
+                                    action=record.decision,
+                                    confidence=record.confidence,
+                                    validation_status="SHADOW_ONLY",
+                                    execution_status="DISABLED",
+                                ),
                             ),
                         )
-                    )
+                    finally:
+                        self._diagnostic_finish(publish_token)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -266,6 +369,8 @@ class ShadowDecisionWorker:
             self._deferred_keys.discard(key)
             if completed:
                 self._completed_keys.add(key)
+            self._diagnostic_finish(total_token)
+            self._update_diagnostic_pressure()
 
     async def _catch_up(self) -> None:
         if not self._needs_catchup:
@@ -273,13 +378,39 @@ class ShadowDecisionWorker:
         if self._queue.full() and not self._deferred_keys and not self._catchup_pending_keys:
             self._needs_catchup = False
             return
+        load_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
         try:
-            snapshots = await asyncio.to_thread(
-                load_persisted_snapshots, self.database, limit=None
-            )
-        except Exception as exc:
-            self._record_failure(exc)
-            return
+            try:
+                snapshots = await asyncio.to_thread(
+                    load_persisted_snapshots, self.database, limit=None
+                )
+            except Exception as exc:
+                self._record_failure(exc)
+                return
+        finally:
+            self._diagnostic_finish(load_token)
+        processing_token = self._diagnostic_begin(
+            "CATCH_UP_PROCESSING", "ON_EVENT_LOOP"
+        )
+        try:
+            ordered = self._order_catch_up_rows(snapshots)
+        finally:
+            self._diagnostic_finish(processing_token)
+        existing_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
+        try:
+            existing = await asyncio.to_thread(self._existing_decision_keys)
+        finally:
+            self._diagnostic_finish(existing_token)
+        processing_token = self._diagnostic_begin(
+            "CATCH_UP_PROCESSING", "ON_EVENT_LOOP"
+        )
+        try:
+            self._process_catch_up_rows(ordered, existing)
+        finally:
+            self._diagnostic_finish(processing_token)
+            self._update_diagnostic_pressure()
+
+    def _order_catch_up_rows(self, snapshots):
         ordered = sorted(
             snapshots,
             key=lambda item: ShadowDecisionEngine._m5_timestamp(
@@ -294,7 +425,11 @@ class ShadowDecisionWorker:
                     for item in ordered
                 ),
             )
-        existing = await asyncio.to_thread(self._existing_decision_keys)
+        return ordered
+
+    def _process_catch_up_rows(
+        self, ordered, existing: set[tuple[str, datetime, str]]
+    ) -> None:
         candidates: list[tuple[tuple[str, datetime, str], ShadowInput]] = []
         candidate_keys: set[tuple[str, datetime, str]] = set()
         for snapshot, snapshot_id, risk in ordered:
@@ -326,6 +461,8 @@ class ShadowDecisionWorker:
             self._queued_keys.add(key)
             self._catchup_pending_keys.discard(key)
             self._queue.put_nowait(item)
+            with contextlib.suppress(Exception):
+                self._queued_at[key] = (datetime.now(UTC), perf_counter())
         self._needs_catchup = bool(self._catchup_pending_keys or self._deferred_keys)
 
     def _key(self, item: ShadowInput) -> tuple[str, datetime, str]:
