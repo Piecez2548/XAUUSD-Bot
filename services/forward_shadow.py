@@ -429,6 +429,7 @@ class ForwardShadowWorker:
                 type(exc).__name__,
             )
         self._last_success_at = now
+        record = None
         if decision.decision.value in {"BUY", "SELL"}:
             record = self._persist_signal(decision, item.snapshot)
             if record is not None:
@@ -475,6 +476,24 @@ class ForwardShadowWorker:
             force=True,
             error_category=None if intelligence_available else "INTELLIGENCE_UNAVAILABLE",
         )
+        if intelligence_record is not None:
+            try:
+                from services.model_inference import persist_advisory_evaluation
+
+                persist_advisory_evaluation(
+                    self.database,
+                    candidate_id=intelligence_record.candidate_id,
+                    forward_session_id=self.session.id,
+                    forward_signal_id=(
+                        record.id if record is not None and provenance_linked else None
+                    ),
+                )
+            except Exception as exc:
+                # This optional offline result must not affect Forward Shadow,
+                # canonical signals, or the separately gated Demo handler.
+                self.logger.warning(
+                    "Offline advisory inference unavailable (%s)", type(exc).__name__
+                )
 
     def _persist_signal(self, decision: Any, snapshot: MarketSnapshot) -> ForwardSignalRecord | None:
         assert self.session is not None

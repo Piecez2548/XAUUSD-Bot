@@ -1002,3 +1002,39 @@ class StrategyIntelligenceRecord(IdMixin, Base):
     )
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+
+
+class ModelInferenceEvaluationRecord(IdMixin, Base):
+    """Versioned offline advisory output, separate from canonical decisions."""
+
+    __tablename__ = "model_inference_evaluations"
+    __table_args__ = (
+        UniqueConstraint("evaluation_key", name="uq_model_inference_evaluation_key"),
+        Index("ix_model_inference_session_time", "forward_session_id", "evaluated_at"),
+        CheckConstraint("execution_allowed = false", name="ck_model_inference_advisory_only"),
+        CheckConstraint(
+            "advisory_classification IN ('SUPPORTIVE', 'CAUTION', 'OBSERVATION_ONLY')",
+            name="ck_model_inference_advisory_classification",
+        ),
+    )
+
+    evaluation_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    inference_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evaluated_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    source_intelligence_record_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_intelligence_records.id"), nullable=False, index=True
+    )
+    source_candidate_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    forward_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("forward_validation_sessions.id")
+    )
+    forward_signal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("forward_validation_signals.id"), index=True
+    )
+    pair_zone_event_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    strategy_config_hash: Mapped[str | None] = mapped_column(String(64))
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    advisory_classification: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_codes_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
