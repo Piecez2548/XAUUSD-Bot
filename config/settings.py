@@ -149,6 +149,7 @@ class Settings:
     mt5_reconnect_initial_seconds: float = 1.0
     mt5_reconnect_max_seconds: float = 30.0
     data_stale_tick_seconds: float = 10.0
+    tick_diagnostic_slow_seconds: float = 2.0
     data_stale_account_seconds: float = 30.0
     data_stale_position_seconds: float = 30.0
     websocket_tick_throttle_ms: int = 500
@@ -222,6 +223,7 @@ class Settings:
             "MT5_RECONNECT_INITIAL_SECONDS": self.mt5_reconnect_initial_seconds,
             "MT5_RECONNECT_MAX_SECONDS": self.mt5_reconnect_max_seconds,
             "DATA_STALE_TICK_SECONDS": self.data_stale_tick_seconds,
+            "TICK_DIAGNOSTIC_SLOW_SECONDS": self.tick_diagnostic_slow_seconds,
             "DATA_STALE_ACCOUNT_SECONDS": self.data_stale_account_seconds,
             "DATA_STALE_POSITION_SECONDS": self.data_stale_position_seconds,
         }
@@ -325,6 +327,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         mt5_reconnect_initial_seconds=float(os.getenv("MT5_RECONNECT_INITIAL_SECONDS", "1")),
         mt5_reconnect_max_seconds=float(os.getenv("MT5_RECONNECT_MAX_SECONDS", "30")),
         data_stale_tick_seconds=float(os.getenv("DATA_STALE_TICK_SECONDS", "10")),
+        tick_diagnostic_slow_seconds=float(os.getenv("TICK_DIAGNOSTIC_SLOW_SECONDS", "2")),
         data_stale_account_seconds=float(os.getenv("DATA_STALE_ACCOUNT_SECONDS", "30")),
         data_stale_position_seconds=float(os.getenv("DATA_STALE_POSITION_SECONDS", "30")),
         websocket_tick_throttle_ms=_nonnegative_int("LIVE_WEBSOCKET_TICK_THROTTLE_MS", 500),

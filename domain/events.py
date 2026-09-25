@@ -79,6 +79,7 @@ class SystemStatusPayload(PayloadModel):
     message: str
     component: str | None = None
     status: str | None = None
+    diagnostics: dict[str, str | int | float] | None = None
 
 
 class SnapshotCreatedPayload(PayloadModel):

@@ -50,6 +50,7 @@ from services.risk import (
 )
 from services.shadow_outcome import ShadowOutcomeWorker
 from services.shadow_service import ShadowDecisionWorker, ShadowInput
+from services.tick_diagnostics import TickPollingDiagnostics
 from services.worker_health import worker_health_ttl
 
 
@@ -110,6 +111,11 @@ class LiveDataEngine:
         self._workers: dict[str, WorkerHealth] = {}
         self._last_event_by_key: dict[str, datetime] = {}
         self._stale_components: set[str] = set()
+        self._tick_diagnostics = TickPollingDiagnostics(
+            stale_threshold_seconds=settings.data_stale_tick_seconds,
+            slow_threshold_seconds=settings.tick_diagnostic_slow_seconds,
+        )
+        self._last_watchdog_started_monotonic: float | None = None
         self._last_risk_state = None
         self._history_health_state = "HEALTHY"
 
@@ -224,7 +230,11 @@ class LiveDataEngine:
             max_trade_risk_percent=self.settings.max_trade_risk_percent,
             max_aggregate_risk_percent=self.settings.max_aggregate_risk_percent,
         )
+        persistence_started = perf_counter()
         result = self.snapshots.persist(snapshot, risk)
+        self._tick_diag(
+            "record_timing", "snapshot_persistence", (perf_counter() - persistence_started) * 1_000
+        )
         self.health.record(
             "mt5",
             "CONNECTED",
@@ -242,6 +252,7 @@ class LiveDataEngine:
         self.state.candles = closed_candles
         now = datetime.now(UTC)
         self.state.last_tick_observed = now
+        self._tick_diag("seed_observation", now, tick.timestamp)
         self.state.last_account_observed = now
         self.state.last_position_observed = now
         self.state.risk_unbounded = risk.unbounded_positions_count > 0
@@ -292,22 +303,93 @@ class LiveDataEngine:
             ),
         )
 
+    def _tick_diag(self, method: str, *args, default=None, **kwargs):
+        """Run diagnostic collection best-effort, isolated from runtime behavior."""
+
+        try:
+            return getattr(self._tick_diagnostics, method)(*args, **kwargs)
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.logger.debug("Tick diagnostic collection failed")
+            return default
+
     async def _fast_loop(self) -> None:
         if self.state.symbol is None:
             return
-        tick, positions = await self.gateway.call(
-            lambda api: (
-                read_tick(api, self.state.symbol),
-                read_open_positions(api, self.state.symbol),
+        started_at = datetime.now(UTC)
+        started_monotonic = perf_counter()
+        self._tick_diag("begin_attempt", started_at, started_monotonic)
+        tick_read_succeeded = False
+
+        def read_market(api):
+            nonlocal tick_read_succeeded
+            tick_started_at = datetime.now(UTC)
+            tick_started_monotonic = perf_counter()
+            self._tick_diag(
+                "mark_stage", "MT5_TICK_READ", tick_started_at, tick_started_monotonic
             )
-        )
+            try:
+                tick = read_tick(api, self.state.symbol)
+            except Exception as exc:
+                self._tick_diag(
+                    "record_tick_read_failure",
+                    datetime.now(UTC),
+                    perf_counter(),
+                    type(exc).__name__,
+                )
+                raise
+            tick_read_succeeded = True
+            tick_completed_at = datetime.now(UTC)
+            tick_completed_monotonic = perf_counter()
+            self._tick_diag(
+                "record_tick_read",
+                source_timestamp=tick.timestamp,
+                completed_at=tick_completed_at,
+                completed_monotonic=tick_completed_monotonic,
+            )
+            self._tick_diag(
+                "mark_stage", "MT5_POSITION_READ", tick_completed_at, tick_completed_monotonic
+            )
+            positions_started = perf_counter()
+            positions = read_open_positions(api, self.state.symbol)
+            return tick, positions, (perf_counter() - positions_started) * 1_000
+
+        def stage_changed(stage: str, monotonic: float) -> None:
+            self._tick_diag("mark_stage", stage, datetime.now(UTC), monotonic)
+
+        try:
+            (tick, positions, positions_read_ms), gateway_timing = await self.gateway.call_timed(
+                read_market, on_stage=stage_changed
+            )
+        except Exception as exc:
+            self._tick_diag(
+                "finish_attempt",
+                completed_at=datetime.now(UTC),
+                completed_monotonic=perf_counter(),
+                observed_at=None,
+                gateway_wait_ms=None,
+                gateway_operation_ms=None,
+                positions_read_ms=None,
+                error_category=type(exc).__name__,
+                tick_read_failed=not tick_read_succeeded,
+            )
+            raise
         previous = {item.ticket: item for item in self.state.positions}
         current = {item.ticket: item for item in positions}
         self.state.tick = tick
         self.state.positions = positions
-        now = datetime.now(UTC)
-        self.state.last_tick_observed = now
-        self.state.last_position_observed = now
+        observed_at = datetime.now(UTC)
+        self.state.last_tick_observed = observed_at
+        self.state.last_position_observed = observed_at
+        self._tick_diag(
+            "finish_attempt",
+            completed_at=datetime.now(UTC),
+            completed_monotonic=perf_counter(),
+            observed_at=observed_at,
+            gateway_wait_ms=gateway_timing.waiting_for_access_ms,
+            gateway_operation_ms=gateway_timing.operation_ms,
+            positions_read_ms=positions_read_ms,
+        )
         for ticket, position in current.items():
             if ticket not in previous:
                 await self._publish(
@@ -381,7 +463,11 @@ class LiveDataEngine:
         # Persist account, current open positions, and derived risk in one
         # transaction.  This closes the stale-position gap that previously
         # updated risk without updating the current-position tables.
+        persistence_started = perf_counter()
         result = self.snapshots.persist(snapshot, risk)
+        self._tick_diag(
+            "record_timing", "snapshot_persistence", (perf_counter() - persistence_started) * 1_000
+        )
         risk_id = str(result.risk_snapshot_id)
         self.health.record(
             "mt5",
@@ -487,7 +573,13 @@ class LiveDataEngine:
             for candle in candles:
                 if cursor is not None and candle.timestamp <= cursor:
                     continue
+                persistence_started = perf_counter()
                 self.snapshots.persist_candle(self.state.specification, timeframe, candle)
+                self._tick_diag(
+                    "record_timing",
+                    "candle_persistence",
+                    (perf_counter() - persistence_started) * 1_000,
+                )
                 self.history.set_candle_cursor(self.state.symbol, timeframe.value, candle.timestamp)
                 await self._publish(
                     EventType.CANDLE_CLOSED,
@@ -525,7 +617,13 @@ class LiveDataEngine:
             facts = await self.gateway.call(
                 lambda api: read_deals(api, self.state.symbol, start, end)
             )
+            persistence_started = perf_counter()
             inserted = self.history.persist_deals(facts, scope=scope)
+            self._tick_diag(
+                "record_timing",
+                "history_persistence",
+                (perf_counter() - persistence_started) * 1_000,
+            )
             self.state.last_history_sync = datetime.now(UTC)
             self.state.last_deals_synchronized += inserted
             # The persisted worker row is authoritative; events are not a
@@ -598,6 +696,14 @@ class LiveDataEngine:
     async def _watchdog_loop(self) -> None:
         while not self._stop.is_set():
             now = datetime.now(UTC)
+            watchdog_started = perf_counter()
+            if self._last_watchdog_started_monotonic is not None:
+                self._tick_diag(
+                    "record_metric",
+                    "watchdog_loop_gap_ms",
+                    (watchdog_started - self._last_watchdog_started_monotonic) * 1_000,
+                )
+            self._last_watchdog_started_monotonic = watchdog_started
             self._record_runtime_heartbeat()
             for name, worker in tuple(self._workers.items()):
                 interval = {
@@ -640,11 +746,18 @@ class LiveDataEngine:
                 stale = observed is not None and (now - observed).total_seconds() > threshold
                 if stale and component not in self._stale_components:
                     self._stale_components.add(component)
+                    health_persist_started = perf_counter()
                     self.health.record(
                         f"data:{component}",
                         "STALE",
                         message=f"{component} data exceeded freshness threshold",
                     )
+                    if component == "tick":
+                        self._tick_diag(
+                            "record_timing",
+                            "watchdog_health_persistence",
+                            (perf_counter() - health_persist_started) * 1_000,
+                        )
                     await self._publish(
                         EventType.DATA_STALE,
                         f"{component} data is stale",
@@ -654,6 +767,16 @@ class LiveDataEngine:
                             message=f"{component} data exceeded freshness threshold",
                             component=component,
                             status="STALE",
+                            diagnostics=(
+                                self._tick_diag(
+                                    "snapshot",
+                                    now=now,
+                                    monotonic=watchdog_started,
+                                    default={},
+                                )
+                                if component == "tick"
+                                else None
+                            ),
                         ),
                     )
                 elif not stale:
@@ -707,20 +830,29 @@ class LiveDataEngine:
         severity: EventSeverity = EventSeverity.INFO,
         payload=None,
     ) -> None:
-        await self.events.publish(
-            DomainEvent(
-                event_type=event_type,
-                source=source,
-                severity=severity,
-                correlation_id=uuid4(),
-                payload=payload
-                or SystemStatusPayload(
-                    message=message,
-                    component=source,
-                    status=event_type.value,
-                ),
+        publish_started = perf_counter()
+        try:
+            await self.events.publish(
+                DomainEvent(
+                    event_type=event_type,
+                    source=source,
+                    severity=severity,
+                    correlation_id=uuid4(),
+                    payload=payload
+                    or SystemStatusPayload(
+                        message=message,
+                        component=source,
+                        status=event_type.value,
+                    ),
+                )
             )
-        )
+        finally:
+            self._tick_diag(
+                "record_timing",
+                "event_publish",
+                (perf_counter() - publish_started) * 1_000,
+                event_type.value,
+            )
 
     def _set_runtime_state(self, state: RuntimeState, message: str) -> None:
         if state == self.runtime_state and state not in {RuntimeState.DEGRADED, RuntimeState.ERROR}:
@@ -736,6 +868,7 @@ class LiveDataEngine:
     def _record_runtime_heartbeat(self) -> None:
         """Persist a bounded heartbeat so process existence is not health."""
 
+        heartbeat_started = perf_counter()
         self.health.record(
             "live_runtime",
             self.runtime_state.value,
@@ -754,6 +887,11 @@ class LiveDataEngine:
                     else None
                 ),
             },
+        )
+        self._tick_diag(
+            "record_timing",
+            "runtime_heartbeat_persistence",
+            (perf_counter() - heartbeat_started) * 1_000,
         )
 
     def _record_worker_attempt(self, name: str) -> None:
@@ -785,6 +923,7 @@ class LiveDataEngine:
             last_error_category=None,
         )
         self._workers[name] = worker
+        health_started = perf_counter()
         self.health.record(
             f"worker:{name}",
             "CONNECTED",
@@ -796,6 +935,12 @@ class LiveDataEngine:
                 "failure_count": 0,
             },
         )
+        if name == "tick":
+            self._tick_diag(
+                "record_timing",
+                "tick_health_persistence",
+                (perf_counter() - health_started) * 1_000,
+            )
 
     def _record_worker_failure(self, name: str, exc: Exception) -> None:
         now = datetime.now(UTC)
