@@ -23,6 +23,7 @@ from mt5.symbols import (
     read_symbol_specification,
     read_tick,
 )
+from mt5.window_mode import MT5BackgroundWindowController
 
 
 class MT5BootstrapError(RuntimeError):
@@ -150,6 +151,7 @@ class MT5AutoLauncher:
         verifier: Callable[[Settings, Any], MT5Verification] = verify_mt5_readiness,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic_clock: Callable[[], float] = monotonic,
+        background_window_controller: MT5BackgroundWindowController | None = None,
     ) -> None:
         self.settings = settings
         self.logger = logger or logging.getLogger(__name__)
@@ -159,6 +161,19 @@ class MT5AutoLauncher:
         self._sleep = sleep
         self._monotonic = monotonic_clock
         self._launched_process: Any | None = None
+        self._background_windows = background_window_controller or MT5BackgroundWindowController(
+            enabled=settings.mt5_background_mode,
+            configured_path=settings.mt5_terminal_path,
+            process_probe=self._process_probe,
+            logger=self.logger,
+        )
+
+    @property
+    def background_status(self) -> dict[str, object]:
+        return self._background_windows.status
+
+    def stop_background_monitor(self) -> None:
+        self._background_windows.stop()
 
     async def ensure_ready(self, database: Any) -> MT5StartupResult:
         deadline = self._monotonic() + self.settings.mt5_startup_timeout_seconds
@@ -190,6 +205,13 @@ class MT5AutoLauncher:
                     "database": "PENDING",
                 },
                 reason=reason,
+            )
+        # Run only after MT5 is verified so GUI timing cannot consume readiness time.
+        try:
+            self._background_windows.start(pid)
+        except Exception as exc:
+            self.logger.warning(
+                "MT5 background-window handling unavailable (%s)", type(exc).__name__
             )
         return MT5StartupResult(
             ready=True,

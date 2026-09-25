@@ -217,6 +217,16 @@ class TelegramControlService:
                     self.logger.exception("Telegram control polling failed")
                     await asyncio.sleep(min(30.0, self.settings.telegram_control_poll_seconds * 2))
         finally:
+            try:
+                stop_window_monitor = getattr(
+                    self.mt5_bootstrap, "stop_background_monitor", None
+                )
+                if callable(stop_window_monitor):
+                    stop_window_monitor()
+            except Exception as exc:
+                self.logger.warning(
+                    "MT5 background-window monitor shutdown failed (%s)", type(exc).__name__
+                )
             if self._ipc_server is not None:
                 self._ipc_server.close()
                 self._ipc_server = None
@@ -227,6 +237,14 @@ class TelegramControlService:
 
     async def stop(self) -> None:
         self._stop.set()
+        try:
+            stop_window_monitor = getattr(self.mt5_bootstrap, "stop_background_monitor", None)
+            if callable(stop_window_monitor):
+                stop_window_monitor()
+        except Exception as exc:
+            self.logger.warning(
+                "MT5 background-window monitor shutdown failed (%s)", type(exc).__name__
+            )
         # A control-process shutdown owns the supervised children.  Stop only
         # identities verified by ProcessSupervisor; unverified PIDs remain
         # untouched and are reported as degraded.
@@ -949,6 +967,11 @@ class TelegramControlService:
             "api": records.get("api").state if records.get("api") else "STOPPED",
             "live": live_state,
             "mt5": self._latest_service_state("mt5"),
+            "mt5_background": getattr(
+                self.mt5_bootstrap,
+                "background_status",
+                {"enabled": False, "state": "UNAVAILABLE", "pid": None},
+            ),
             "database": "CONNECTED" if self.database.healthcheck() else "DISCONNECTED",
             "telegram": self._telegram_state(),
             "forward_shadow": forward_status.get("state", "UNKNOWN"),

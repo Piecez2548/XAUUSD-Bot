@@ -99,6 +99,7 @@ class Settings:
     trading_symbol: str | None = None
     mt5_terminal_path: str | None = None
     mt5_auto_launch: bool = False
+    mt5_background_mode: bool = False
     mt5_startup_timeout_seconds: float = 30.0
     mt5_login: int | None = None
     mt5_server: str | None = None
@@ -273,6 +274,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
             terminal_path.strip() if terminal_path and terminal_path.strip() else None
         ),
         mt5_auto_launch=_boolean("MT5_AUTO_LAUNCH", False),
+        mt5_background_mode=_boolean("MT5_BACKGROUND_MODE", False),
         mt5_startup_timeout_seconds=float(os.getenv("MT5_STARTUP_TIMEOUT_SECONDS", "30")),
         mt5_login=_optional_int("MT5_LOGIN"),
         mt5_server=server.strip() if server and server.strip() else None,
