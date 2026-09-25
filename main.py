@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from config.settings import ConfigurationError, load_settings
 from events.bus import EventBus
@@ -20,6 +22,10 @@ from services.backup import create_database_backup
 from services.collector import collect_market_snapshot
 from services.control import TelegramControlService
 from services.live import LiveDataEngine
+from services.live_history_diagnostic import (
+    HistoryDiagnosticError,
+    LiveHistoryDiagnosticClient,
+)
 from services.observatory import ObservatoryService
 from services.research_platform import (
     import_mt5_research_bundle,
@@ -226,6 +232,25 @@ async def _live() -> int:
         database.dispose()
 
 
+def run_live_history_diagnostic(args: argparse.Namespace) -> int:
+    """Request a bounded read from the already-running Live process only."""
+
+    payload = {
+        "request_id": str(uuid4()),
+        "symbol": args.symbol,
+        "timeframe": args.timeframe,
+        "start": args.start,
+        "end": args.end,
+    }
+    try:
+        result = LiveHistoryDiagnosticClient(PROJECT_ROOT).request(payload)
+    except HistoryDiagnosticError as exc:
+        print(json.dumps({"ok": False, "error_code": exc.code}, sort_keys=True))
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 async def _control() -> int:
     """Run the persistent Telegram control plane; it never enables execution."""
 
@@ -400,6 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
             "strategy-research",
             "research-import",
             "backtest",
+            "history-diagnostic",
         ),
         default="phase1",
         help="phase1 is the unchanged default diagnostic",
@@ -414,12 +440,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", default="operational", choices=("operational", "mt5"))
     parser.add_argument("--count", type=int, default=50_000)
     parser.add_argument("--chunk-size", type=int, default=5_000)
+    parser.add_argument("--symbol", default=None, help="configured symbol for bounded Live history diagnostic")
+    parser.add_argument("--start", default=None, help="UTC ISO-8601 start timestamp for history-diagnostic")
+    parser.add_argument("--end", default=None, help="UTC ISO-8601 end timestamp for history-diagnostic")
     return parser
 
 
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     command = args.command
+    if command == "history-diagnostic":
+        return run_live_history_diagnostic(args)
     if command == "phase1":
         return run_phase1()
     if command == "observe":

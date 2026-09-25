@@ -8,6 +8,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
@@ -44,6 +45,11 @@ from persistence.repositories import HistoryRepository, SnapshotRepository, Syst
 from services.demo_execution import DemoExecutionService
 from services.event_loop_diagnostics import EventLoopLagDiagnostics
 from services.forward_shadow import ForwardInput, ForwardShadowWorker
+from services.live_history_diagnostic import (
+    HistoryDiagnosticRequest,
+    LiveHistoryDiagnosticServer,
+    execute_history_diagnostic,
+)
 from services.risk import (
     calculate_risk_snapshot,
     normalize_risk_state,
@@ -109,6 +115,7 @@ class LiveDataEngine:
         self._stop = asyncio.Event()
         self._reconnect_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
+        self._history_diagnostic_server: LiveHistoryDiagnosticServer | None = None
         self._workers: dict[str, WorkerHealth] = {}
         self._last_event_by_key: dict[str, datetime] = {}
         self._stale_components: set[str] = set()
@@ -144,6 +151,7 @@ class LiveDataEngine:
                     await self.gateway.shutdown()
                 await self._reconnect()
             self._set_runtime_state(RuntimeState.CONNECTED, "Live Data Engine synchronized")
+            self._start_history_diagnostic_server(asyncio.get_running_loop())
             self._tasks = [
                 asyncio.create_task(self._worker("tick", self._fast_loop), name="live-tick"),
                 asyncio.create_task(
@@ -188,6 +196,9 @@ class LiveDataEngine:
         if self._stop.is_set() and not self._tasks and self.runtime_state == RuntimeState.STOPPED:
             return
         self._stop.set()
+        if self._history_diagnostic_server is not None:
+            self._history_diagnostic_server.close()
+            self._history_diagnostic_server = None
         tasks, self._tasks = self._tasks, []
         for task in tasks:
             task.cancel()
@@ -200,6 +211,37 @@ class LiveDataEngine:
         self._set_runtime_state(RuntimeState.STOPPED, "Live Data Engine stopped")
         with contextlib.suppress(Exception):
             await self._publish(EventType.SYSTEM_LIVE_STOPPED, "Live Data Engine stopped")
+
+    def _start_history_diagnostic_server(self, loop: asyncio.AbstractEventLoop) -> None:
+        server = LiveHistoryDiagnosticServer(
+            Path(__file__).resolve().parents[1], loop, self._handle_history_diagnostic
+        )
+        try:
+            server.start()
+        except Exception as exc:
+            # Optional diagnostic IPC must never prevent Live from starting.
+            self.logger.warning(
+                "Bounded MT5 history diagnostic unavailable (%s)", type(exc).__name__
+            )
+            return
+        self._history_diagnostic_server = server
+
+    async def _handle_history_diagnostic(
+        self, request: HistoryDiagnosticRequest
+    ) -> dict[str, Any]:
+        payload = {
+            "request_id": request.request_id,
+            "symbol": request.symbol,
+            "timeframe": request.timeframe,
+            "start": request.start.isoformat(),
+            "end": request.end.isoformat(),
+        }
+        return await execute_history_diagnostic(
+            self.gateway,
+            payload,
+            active_symbol=self.state.symbol,
+            runtime_connected=self.runtime_state == RuntimeState.CONNECTED,
+        )
 
     async def _synchronize(self, *, initial: bool = False) -> None:
         await self.gateway.connect()
