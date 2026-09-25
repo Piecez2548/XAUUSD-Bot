@@ -99,6 +99,7 @@ COMMAND_HELP = {
 }
 
 API_READINESS_VERSION = "phase26-supervisor-socket-readiness-v2"
+SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT = 8
 
 
 class TelegramControlService:
@@ -561,6 +562,7 @@ class TelegramControlService:
             details={
                 "verification_state": "COMPLETE" if verification_complete else "INCOMPLETE",
                 "checks": verification_checks,
+                "snapshot_verification": verification.get("snapshot_diagnostic", {}),
                 "rollback_trigger": (
                     None
                     if verification_complete
@@ -1132,7 +1134,38 @@ class TelegramControlService:
             )
             runtime = self._latest_service_state("live_runtime", minimum_timestamp=startup_started_at)
             mt5 = self._latest_service_state("mt5", minimum_timestamp=startup_started_at)
-            _risk, _observed, freshness, _rows, snapshot_id = self._snapshot_context()
+            (
+                _risk,
+                _observed,
+                freshness,
+                _rows,
+                snapshot_id,
+                snapshot_diagnostic,
+            ) = self._snapshot_context_with_diagnostics(
+                minimum_timestamp=startup_started_at
+            )
+            snapshot_diagnostic.update(
+                {
+                    "supervisor_live_record_state": getattr(live_process, "state", None),
+                    "supervisor_live_identity_present": bool(
+                        getattr(live_process, "process_identities", ())
+                    ),
+                    "supervisor_live_identity_verified": bool(
+                        live_process is not None
+                        and live_process.state == "RUNNING"
+                        and getattr(live_process, "pid", None) is not None
+                        and getattr(live_process, "process_create_time", None) is not None
+                        and any(
+                            identity[0] == live_process.pid
+                            and identity[1] == live_process.process_create_time
+                            for identity in (
+                                getattr(live_process, "process_identities", ()) or ()
+                            )
+                            if isinstance(identity, (tuple, list)) and len(identity) == 2
+                        )
+                    ),
+                }
+            )
             checks = {
                 "api": "OK" if api_ok else "WAITING",
                 "live_runtime": "CONNECTED" if runtime == "CONNECTED" else runtime,
@@ -1150,7 +1183,11 @@ class TelegramControlService:
                 and live_process.state == "RUNNING"
             )
             if complete or monotonic() >= deadline:
-                return {"complete": complete, "checks": checks}
+                return {
+                    "complete": complete,
+                    "checks": checks,
+                    "snapshot_diagnostic": snapshot_diagnostic,
+                }
             await asyncio.sleep(0.25)
 
     async def _api_responsive(self) -> bool:
@@ -1970,6 +2007,103 @@ class TelegramControlService:
     def _snapshot_context(self, *, minimum_timestamp: datetime | None = None):
         """Return the latest coherent risk/position view from one persisted cycle."""
 
+        result, _diagnostic = self._select_snapshot_context(
+            minimum_timestamp=minimum_timestamp,
+            capture_diagnostic=False,
+        )
+        return result
+
+    def _snapshot_context_with_diagnostics(
+        self, *, minimum_timestamp: datetime | None = None
+    ):
+        """Return startup snapshot context and one bounded, safe explanation."""
+
+        result, diagnostic = self._select_snapshot_context(
+            minimum_timestamp=minimum_timestamp,
+            capture_diagnostic=True,
+        )
+        return (*result, diagnostic)
+
+    @staticmethod
+    def _snapshot_candidate_diagnostic(
+        *,
+        risk,
+        market,
+        snapshot_count: int,
+        minimum_timestamp: datetime | None,
+        latest_risk_any,
+        latest_market_any,
+        freshness: str,
+        newer_unmatched_market: bool,
+        newer_unmatched_risk: bool,
+    ) -> dict[str, object]:
+        market_after_boundary = (
+            minimum_timestamp is None or market.timestamp >= minimum_timestamp
+        )
+        risk_after_boundary = (
+            minimum_timestamp is None or risk.timestamp >= minimum_timestamp
+        )
+        count_match = risk.open_positions_count == market.open_position_count
+        rows_match = snapshot_count == market.open_position_count
+        newer_market = (
+            latest_market_any is not None
+            and latest_market_any.timestamp > market.timestamp
+        )
+        newer_risk = (
+            latest_risk_any is not None
+            and latest_risk_any.timestamp > risk.timestamp
+        )
+        reasons: list[str] = []
+        if not market_after_boundary:
+            reasons.append("PRE_START_MARKET")
+        if not risk_after_boundary:
+            reasons.append("PRE_START_RISK")
+        if not market.positions_observed_successfully:
+            reasons.append("POSITIONS_NOT_VERIFIED")
+        if not count_match:
+            reasons.append("MARKET_RISK_POSITION_COUNT_MISMATCH")
+        if not rows_match:
+            reasons.append("POSITION_ROW_COUNT_MISMATCH")
+        # The legacy predicate rejects any newer row, not only an unpaired one.
+        if newer_market:
+            reasons.append("NEWER_MARKET_SNAPSHOT")
+        if newer_risk:
+            reasons.append("NEWER_RISK_SNAPSHOT")
+        if freshness != "LIVE":
+            reasons.append("SNAPSHOT_STALE")
+        return {
+            "market_snapshot_id": str(market.id),
+            "market_timestamp": market.timestamp.isoformat(),
+            "risk_snapshot_id": str(risk.id),
+            "risk_timestamp": risk.timestamp.isoformat(),
+            "market_position_count": market.open_position_count,
+            "risk_position_count": risk.open_positions_count,
+            "persisted_position_row_count": snapshot_count,
+            "positions_observed_successfully": bool(
+                market.positions_observed_successfully
+            ),
+            "market_after_start_boundary": market_after_boundary,
+            "risk_after_start_boundary": risk_after_boundary,
+            "market_risk_count_match": count_match,
+            "market_position_rows_match": rows_match,
+            "newer_market_snapshot_exists": newer_market,
+            "newer_risk_snapshot_exists": newer_risk,
+            "newer_unmatched_market_exists": newer_unmatched_market,
+            "newer_unmatched_risk_exists": newer_unmatched_risk,
+            "candidate_freshness": freshness,
+            "candidate_accepted": not reasons,
+            "rejection_reason": reasons[0] if reasons else "CANDIDATE_ACCEPTED",
+            "rejection_reasons": reasons,
+        }
+
+    def _select_snapshot_context(
+        self,
+        *,
+        minimum_timestamp: datetime | None,
+        capture_diagnostic: bool,
+    ):
+        """Apply the existing coherence predicate and optionally explain it."""
+
         with self.database.session() as session:
             candidates = session.execute(
                 select(RiskSnapshotRecord, MarketSnapshotRecord)
@@ -2000,11 +2134,49 @@ class TelegramControlService:
                 .order_by(desc(MarketSnapshotRecord.timestamp))
                 .limit(1)
             )
-            for risk, market in candidates:
-                if minimum_timestamp is not None and (
-                    risk.timestamp < minimum_timestamp or market.timestamp < minimum_timestamp
-                ):
-                    continue
+            latest_risk_all = latest_risk_any
+            latest_market_all = latest_market_any
+            if capture_diagnostic and minimum_timestamp is not None:
+                try:
+                    latest_risk_all = session.scalar(
+                        select(RiskSnapshotRecord)
+                        .order_by(desc(RiskSnapshotRecord.timestamp))
+                        .limit(1)
+                    )
+                    latest_market_all = session.scalar(
+                        select(MarketSnapshotRecord)
+                        .order_by(desc(MarketSnapshotRecord.timestamp))
+                        .limit(1)
+                    )
+                except Exception as exc:
+                    # Optional evidence must not turn a normal readiness read
+                    # into a startup failure; retain only the exception type.
+                    latest_risk_all = latest_risk_any
+                    latest_market_all = latest_market_any
+                    diagnostic_error_type = type(exc).__name__
+                else:
+                    diagnostic_error_type = None
+            else:
+                diagnostic_error_type = None
+
+            diagnostic: dict[str, object] = {
+                "startup_boundary": (
+                    minimum_timestamp.isoformat() if minimum_timestamp is not None else None
+                ),
+                "boundary_filter_applied": minimum_timestamp is not None,
+                "candidate_evaluations": [],
+                "candidate_evaluations_total": 0,
+                "selected_candidate": None,
+                "rejection_reason": None,
+                "rejection_reasons": [],
+                "market_snapshot_generation_link": "ABSENT",
+                "risk_snapshot_generation_link": "ABSENT",
+            }
+            if diagnostic_error_type is not None:
+                diagnostic["diagnostic_collection_error_type"] = diagnostic_error_type
+            candidate_diagnostics: list[dict[str, object]] = []
+            selected_diagnostic: dict[str, object] | None = None
+            for candidate_index, (risk, market) in enumerate(candidates):
                 snapshot_count = (
                     session.scalar(
                         select(func.count())
@@ -2013,14 +2185,90 @@ class TelegramControlService:
                     )
                     or 0
                 )
+                freshness = _freshness_state(
+                    risk.timestamp,
+                    max_age_seconds=self.settings.data_stale_position_seconds,
+                )
+                newer_unmatched_market = False
+                newer_unmatched_risk = False
                 if (
-                    risk.open_positions_count != market.open_position_count
-                    or snapshot_count != market.open_position_count
+                    capture_diagnostic
+                    and candidate_index < SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT
                 ):
-                    continue
-                if (latest_risk_any is not None and latest_risk_any.timestamp > risk.timestamp) or (
-                    latest_market_any is not None and latest_market_any.timestamp > market.timestamp
-                ):
+                    try:
+                        newer_unmatched_market = bool(
+                            latest_market_all is not None
+                            and latest_market_all.timestamp > market.timestamp
+                            and session.scalar(
+                                select(func.count())
+                                .select_from(RiskSnapshotRecord)
+                                .where(
+                                    RiskSnapshotRecord.market_snapshot_id
+                                    == latest_market_all.id
+                                )
+                            )
+                            == 0
+                        )
+                        newer_unmatched_risk = bool(
+                            latest_risk_all is not None
+                            and latest_risk_all.timestamp > risk.timestamp
+                            and (
+                                latest_risk_all.market_snapshot_id is None
+                                or session.get(
+                                    MarketSnapshotRecord,
+                                    latest_risk_all.market_snapshot_id,
+                                )
+                                is None
+                            )
+                        )
+                    except Exception as exc:
+                        diagnostic["diagnostic_collection_error_type"] = type(exc).__name__
+                candidate_diagnostic: dict[str, object] | None = None
+                if capture_diagnostic and candidate_index < SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT:
+                    try:
+                        candidate_diagnostic = self._snapshot_candidate_diagnostic(
+                            risk=risk,
+                            market=market,
+                            snapshot_count=int(snapshot_count),
+                            minimum_timestamp=minimum_timestamp,
+                            latest_risk_any=latest_risk_any,
+                            latest_market_any=latest_market_any,
+                            freshness=freshness,
+                            newer_unmatched_market=newer_unmatched_market,
+                            newer_unmatched_risk=newer_unmatched_risk,
+                        )
+                    except Exception as exc:
+                        diagnostic["diagnostic_collection_error_type"] = type(exc).__name__
+                if capture_diagnostic:
+                    diagnostic["candidate_evaluations_total"] = candidate_index + 1
+                if candidate_diagnostic is not None:
+                    candidate_diagnostics.append(candidate_diagnostic)
+                market_after_boundary = (
+                    minimum_timestamp is None or market.timestamp >= minimum_timestamp
+                )
+                risk_after_boundary = (
+                    minimum_timestamp is None or risk.timestamp >= minimum_timestamp
+                )
+                count_match = risk.open_positions_count == market.open_position_count
+                rows_match = snapshot_count == market.open_position_count
+                has_newer_risk = (
+                    latest_risk_any is not None
+                    and latest_risk_any.timestamp > risk.timestamp
+                )
+                has_newer_market = (
+                    latest_market_any is not None
+                    and latest_market_any.timestamp > market.timestamp
+                )
+                accepted_by_coherence = (
+                    market_after_boundary
+                    and risk_after_boundary
+                    and market.positions_observed_successfully
+                    and count_match
+                    and rows_match
+                    and not has_newer_risk
+                    and not has_newer_market
+                )
+                if not accepted_by_coherence:
                     continue
                 rows = session.execute(
                     select(PositionRecord, PositionSnapshotRecord)
@@ -2032,11 +2280,47 @@ class TelegramControlService:
                     .order_by(PositionRecord.first_seen_at)
                 ).all()
                 observed_at = risk.timestamp
-                freshness = _freshness_state(
-                    observed_at,
-                    max_age_seconds=self.settings.data_stale_position_seconds,
-                )
-                return risk, observed_at, freshness, tuple(rows), market.id
+                if capture_diagnostic:
+                    if candidate_diagnostic is None:
+                        candidate_diagnostic = {
+                            "market_snapshot_id": str(market.id),
+                            "market_timestamp": market.timestamp.isoformat(),
+                            "risk_snapshot_id": str(risk.id),
+                            "risk_timestamp": risk.timestamp.isoformat(),
+                            "candidate_freshness": freshness,
+                            "candidate_accepted": freshness == "LIVE",
+                            "rejection_reason": (
+                                "CANDIDATE_ACCEPTED"
+                                if freshness == "LIVE"
+                                else "SNAPSHOT_STALE"
+                            ),
+                            "rejection_reasons": (
+                                [] if freshness == "LIVE" else ["SNAPSHOT_STALE"]
+                            ),
+                        }
+                    diagnostic["candidate_evaluations"] = candidate_diagnostics
+                    diagnostic["selected_candidate"] = candidate_diagnostic
+                    diagnostic["rejection_reason"] = (
+                        "CANDIDATE_ACCEPTED" if freshness == "LIVE" else "SNAPSHOT_STALE"
+                    )
+                    diagnostic["rejection_reasons"] = (
+                        [] if freshness == "LIVE" else ["SNAPSHOT_STALE"]
+                    )
+                    self._add_latest_snapshot_diagnostics(
+                        diagnostic,
+                        latest_market_all,
+                        latest_risk_all,
+                        minimum_timestamp,
+                    )
+                result = (risk, observed_at, freshness, tuple(rows), market.id)
+                return (result, diagnostic) if capture_diagnostic else (result, None)
+
+                # Candidate diagnostics are intentionally only kept for the
+                # bounded prefix; the actual predicate still evaluates all.
+            if capture_diagnostic:
+                diagnostic["candidate_evaluations"] = candidate_diagnostics
+                if candidate_diagnostics:
+                    selected_diagnostic = candidate_diagnostics[0]
 
             risk = session.scalar(
                 select(RiskSnapshotRecord)
@@ -2081,7 +2365,91 @@ class TelegramControlService:
             )
             if risk is not None or market is not None:
                 freshness = "STATE_SYNC_PENDING"
-            return risk, observed_at, freshness, tuple(rows), None
+            if capture_diagnostic:
+                self._add_latest_snapshot_diagnostics(
+                    diagnostic,
+                    latest_market_all,
+                    latest_risk_all,
+                    minimum_timestamp,
+                )
+                if selected_diagnostic is not None:
+                    diagnostic["selected_candidate"] = selected_diagnostic
+                    reasons = selected_diagnostic.get("rejection_reasons", [])
+                    diagnostic["rejection_reasons"] = reasons
+                    diagnostic["rejection_reason"] = (
+                        reasons[0] if reasons else "NO_COHERENT_CANDIDATE"
+                    )
+                else:
+                    reasons: list[str] = []
+                    if latest_market_all is None:
+                        reasons.append("NO_MARKET_SNAPSHOT")
+                    elif minimum_timestamp is not None and (
+                        latest_market_all.timestamp < minimum_timestamp
+                    ):
+                        reasons.append("PRE_START_MARKET")
+                    elif not latest_market_all.positions_observed_successfully:
+                        reasons.append("POSITIONS_NOT_VERIFIED")
+                    if latest_risk_all is None:
+                        reasons.append("NO_RISK_SNAPSHOT")
+                    elif minimum_timestamp is not None and (
+                        latest_risk_all.timestamp < minimum_timestamp
+                    ):
+                        reasons.append("PRE_START_RISK")
+                    if not reasons:
+                        reasons.append("NO_MATCHING_MARKET_RISK_PAIR")
+                    diagnostic["rejection_reasons"] = reasons
+                    diagnostic["rejection_reason"] = reasons[0]
+            result = (risk, observed_at, freshness, tuple(rows), None)
+            return (result, diagnostic) if capture_diagnostic else (result, None)
+
+    def _add_latest_snapshot_diagnostics(
+        self,
+        diagnostic: dict[str, object],
+        market,
+        risk,
+        minimum_timestamp: datetime | None,
+    ) -> None:
+        """Add optional latest-row details without affecting snapshot selection."""
+
+        try:
+            market_details = self._latest_market_diagnostic(market, minimum_timestamp)
+            risk_details = self._latest_risk_diagnostic(risk, minimum_timestamp)
+        except Exception as exc:
+            # Diagnostic formatting is best-effort. Keep only a safe type name;
+            # never serialize exception text or traceback data.
+            diagnostic["diagnostic_collection_error_type"] = type(exc).__name__
+            return
+        diagnostic["latest_market_snapshot"] = market_details
+        diagnostic["latest_risk_snapshot"] = risk_details
+
+    @staticmethod
+    def _latest_market_diagnostic(market, minimum_timestamp):
+        if market is None:
+            return None
+        return {
+            "market_snapshot_id": str(market.id),
+            "market_timestamp": market.timestamp.isoformat(),
+            "market_position_count": market.open_position_count,
+            "positions_observed_successfully": bool(
+                market.positions_observed_successfully
+            ),
+            "market_after_start_boundary": (
+                minimum_timestamp is None or market.timestamp >= minimum_timestamp
+            ),
+        }
+
+    @staticmethod
+    def _latest_risk_diagnostic(risk, minimum_timestamp):
+        if risk is None:
+            return None
+        return {
+            "risk_snapshot_id": str(risk.id),
+            "risk_timestamp": risk.timestamp.isoformat(),
+            "risk_position_count": risk.open_positions_count,
+            "risk_after_start_boundary": (
+                minimum_timestamp is None or risk.timestamp >= minimum_timestamp
+            ),
+        }
 
     def _logs(self) -> str:
         with self.database.session() as session:
