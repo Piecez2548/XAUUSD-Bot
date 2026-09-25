@@ -19,7 +19,7 @@ from persistence.orm import (
 from services.authentication import AuthenticationService
 
 PRE_AUTH_REVISION = "20260924_0013"
-CURRENT_HEAD_REVISION = "20260924_0016"
+CURRENT_HEAD_REVISION = "20260925_0017"
 TAILSCALE = {
     "Tailscale-User-Login": "operator@example.test",
     "Origin": "https://dashboard.tailnet.test",
@@ -298,6 +298,137 @@ def test_pair_zone_0015_0016_upgrade_downgrade_round_trip_preserves_existing_dat
                 ("pre-pair-zone-config",),
             ).scalar_one()
         assert preserved == '{"preserve":"through-pair-zone-migration"}'
+    finally:
+        database.dispose()
+
+
+def test_risk_snapshot_index_0016_0017_round_trip_preserves_existing_data(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "risk-index-0016-0017-round-trip.db"
+    config = _config(db_path)
+    command.upgrade(config, "20260924_0016")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        with database.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "INSERT INTO configuration_versions "
+                "(id, version, timestamp, configuration, checksum, active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "pre-risk-index-config",
+                    "preserved-before-risk-index",
+                    "2026-09-25 00:00:00",
+                    '{"preserve":"unrelated-production-era-data"}',
+                    "d" * 64,
+                    1,
+                ),
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO risk_snapshots "
+                "(id, market_snapshot_id, timestamp, equity, balance, "
+                "open_risk_percent, open_risk_amount, remaining_risk_percent, "
+                "risk_per_position, daily_pnl, daily_realized_loss, drawdown_percent, "
+                "max_trade_risk_percent, max_aggregate_risk_percent, "
+                "open_positions_count, unbounded_positions_count, "
+                "margin_usage_percent, free_margin) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "risk-before-index",
+                    None,
+                    "2026-09-25 00:00:00",
+                    10100.0,
+                    10000.0,
+                    0.25,
+                    25.0,
+                    5.75,
+                    "[]",
+                    5.0,
+                    0.0,
+                    0.1,
+                    2.0,
+                    6.0,
+                    0,
+                    0,
+                    1.0,
+                    10000.0,
+                ),
+            )
+        revision, _tables = _revision_and_tables(database)
+        assert revision == "20260924_0016"
+        assert "ix_risk_snapshots_market_snapshot_id" not in {
+            index["name"] for index in inspect(database.engine).get_indexes("risk_snapshots")
+        }
+    finally:
+        database.dispose()
+
+    command.upgrade(config, "20260925_0017")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, _tables = _revision_and_tables(database)
+        assert revision == "20260925_0017"
+        assert "ix_risk_snapshots_market_snapshot_id" in {
+            index["name"] for index in inspect(database.engine).get_indexes("risk_snapshots")
+        }
+        with database.engine.connect() as connection:
+            preserved = connection.exec_driver_sql(
+                "SELECT version, configuration, checksum, active "
+                "FROM configuration_versions WHERE id = ?",
+                ("pre-risk-index-config",),
+            ).one()
+        assert tuple(preserved) == (
+            "preserved-before-risk-index",
+            '{"preserve":"unrelated-production-era-data"}',
+            "d" * 64,
+            1,
+        )
+        with database.engine.connect() as connection:
+            preserved_risk = connection.exec_driver_sql(
+                "SELECT id, equity, balance, open_risk_percent, free_margin "
+                "FROM risk_snapshots WHERE id = ?",
+                ("risk-before-index",),
+            ).one()
+        assert tuple(preserved_risk) == (
+            "risk-before-index",
+            10100.0,
+            10000.0,
+            0.25,
+            10000.0,
+        )
+    finally:
+        database.dispose()
+
+    command.downgrade(config, "20260924_0016")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, _tables = _revision_and_tables(database)
+        assert revision == "20260924_0016"
+        assert "ix_risk_snapshots_market_snapshot_id" not in {
+            index["name"] for index in inspect(database.engine).get_indexes("risk_snapshots")
+        }
+        with database.engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql(
+                    "SELECT configuration FROM configuration_versions WHERE id = ?",
+                    ("pre-risk-index-config",),
+                ).scalar_one()
+                == '{"preserve":"unrelated-production-era-data"}'
+            )
+            assert connection.exec_driver_sql(
+                "SELECT equity, balance FROM risk_snapshots WHERE id = ?",
+                ("risk-before-index",),
+            ).one() == (10100.0, 10000.0)
+    finally:
+        database.dispose()
+
+    command.upgrade(config, "20260925_0017")
+    database = Database(f"sqlite:///{db_path.as_posix()}")
+    try:
+        revision, _tables = _revision_and_tables(database)
+        assert revision == "20260925_0017"
+        assert "ix_risk_snapshots_market_snapshot_id" in {
+            index["name"] for index in inspect(database.engine).get_indexes("risk_snapshots")
+        }
     finally:
         database.dispose()
 

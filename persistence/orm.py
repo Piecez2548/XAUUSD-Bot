@@ -419,7 +419,9 @@ class ShadowOutcomeRecord(IdMixin, Base):
 class RiskSnapshotRecord(IdMixin, Base):
     __tablename__ = "risk_snapshots"
 
-    market_snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("market_snapshots.id"))
+    market_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("market_snapshots.id"), index=True
+    )
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
     equity: Mapped[float] = mapped_column(Float)
     balance: Mapped[float] = mapped_column(Float)

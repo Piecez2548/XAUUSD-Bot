@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
 from uuid import UUID
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, tuple_
 
 from domain.events import AiDecisionEventPayload, DomainEvent, EventSeverity, EventType
 from models.market import MarketSnapshot
@@ -23,7 +24,11 @@ from persistence.repositories import (
 )
 from services.shadow_diagnostics import OperationToken, ShadowDiagnostics
 from services.shadow_engine import ShadowDecisionEngine
-from services.shadow_replay import load_persisted_snapshots
+from services.shadow_replay import (
+    PersistedSnapshotPage,
+    SnapshotCursor,
+    load_persisted_snapshot_page,
+)
 from services.strategy_platform import StrategyRegistry
 
 
@@ -74,6 +79,10 @@ class ShadowDecisionWorker:
         self._needs_catchup = True
         self.stall_ttl_seconds = max(60.0, settings.live_account_interval_seconds * 4)
         self._catchup_pending_keys: set[tuple[str, datetime, str]] = set()
+        self._catchup_pending: deque[tuple[tuple[str, datetime, str], ShadowInput]] = deque()
+        self._catchup_cursor: SnapshotCursor | None = None
+        self._catchup_has_more = True
+        self._catchup_page_size = 50
         self._restore_prior_health()
 
     def _record_strategy_activation(self) -> None:
@@ -203,17 +212,17 @@ class ShadowDecisionWorker:
             return "DEGRADED"
         if self.total_backlog:
             reference = self._last_success_at or self._last_received_candle
-            if reference is not None and (
-                datetime.now(UTC) - reference
-            ).total_seconds() <= self.stall_ttl_seconds:
+            if (
+                reference is not None
+                and (datetime.now(UTC) - reference).total_seconds() <= self.stall_ttl_seconds
+            ):
                 return "CATCHING_UP"
             return "DEGRADED"
         if (
             self._last_received_candle is not None
             and self._last_processed_candle != self._last_received_candle
             and (
-                datetime.now(UTC)
-                - (self._last_success_at or self._last_received_candle)
+                datetime.now(UTC) - (self._last_success_at or self._last_received_candle)
             ).total_seconds()
             > self.stall_ttl_seconds
         ):
@@ -296,6 +305,7 @@ class ShadowDecisionWorker:
         key = self._key(item)
         self._processing_keys.add(key)
         completed = False
+        failed = False
         try:
             evaluation_token = self._diagnostic_begin("DECISION_EVALUATION", "ON_EVENT_LOOP")
             try:
@@ -307,9 +317,7 @@ class ShadowDecisionWorker:
                 )
             finally:
                 self._diagnostic_finish(evaluation_token)
-            persistence_token = self._diagnostic_begin(
-                "DECISION_PERSISTENCE", "ON_EVENT_LOOP"
-            )
+            persistence_token = self._diagnostic_begin("DECISION_PERSISTENCE", "ON_EVENT_LOOP")
             try:
                 record = self.repository.persist(decision)
             finally:
@@ -362,59 +370,87 @@ class ShadowDecisionWorker:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            failed = True
             self._record_failure(exc)
             self.logger.warning("Shadow decision worker failed (%s)", type(exc).__name__)
         finally:
             self._processing_keys.discard(key)
-            self._deferred_keys.discard(key)
             if completed:
                 self._completed_keys.add(key)
+                self._deferred_keys.discard(key)
+            elif failed and key not in self._catchup_pending_keys:
+                # Keep a failed durable input retryable without rewinding the
+                # cursor and rereading all previously traversed snapshots.
+                self._catchup_pending.appendleft((key, item))
+                self._catchup_pending_keys.add(key)
+                self._needs_catchup = True
             self._diagnostic_finish(total_token)
             self._update_diagnostic_pressure()
 
     async def _catch_up(self) -> None:
         if not self._needs_catchup:
             return
-        if self._queue.full() and not self._deferred_keys and not self._catchup_pending_keys:
-            self._needs_catchup = False
+        if self._queue.full():
             return
-        load_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
-        try:
+        if not self._catchup_pending:
+            load_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
             try:
-                snapshots = await asyncio.to_thread(
-                    load_persisted_snapshots, self.database, limit=None
-                )
-            except Exception as exc:
-                self._record_failure(exc)
-                return
-        finally:
-            self._diagnostic_finish(load_token)
-        processing_token = self._diagnostic_begin(
-            "CATCH_UP_PROCESSING", "ON_EVENT_LOOP"
-        )
-        try:
-            ordered = self._order_catch_up_rows(snapshots)
-        finally:
-            self._diagnostic_finish(processing_token)
-        existing_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
-        try:
-            existing = await asyncio.to_thread(self._existing_decision_keys)
-        finally:
-            self._diagnostic_finish(existing_token)
-        processing_token = self._diagnostic_begin(
-            "CATCH_UP_PROCESSING", "ON_EVENT_LOOP"
-        )
-        try:
-            self._process_catch_up_rows(ordered, existing)
-        finally:
-            self._diagnostic_finish(processing_token)
-            self._update_diagnostic_pressure()
+                try:
+                    page = await asyncio.to_thread(
+                        load_persisted_snapshot_page,
+                        self.database,
+                        limit=self._catchup_page_size,
+                        after=self._catchup_cursor,
+                    )
+                except Exception as exc:
+                    self._record_failure(exc)
+                    return
+            finally:
+                self._diagnostic_finish(load_token)
+            processing_token = self._diagnostic_begin("CATCH_UP_PROCESSING", "ON_EVENT_LOOP")
+            try:
+                ordered = self._order_catch_up_rows(page)
+                candidates = self._catch_up_candidates(ordered)
+            finally:
+                self._diagnostic_finish(processing_token)
+            if candidates:
+                existing_token = self._diagnostic_begin("CATCH_UP_LOAD", "OFFLOADED_WORKER")
+                try:
+                    try:
+                        existing = await asyncio.to_thread(
+                            self._existing_decision_keys,
+                            [key for key, _item in candidates],
+                        )
+                    except Exception as exc:
+                        self._record_failure(exc)
+                        return
+                finally:
+                    self._diagnostic_finish(existing_token)
+                processing_token = self._diagnostic_begin("CATCH_UP_PROCESSING", "ON_EVENT_LOOP")
+                try:
+                    for key, item in candidates:
+                        if key in existing:
+                            self._completed_keys.add(key)
+                            self._deferred_keys.discard(key)
+                            continue
+                        self._catchup_pending.append((key, item))
+                        self._catchup_pending_keys.add(key)
+                finally:
+                    self._diagnostic_finish(processing_token)
+            self._catchup_cursor = page.next_cursor
+            self._catchup_has_more = page.has_more
 
-    def _order_catch_up_rows(self, snapshots):
+        self._enqueue_catchup_batch()
+        self._needs_catchup = bool(self._catchup_pending or self._catchup_has_more)
+        self._update_diagnostic_pressure()
+
+    def _order_catch_up_rows(self, page: PersistedSnapshotPage):
         ordered = sorted(
-            snapshots,
-            key=lambda item: ShadowDecisionEngine._m5_timestamp(
-                item[0], candles_are_closed=True
+            page.rows,
+            key=lambda item: (
+                ShadowDecisionEngine._m5_timestamp(item[0], candles_are_closed=True),
+                item[0].generated_at,
+                str(item[1]),
             ),
         )
         if ordered:
@@ -427,9 +463,7 @@ class ShadowDecisionWorker:
             )
         return ordered
 
-    def _process_catch_up_rows(
-        self, ordered, existing: set[tuple[str, datetime, str]]
-    ) -> None:
+    def _catch_up_candidates(self, ordered):
         candidates: list[tuple[tuple[str, datetime, str], ShadowInput]] = []
         candidate_keys: set[tuple[str, datetime, str]] = set()
         for snapshot, snapshot_id, risk in ordered:
@@ -442,28 +476,30 @@ class ShadowDecisionWorker:
                 key in self._queued_keys
                 or key in self._processing_keys
                 or key in self._completed_keys
+                or key in self._catchup_pending_keys
                 or key in candidate_keys
             ):
                 continue
-            if key in existing:
-                self._completed_keys.add(key)
-                continue
-            self._catchup_pending_keys.add(key)
             candidate_keys.add(key)
             candidates.append((key, ShadowInput(snapshot, snapshot_id, risk, True)))
+
+        return candidates
+
+    def _enqueue_catchup_batch(self) -> None:
         # Add a small historical batch so live items retain priority and the
         # scheduler cannot be monopolized by replay.
-        for index, (key, item) in enumerate(candidates):
-            if self._queue.full() or index >= 2:
+        for _ in range(2):
+            if self._queue.full() or not self._catchup_pending:
                 break
+            key, item = self._catchup_pending.popleft()
             self._set_max("_last_received_candle", key[1])
             self._set_max("_latest_received_m5", key[1])
             self._queued_keys.add(key)
+            self._deferred_keys.discard(key)
             self._catchup_pending_keys.discard(key)
             self._queue.put_nowait(item)
             with contextlib.suppress(Exception):
                 self._queued_at[key] = (datetime.now(UTC), perf_counter())
-        self._needs_catchup = bool(self._catchup_pending_keys or self._deferred_keys)
 
     def _key(self, item: ShadowInput) -> tuple[str, datetime, str]:
         return (
@@ -546,17 +582,28 @@ class ShadowDecisionWorker:
             return None
         return max(0.0, (self._latest_available_m5 - self._latest_processed_m5).total_seconds())
 
-    def _existing_decision_keys(self) -> set[tuple[str, datetime, str]]:
+    def _existing_decision_keys(
+        self, keys: list[tuple[str, datetime, str]] | None = None
+    ) -> set[tuple[str, datetime, str]]:
         from persistence.orm import ShadowDecisionRecord
 
+        if keys is not None and not keys:
+            return set()
         with self.database.session() as session:
-            rows = session.execute(
-                select(
-                    ShadowDecisionRecord.symbol,
-                    ShadowDecisionRecord.m5_candle_timestamp,
-                    ShadowDecisionRecord.strategy_version,
+            query = select(
+                ShadowDecisionRecord.symbol,
+                ShadowDecisionRecord.m5_candle_timestamp,
+                ShadowDecisionRecord.strategy_version,
+            )
+            if keys is not None:
+                query = query.where(
+                    tuple_(
+                        ShadowDecisionRecord.symbol,
+                        ShadowDecisionRecord.m5_candle_timestamp,
+                        ShadowDecisionRecord.strategy_version,
+                    ).in_(keys)
                 )
-            ).all()
+            rows = session.execute(query).all()
         return {(symbol, timestamp, version) for symbol, timestamp, version in rows}
 
     def _restore_prior_health(self) -> None:

@@ -24,7 +24,7 @@ from services.control import TelegramControlService
 from services.features import FeatureValidationError, extract_features
 from services.risk import calculate_risk_snapshot
 from services.shadow_engine import ShadowDecisionEngine
-from services.shadow_replay import replay_snapshots
+from services.shadow_replay import PersistedSnapshotPage, SnapshotCursor, replay_snapshots
 from services.shadow_service import ShadowDecisionWorker, ShadowInput
 
 
@@ -274,9 +274,7 @@ async def test_shadow_worker_persists_consecutive_no_trade_candles(shadow_databa
         }
     )
     worker = ShadowDecisionWorker(
-        Settings(),
-        shadow_database,
-        EventBus(logging.getLogger("shadow-test")),
+        Settings(), shadow_database, EventBus(logging.getLogger("shadow-test")),
         logger=logging.getLogger("shadow-test"),
     )
     for index in range(5):
@@ -456,8 +454,11 @@ async def test_shadow_catch_up_records_offloaded_load_and_loop_processing(
         Settings(), shadow_database, EventBus(logging.getLogger("shadow-catchup-diagnostics")),
         logger=logging.getLogger("shadow-catchup-diagnostics"),
     )
-    monkeypatch.setattr(shadow_service_module, "load_persisted_snapshots", lambda *_a, **_k: [])
-    monkeypatch.setattr(worker, "_existing_decision_keys", lambda: set())
+    monkeypatch.setattr(
+        shadow_service_module,
+        "load_persisted_snapshot_page",
+        lambda *_a, **_k: PersistedSnapshotPage((), None, False, 0),
+    )
     worker._needs_catchup = True
 
     await worker._catch_up()
@@ -756,15 +757,24 @@ async def test_shadow_restart_catchup_is_chronological_and_idempotent(
             }
         }
     )
+    page_rows = [
+        (first, uuid4(), _engine_risk(first)),
+        (second, uuid4(), _engine_risk(second)),
+    ]
+    cursor = SnapshotCursor(datetime(2026, 1, 1, tzinfo=UTC), str(page_rows[-1][1]))
     monkeypatch.setattr(
-        "services.shadow_service.load_persisted_snapshots",
-        lambda _database, limit=None: [
-            (second, None, _engine_risk(second)),
-            (first, None, _engine_risk(first)),
-        ],
+        "services.shadow_service.load_persisted_snapshot_page",
+        lambda _database, *, limit, after: PersistedSnapshotPage(
+            tuple(page_rows) if after is None else (),
+            cursor if after is None else None,
+            False,
+            len(page_rows) if after is None else 0,
+        ),
     )
     worker = ShadowDecisionWorker(
-        Settings(), shadow_database, EventBus(logging.getLogger("shadow-test")),
+        Settings(),
+        shadow_database,
+        EventBus(logging.getLogger("shadow-test")),
         logger=logging.getLogger("shadow-test"),
     )
     await worker._catch_up()
