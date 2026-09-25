@@ -15,7 +15,7 @@ from time import monotonic, perf_counter
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, literal_column, select
 
 from config.settings import Settings
 from mt5.bootstrap import MT5AutoLauncher, MT5StartupResult
@@ -99,7 +99,6 @@ COMMAND_HELP = {
 }
 
 API_READINESS_VERSION = "phase26-supervisor-socket-readiness-v2"
-SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT = 8
 
 
 class TelegramControlService:
@@ -2037,6 +2036,7 @@ class TelegramControlService:
         minimum_timestamp: datetime | None,
         latest_risk_any,
         latest_market_any,
+        latest_timestamp_view_matches: bool,
         freshness: str,
         newer_unmatched_market: bool,
         newer_unmatched_risk: bool,
@@ -2092,6 +2092,7 @@ class TelegramControlService:
             "market_position_rows_match": rows_match,
             "newer_market_snapshot_exists": newer_market,
             "newer_risk_snapshot_exists": newer_risk,
+            "latest_timestamp_view_matches": latest_timestamp_view_matches,
             "newer_unmatched_market_exists": newer_unmatched_market,
             "newer_unmatched_risk_exists": newer_unmatched_risk,
             "candidate_freshness": freshness,
@@ -2106,62 +2107,69 @@ class TelegramControlService:
         minimum_timestamp: datetime | None,
         capture_diagnostic: bool,
     ):
-        """Apply the existing coherence predicate and optionally explain it."""
+        """Select one linked latest pair from a single, bounded SQL read."""
 
         with self.database.session() as session:
-            candidates = session.execute(
-                select(RiskSnapshotRecord, MarketSnapshotRecord)
-                .join(
-                    MarketSnapshotRecord,
-                    RiskSnapshotRecord.market_snapshot_id == MarketSnapshotRecord.id,
-                )
-                .where(MarketSnapshotRecord.positions_observed_successfully.is_(True))
-                .order_by(desc(RiskSnapshotRecord.timestamp))
-            ).all()
-            latest_risk_any = session.scalar(
-                select(RiskSnapshotRecord)
-                .where(
-                    RiskSnapshotRecord.timestamp >= minimum_timestamp
-                    if minimum_timestamp is not None
-                    else True
-                )
-                .order_by(desc(RiskSnapshotRecord.timestamp))
-                .limit(1)
+            candidate = self._load_latest_snapshot_candidate(
+                session, minimum_timestamp=minimum_timestamp
             )
-            latest_market_any = session.scalar(
-                select(MarketSnapshotRecord)
-                .where(
-                    MarketSnapshotRecord.timestamp >= minimum_timestamp
-                    if minimum_timestamp is not None
-                    else True
+            if candidate is None:
+                latest_market_id, latest_risk_id = session.execute(
+                    self._latest_snapshot_ids(minimum_timestamp=minimum_timestamp)
+                ).one()
+                risk = None
+                market = None
+                position_snapshot_count = 0
+                latest_market_any = (
+                    session.get(MarketSnapshotRecord, latest_market_id)
+                    if latest_market_id is not None
+                    else None
                 )
-                .order_by(desc(MarketSnapshotRecord.timestamp))
-                .limit(1)
-            )
-            latest_risk_all = latest_risk_any
-            latest_market_all = latest_market_any
-            if capture_diagnostic and minimum_timestamp is not None:
-                try:
-                    latest_risk_all = session.scalar(
-                        select(RiskSnapshotRecord)
-                        .order_by(desc(RiskSnapshotRecord.timestamp))
-                        .limit(1)
-                    )
-                    latest_market_all = session.scalar(
-                        select(MarketSnapshotRecord)
-                        .order_by(desc(MarketSnapshotRecord.timestamp))
-                        .limit(1)
-                    )
-                except Exception as exc:
-                    # Optional evidence must not turn a normal readiness read
-                    # into a startup failure; retain only the exception type.
-                    latest_risk_all = latest_risk_any
-                    latest_market_all = latest_market_any
-                    diagnostic_error_type = type(exc).__name__
-                else:
-                    diagnostic_error_type = None
+                latest_risk_any = (
+                    session.get(RiskSnapshotRecord, latest_risk_id)
+                    if latest_risk_id is not None
+                    else None
+                )
+                latest_timestamp_view_matches = False
             else:
-                diagnostic_error_type = None
+                (
+                    risk,
+                    market,
+                    position_snapshot_count,
+                    latest_market_id,
+                    latest_risk_id,
+                ) = candidate
+                latest_market_any = (
+                    session.get(MarketSnapshotRecord, latest_market_id)
+                    if latest_market_id is not None
+                    else None
+                )
+                latest_risk_any = (
+                    session.get(RiskSnapshotRecord, latest_risk_id)
+                    if latest_risk_id is not None
+                    else None
+                )
+                latest_timestamp_view_matches = (
+                    (latest_market_any is None or latest_market_any.timestamp <= market.timestamp)
+                    and (latest_risk_any is None or latest_risk_any.timestamp <= risk.timestamp)
+                )
+
+            latest_market_all = latest_market_any
+            latest_risk_all = latest_risk_any
+            if capture_diagnostic and minimum_timestamp is not None and candidate is None:
+                latest_market_all_id, latest_risk_all_id = session.execute(
+                    self._latest_snapshot_ids(minimum_timestamp=None)
+                ).one()
+                latest_market_all = (
+                    session.get(MarketSnapshotRecord, latest_market_all_id)
+                    if latest_market_all_id is not None
+                    else None
+                )
+                latest_risk_all = (
+                    session.get(RiskSnapshotRecord, latest_risk_all_id)
+                    if latest_risk_all_id is not None
+                    else None
+                )
 
             diagnostic: dict[str, object] = {
                 "startup_boundary": (
@@ -2176,77 +2184,63 @@ class TelegramControlService:
                 "market_snapshot_generation_link": "ABSENT",
                 "risk_snapshot_generation_link": "ABSENT",
             }
-            if diagnostic_error_type is not None:
-                diagnostic["diagnostic_collection_error_type"] = diagnostic_error_type
-            candidate_diagnostics: list[dict[str, object]] = []
-            selected_diagnostic: dict[str, object] | None = None
-            for candidate_index, (risk, market) in enumerate(candidates):
-                snapshot_count = (
-                    session.scalar(
-                        select(func.count())
-                        .select_from(PositionSnapshotRecord)
-                        .where(PositionSnapshotRecord.market_snapshot_id == market.id)
-                    )
-                    or 0
-                )
+            candidate_diagnostic: dict[str, object] | None = None
+            if candidate is not None:
                 freshness = _freshness_state(
                     risk.timestamp,
                     max_age_seconds=self.settings.data_stale_position_seconds,
                 )
                 newer_unmatched_market = False
                 newer_unmatched_risk = False
-                if (
-                    capture_diagnostic
-                    and candidate_index < SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT
-                ):
+                if capture_diagnostic:
                     try:
                         newer_unmatched_market = bool(
-                            latest_market_all is not None
-                            and latest_market_all.timestamp > market.timestamp
+                            latest_market_any is not None
+                            and latest_market_any.timestamp > market.timestamp
                             and session.scalar(
                                 select(func.count())
                                 .select_from(RiskSnapshotRecord)
                                 .where(
                                     RiskSnapshotRecord.market_snapshot_id
-                                    == latest_market_all.id
+                                    == latest_market_any.id
                                 )
                             )
                             == 0
                         )
                         newer_unmatched_risk = bool(
-                            latest_risk_all is not None
-                            and latest_risk_all.timestamp > risk.timestamp
+                            latest_risk_any is not None
+                            and latest_risk_any.timestamp > risk.timestamp
                             and (
-                                latest_risk_all.market_snapshot_id is None
+                                latest_risk_any.market_snapshot_id is None
                                 or session.get(
                                     MarketSnapshotRecord,
-                                    latest_risk_all.market_snapshot_id,
+                                    latest_risk_any.market_snapshot_id,
                                 )
                                 is None
                             )
                         )
                     except Exception as exc:
                         diagnostic["diagnostic_collection_error_type"] = type(exc).__name__
-                candidate_diagnostic: dict[str, object] | None = None
-                if capture_diagnostic and candidate_index < SNAPSHOT_DIAGNOSTIC_CANDIDATE_LIMIT:
                     try:
                         candidate_diagnostic = self._snapshot_candidate_diagnostic(
                             risk=risk,
                             market=market,
-                            snapshot_count=int(snapshot_count),
+                            snapshot_count=int(position_snapshot_count or 0),
                             minimum_timestamp=minimum_timestamp,
                             latest_risk_any=latest_risk_any,
                             latest_market_any=latest_market_any,
+                            latest_timestamp_view_matches=latest_timestamp_view_matches,
                             freshness=freshness,
                             newer_unmatched_market=newer_unmatched_market,
                             newer_unmatched_risk=newer_unmatched_risk,
                         )
                     except Exception as exc:
                         diagnostic["diagnostic_collection_error_type"] = type(exc).__name__
-                if capture_diagnostic:
-                    diagnostic["candidate_evaluations_total"] = candidate_index + 1
-                if candidate_diagnostic is not None:
-                    candidate_diagnostics.append(candidate_diagnostic)
+                    diagnostic["candidate_evaluations_total"] = 1
+                    if candidate_diagnostic is not None:
+                        diagnostic["candidate_evaluations"] = [candidate_diagnostic]
+                        diagnostic["selected_candidate"] = candidate_diagnostic
+
                 market_after_boundary = (
                     minimum_timestamp is None or market.timestamp >= minimum_timestamp
                 )
@@ -2254,98 +2248,44 @@ class TelegramControlService:
                     minimum_timestamp is None or risk.timestamp >= minimum_timestamp
                 )
                 count_match = risk.open_positions_count == market.open_position_count
-                rows_match = snapshot_count == market.open_position_count
-                has_newer_risk = (
-                    latest_risk_any is not None
-                    and latest_risk_any.timestamp > risk.timestamp
-                )
-                has_newer_market = (
-                    latest_market_any is not None
-                    and latest_market_any.timestamp > market.timestamp
-                )
+                rows_match = position_snapshot_count == market.open_position_count
                 accepted_by_coherence = (
                     market_after_boundary
                     and risk_after_boundary
                     and market.positions_observed_successfully
                     and count_match
                     and rows_match
-                    and not has_newer_risk
-                    and not has_newer_market
+                    and latest_timestamp_view_matches
                 )
-                if not accepted_by_coherence:
-                    continue
-                rows = session.execute(
-                    select(PositionRecord, PositionSnapshotRecord)
-                    .join(
-                        PositionSnapshotRecord,
-                        PositionSnapshotRecord.position_id == PositionRecord.id,
-                    )
-                    .where(PositionSnapshotRecord.market_snapshot_id == market.id)
-                    .order_by(PositionRecord.first_seen_at)
-                ).all()
-                observed_at = risk.timestamp
-                if capture_diagnostic:
-                    if candidate_diagnostic is None:
-                        candidate_diagnostic = {
-                            "market_snapshot_id": str(market.id),
-                            "market_timestamp": market.timestamp.isoformat(),
-                            "risk_snapshot_id": str(risk.id),
-                            "risk_timestamp": risk.timestamp.isoformat(),
-                            "candidate_freshness": freshness,
-                            "candidate_accepted": freshness == "LIVE",
-                            "rejection_reason": (
-                                "CANDIDATE_ACCEPTED"
-                                if freshness == "LIVE"
-                                else "SNAPSHOT_STALE"
-                            ),
-                            "rejection_reasons": (
-                                [] if freshness == "LIVE" else ["SNAPSHOT_STALE"]
-                            ),
-                        }
-                    diagnostic["candidate_evaluations"] = candidate_diagnostics
-                    diagnostic["selected_candidate"] = candidate_diagnostic
-                    diagnostic["rejection_reason"] = (
-                        "CANDIDATE_ACCEPTED" if freshness == "LIVE" else "SNAPSHOT_STALE"
-                    )
-                    diagnostic["rejection_reasons"] = (
-                        [] if freshness == "LIVE" else ["SNAPSHOT_STALE"]
-                    )
-                    self._add_latest_snapshot_diagnostics(
-                        diagnostic,
-                        latest_market_all,
-                        latest_risk_all,
-                        minimum_timestamp,
-                    )
-                result = (risk, observed_at, freshness, tuple(rows), market.id)
-                return (result, diagnostic) if capture_diagnostic else (result, None)
+                if accepted_by_coherence:
+                    rows = session.execute(
+                        select(PositionRecord, PositionSnapshotRecord)
+                        .join(
+                            PositionSnapshotRecord,
+                            PositionSnapshotRecord.position_id == PositionRecord.id,
+                        )
+                        .where(PositionSnapshotRecord.market_snapshot_id == market.id)
+                        .order_by(PositionRecord.first_seen_at)
+                    ).all()
+                    if capture_diagnostic:
+                        if candidate_diagnostic is not None:
+                            diagnostic["rejection_reason"] = candidate_diagnostic[
+                                "rejection_reason"
+                            ]
+                            diagnostic["rejection_reasons"] = candidate_diagnostic[
+                                "rejection_reasons"
+                            ]
+                        self._add_latest_snapshot_diagnostics(
+                            diagnostic,
+                            latest_market_all,
+                            latest_risk_all,
+                            minimum_timestamp,
+                        )
+                    result = (risk, risk.timestamp, freshness, tuple(rows), market.id)
+                    return (result, diagnostic) if capture_diagnostic else (result, None)
 
-                # Candidate diagnostics are intentionally only kept for the
-                # bounded prefix; the actual predicate still evaluates all.
-            if capture_diagnostic:
-                diagnostic["candidate_evaluations"] = candidate_diagnostics
-                if candidate_diagnostics:
-                    selected_diagnostic = candidate_diagnostics[0]
-
-            risk = session.scalar(
-                select(RiskSnapshotRecord)
-                .where(
-                    RiskSnapshotRecord.timestamp >= minimum_timestamp
-                    if minimum_timestamp is not None
-                    else True
-                )
-                .order_by(desc(RiskSnapshotRecord.timestamp))
-                .limit(1)
-            )
-            market = session.scalar(
-                select(MarketSnapshotRecord)
-                .where(
-                    MarketSnapshotRecord.timestamp >= minimum_timestamp
-                    if minimum_timestamp is not None
-                    else True
-                )
-                .order_by(desc(MarketSnapshotRecord.timestamp))
-                .limit(1)
-            )
+            risk = latest_risk_any
+            market = latest_market_any
             active = session.scalars(
                 select(PositionRecord)
                 .where(PositionRecord.closed_observed_at.is_(None))
@@ -2376,9 +2316,8 @@ class TelegramControlService:
                     latest_risk_all,
                     minimum_timestamp,
                 )
-                if selected_diagnostic is not None:
-                    diagnostic["selected_candidate"] = selected_diagnostic
-                    reasons = selected_diagnostic.get("rejection_reasons", [])
+                if candidate_diagnostic is not None:
+                    reasons = candidate_diagnostic.get("rejection_reasons", [])
                     diagnostic["rejection_reasons"] = reasons
                     diagnostic["rejection_reason"] = (
                         reasons[0] if reasons else "NO_COHERENT_CANDIDATE"
@@ -2399,12 +2338,77 @@ class TelegramControlService:
                         latest_risk_all.timestamp < minimum_timestamp
                     ):
                         reasons.append("PRE_START_RISK")
+                    if (
+                        latest_market_any is not None or latest_risk_any is not None
+                    ):
+                        reasons.append("LATEST_MARKET_RISK_LINK_MISMATCH")
                     if not reasons:
                         reasons.append("NO_MATCHING_MARKET_RISK_PAIR")
                     diagnostic["rejection_reasons"] = reasons
                     diagnostic["rejection_reason"] = reasons[0]
             result = (risk, observed_at, freshness, tuple(rows), None)
             return (result, diagnostic) if capture_diagnostic else (result, None)
+
+    @staticmethod
+    def _latest_snapshot_ids(*, minimum_timestamp: datetime | None):
+        # SQLite's timestamp indexes also carry rowid, giving tied timestamps
+        # a stable insertion-order tie-break without a temporary sort.
+        market_query = select(MarketSnapshotRecord.id).order_by(
+            desc(MarketSnapshotRecord.timestamp),
+            desc(literal_column("market_snapshots.rowid")),
+        )
+        risk_query = select(RiskSnapshotRecord.id).order_by(
+            desc(RiskSnapshotRecord.timestamp),
+            desc(literal_column("risk_snapshots.rowid")),
+        )
+        if minimum_timestamp is not None:
+            market_query = market_query.where(
+                MarketSnapshotRecord.timestamp >= minimum_timestamp
+            )
+            risk_query = risk_query.where(RiskSnapshotRecord.timestamp >= minimum_timestamp)
+        return select(
+            market_query.limit(1).scalar_subquery(),
+            risk_query.limit(1).scalar_subquery(),
+        )
+
+    @staticmethod
+    def _load_latest_snapshot_candidate(session, *, minimum_timestamp: datetime | None):
+        """Read the latest market/risk identities and their linked pair atomically.
+
+        The scalar latest-ID subqueries and pair validation execute as one SQL
+        statement, so a later Live write cannot invalidate this read view.
+        Only one candidate and its position-row count are materialized.
+        """
+        latest_ids = TelegramControlService._latest_snapshot_ids(
+            minimum_timestamp=minimum_timestamp
+        )
+        latest_market_id, latest_risk_id = latest_ids.selected_columns
+        position_snapshot_count = (
+            select(func.count())
+            .select_from(PositionSnapshotRecord)
+            .where(PositionSnapshotRecord.market_snapshot_id == MarketSnapshotRecord.id)
+            .correlate(MarketSnapshotRecord)
+            .scalar_subquery()
+        )
+        statement = (
+            select(
+                RiskSnapshotRecord,
+                MarketSnapshotRecord,
+                position_snapshot_count.label("position_snapshot_count"),
+                latest_market_id.label("latest_market_id"),
+                latest_risk_id.label("latest_risk_id"),
+            )
+            .join(
+                MarketSnapshotRecord,
+                RiskSnapshotRecord.market_snapshot_id == MarketSnapshotRecord.id,
+            )
+            .where(
+                MarketSnapshotRecord.id == latest_market_id,
+                RiskSnapshotRecord.id == latest_risk_id,
+            )
+            .limit(1)
+        )
+        return session.execute(statement).first()
 
     def _add_latest_snapshot_diagnostics(
         self,

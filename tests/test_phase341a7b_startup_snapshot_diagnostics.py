@@ -222,8 +222,8 @@ def test_old_coherent_and_new_incomplete_market_remains_pending(tmp_path, model_
         )
         assert snapshot_id is None
         assert freshness == "STATE_SYNC_PENDING"
-        assert "PRE_START_MARKET" in diagnostic["rejection_reasons"]
         assert "PRE_START_RISK" in diagnostic["rejection_reasons"]
+        assert "LATEST_MARKET_RISK_LINK_MISMATCH" in diagnostic["rejection_reasons"]
         assert diagnostic["latest_market_snapshot"]["market_after_start_boundary"] is True
     finally:
         database.dispose()
@@ -260,15 +260,9 @@ def test_one_side_after_boundary_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("newer_row", "expected_flag", "expected_reason"),
-    [
-        ("market", "newer_unmatched_market_exists", "NEWER_MARKET_SNAPSHOT"),
-        ("risk", "newer_unmatched_risk_exists", "NEWER_RISK_SNAPSHOT"),
-    ],
+    "newer_row", ["market", "risk"]
 )
-def test_newer_unmatched_row_rejection_is_explained(
-    tmp_path, model_parts, newer_row, expected_flag, expected_reason
-):
+def test_newer_unmatched_row_rejection_is_explained(tmp_path, model_parts, newer_row):
     service, database = _service(tmp_path)
     try:
         boundary = datetime.now(UTC) - timedelta(milliseconds=5)
@@ -276,17 +270,27 @@ def test_newer_unmatched_row_rejection_is_explained(
             service, model_parts, boundary + timedelta(milliseconds=1)
         )
         if newer_row == "market":
-            _add_unmatched_market(database, market_id, boundary + timedelta(seconds=1))
+            latest_id = _add_unmatched_market(
+                database, market_id, boundary + timedelta(seconds=1)
+            )
         else:
-            _add_unmatched_risk(database, risk_id, boundary + timedelta(seconds=1))
+            latest_id = _add_unmatched_risk(
+                database, risk_id, boundary + timedelta(seconds=1)
+            )
         _risk, _observed, freshness, _rows, snapshot_id, diagnostic = (
             service._snapshot_context_with_diagnostics(minimum_timestamp=boundary)
         )
         assert snapshot_id is None
         assert freshness == "STATE_SYNC_PENDING"
-        candidate = diagnostic["selected_candidate"]
-        assert candidate[expected_flag] is True
-        assert expected_reason in candidate["rejection_reasons"]
+        assert diagnostic["selected_candidate"] is None
+        assert "LATEST_MARKET_RISK_LINK_MISMATCH" in diagnostic["rejection_reasons"]
+        latest = diagnostic[
+            "latest_market_snapshot" if newer_row == "market" else "latest_risk_snapshot"
+        ]
+        assert latest["market_snapshot_id" if newer_row == "market" else "risk_snapshot_id"] == (
+            latest_id
+        )
+        assert latest_id not in {market_id, risk_id}
     finally:
         database.dispose()
 
@@ -314,6 +318,85 @@ def test_incident_shaped_repeated_zero_position_cycles_are_accepted(tmp_path, mo
         assert diagnostic["candidate_evaluations_total"] == 1
         assert diagnostic["selected_candidate"]["candidate_accepted"] is True
         assert diagnostic["market_snapshot_generation_link"] == "ABSENT"
+    finally:
+        database.dispose()
+
+
+def test_new_pair_visible_in_verification_view_is_selected(tmp_path, model_parts):
+    service, database = _service(tmp_path)
+    try:
+        boundary = datetime.now(UTC) - timedelta(seconds=5)
+        pair_a = _persist_cycle(service, model_parts, boundary + timedelta(seconds=1))
+        pair_b = _persist_cycle(service, model_parts, boundary + timedelta(seconds=2))
+
+        risk, _observed, freshness, _rows, snapshot_id, diagnostic = (
+            service._snapshot_context_with_diagnostics(minimum_timestamp=boundary)
+        )
+
+        assert risk is not None
+        assert snapshot_id == pair_b[0]
+        assert freshness == "LIVE"
+        assert diagnostic["candidate_evaluations_total"] == 1
+        assert diagnostic["selected_candidate"]["market_snapshot_id"] == pair_b[0]
+        assert snapshot_id != pair_a[0]
+    finally:
+        database.dispose()
+
+
+def test_new_pair_after_atomic_selection_does_not_reject_selected_pair(
+    tmp_path, model_parts, monkeypatch
+):
+    service, database = _service(tmp_path)
+    try:
+        boundary = datetime.now(UTC) - timedelta(seconds=5)
+        pair_a = _persist_cycle(service, model_parts, boundary + timedelta(seconds=1))
+        original_loader = service._load_latest_snapshot_candidate
+        inserted = False
+
+        def insert_pair_after_selection(session, *, minimum_timestamp):
+            nonlocal inserted
+            selected = original_loader(session, minimum_timestamp=minimum_timestamp)
+            if not inserted:
+                inserted = True
+                _persist_cycle(service, model_parts, boundary + timedelta(seconds=2))
+            return selected
+
+        monkeypatch.setattr(
+            service, "_load_latest_snapshot_candidate", insert_pair_after_selection
+        )
+        risk, _observed, freshness, _rows, snapshot_id, diagnostic = (
+            service._snapshot_context_with_diagnostics(minimum_timestamp=boundary)
+        )
+
+        assert inserted is True
+        assert risk is not None
+        assert snapshot_id == pair_a[0]
+        assert freshness == "LIVE"
+        assert diagnostic["selected_candidate"]["market_snapshot_id"] == pair_a[0]
+        assert diagnostic["selected_candidate"]["candidate_accepted"] is True
+    finally:
+        database.dispose()
+
+
+def test_same_timestamp_candidates_have_deterministic_tie_order(tmp_path, model_parts):
+    service, database = _service(tmp_path)
+    try:
+        timestamp = datetime.now(UTC) - timedelta(seconds=1)
+        pair_ids = [
+            _persist_cycle(service, model_parts, timestamp),
+            _persist_cycle(service, model_parts, timestamp),
+        ]
+        # Equal timestamps are resolved by the stable SQLite insertion rowid.
+        expected_market_id, expected_risk_id = pair_ids[-1]
+
+        risk, _observed, freshness, _rows, snapshot_id, _diagnostic = (
+            service._snapshot_context_with_diagnostics()
+        )
+
+        assert risk is not None
+        assert risk.id == expected_risk_id
+        assert snapshot_id == expected_market_id
+        assert freshness == "LIVE"
     finally:
         database.dispose()
 
@@ -553,8 +636,8 @@ def test_candidate_diagnostic_history_is_bounded(tmp_path, model_parts):
         )
         assert snapshot_id is None
         assert freshness == "UNKNOWN"
-        assert diagnostic["candidate_evaluations_total"] == 10
-        assert len(diagnostic["candidate_evaluations"]) == 8
+        assert diagnostic["candidate_evaluations_total"] == 0
+        assert len(diagnostic["candidate_evaluations"]) == 0
         assert diagnostic["rejection_reason"] in {"PRE_START_MARKET", "PRE_START_RISK"}
     finally:
         database.dispose()
