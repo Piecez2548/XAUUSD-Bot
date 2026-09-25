@@ -19,7 +19,7 @@ from persistence.orm import (
 from services.authentication import AuthenticationService
 
 PRE_AUTH_REVISION = "20260924_0013"
-CURRENT_HEAD_REVISION = "20260925_0018"
+CURRENT_HEAD_REVISION = "20260925_0019"
 TAILSCALE = {
     "Tailscale-User-Login": "operator@example.test",
     "Origin": "https://dashboard.tailnet.test",

@@ -891,8 +891,9 @@ class TelegramControlService:
                 return False
             await asyncio.sleep(0.25)
 
-    def _status(self) -> str:
-        records = self.supervisor.status()
+    def _status(self, records=None) -> str:
+        if records is None:
+            records = self.supervisor.status()
         live_process = records.get("live")
         runtime = self._latest_service_state("live_runtime")
         live_state = (
@@ -920,10 +921,11 @@ class TelegramControlService:
             ]
         )
 
-    def _operator_status_payload(self) -> dict[str, object]:
+    def _operator_status_payload(self, records=None) -> dict[str, object]:
         """Return an operator view with generation-verified Pair Zone state."""
 
-        records = self.supervisor.status()
+        if records is None:
+            records = self.supervisor.status()
         live_process = records.get("live")
         runtime = self._latest_service_state("live_runtime")
         live_state = (
@@ -1050,22 +1052,24 @@ class TelegramControlService:
         command = request["command"]
         actor = request["actor"]
         if command == "status":
+            records = self.supervisor.status()
             return {
                 "ok": True,
                 "duplicate": False,
                 "operation_id": operation_id,
                 "command": command,
-                "message": self._status(),
-                "status": self._operator_status_payload(),
+                "message": self._status(records),
+                "status": self._operator_status_payload(records),
             }
         if command == "demo_status":
+            records = self.supervisor.status()
             return {
                 "ok": True,
                 "duplicate": False,
                 "operation_id": operation_id,
                 "command": command,
                 "message": self._demo_status(),
-                "status": self._operator_status_payload(),
+                "status": self._operator_status_payload(records),
             }
         async with self._operation_lock:
             existing = self.audit.find_by_correlation_id(operation_id)

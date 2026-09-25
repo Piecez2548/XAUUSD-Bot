@@ -464,6 +464,13 @@ class SystemEventRecord(Base):
 
 class SystemHealthRecord(IdMixin, Base):
     __tablename__ = "system_health"
+    __table_args__ = (
+        Index(
+            "ix_system_health_component_timestamp",
+            "component",
+            text("timestamp DESC"),
+        ),
+    )
 
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), index=True)
     component: Mapped[str] = mapped_column(String(64), index=True)
