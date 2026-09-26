@@ -770,6 +770,158 @@ class ResearchRobustnessRecord(IdMixin, Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
 
 
+RESEARCH_PIPELINE_STATUSES = (
+    "'WAITING', 'READY', 'RUNNING', 'PASS', 'BLOCKED', 'FAILED', 'SKIPPED', 'CANCELLED'"
+)
+
+
+class ResearchPipelineRunRecord(IdMixin, Base):
+    """Immutable request manifest for one research pipeline experiment."""
+
+    __tablename__ = "research_pipeline_runs"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_research_pipeline_idempotency"),
+        UniqueConstraint("run_id", name="uq_research_pipeline_run_id"),
+        CheckConstraint(
+            f"status IN ({RESEARCH_PIPELINE_STATUSES})", name="ck_research_pipeline_status"
+        ),
+        CheckConstraint("execution_allowed = false", name="ck_research_pipeline_read_only"),
+        Index("ix_research_pipeline_status_created", "status", "created_at"),
+    )
+
+    run_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    pipeline_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    experiment_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_inputs_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    source_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    configuration_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    code_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="WAITING", index=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    terminal_reason: Mapped[str | None] = mapped_column(String(200))
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ResearchStageRunRecord(IdMixin, Base):
+    """One durable attempt of one research pipeline stage."""
+
+    __tablename__ = "research_stage_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "pipeline_run_id", "stage_key", "attempt_number",
+            name="uq_research_stage_attempt",
+        ),
+        CheckConstraint(
+            f"status IN ({RESEARCH_PIPELINE_STATUSES})", name="ck_research_stage_status"
+        ),
+        CheckConstraint(
+            "progress_processed >= 0 AND "
+            "(progress_total IS NULL OR "
+            "(progress_total >= 0 AND progress_processed <= progress_total))",
+            name="ck_research_stage_progress",
+        ),
+        CheckConstraint("attempt_number >= 1", name="ck_research_stage_attempt_number"),
+        CheckConstraint("execution_allowed = false", name="ck_research_stage_read_only"),
+        Index("ix_research_stage_pipeline_status", "pipeline_run_id", "status"),
+    )
+
+    stage_run_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    pipeline_run_id: Mapped[str] = mapped_column(
+        ForeignKey("research_pipeline_runs.id"), nullable=False
+    )
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="READY", index=True)
+    progress_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_total: Mapped[int | None] = mapped_column(Integer)
+    progress_unit: Mapped[str | None] = mapped_column(String(64))
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(100))
+    failure_reason_code: Mapped[str | None] = mapped_column(String(100))
+    terminal_reason: Mapped[str | None] = mapped_column(String(200))
+    input_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    evidence_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    gate_evidence_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    lineage_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ResearchArtifactRecord(IdMixin, Base):
+    """Metadata-only, content-addressed research artifact registry."""
+
+    __tablename__ = "research_artifacts"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", name="uq_research_artifact_id"),
+        UniqueConstraint("content_sha256", name="uq_research_artifact_content"),
+        CheckConstraint("size_bytes >= 0", name="ck_research_artifact_size"),
+        CheckConstraint(
+            "publication_status IN ('UNPUBLISHED', 'PUBLISHED', 'REJECTED')",
+            name="ck_research_artifact_publication",
+        ),
+        CheckConstraint(
+            "validation_status IN ('UNVALIDATED', 'VALID', 'INVALID')",
+            name="ck_research_artifact_validation",
+        ),
+        CheckConstraint("execution_allowed = false", name="ck_research_artifact_read_only"),
+        Index("ix_research_artifacts_pipeline_created", "pipeline_run_id", "created_at"),
+    )
+
+    artifact_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    artifact_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    logical_locator: Mapped[str] = mapped_column(String(200), nullable=False)
+    pipeline_run_id: Mapped[str] = mapped_column(
+        ForeignKey("research_pipeline_runs.id"), nullable=False
+    )
+    producer_stage_run_id: Mapped[str] = mapped_column(
+        ForeignKey("research_stage_runs.id"), nullable=False
+    )
+    publication_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="UNPUBLISHED"
+    )
+    validation_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="UNVALIDATED"
+    )
+    gate_evidence_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    lineage_references_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
 class ForwardValidationSessionRecord(IdMixin, Base):
     """Durable, forward-only shadow validation session manifest."""
 

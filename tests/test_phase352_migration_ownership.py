@@ -19,7 +19,7 @@ from persistence.orm import (
 from services.authentication import AuthenticationService
 
 PRE_AUTH_REVISION = "20260924_0013"
-CURRENT_HEAD_REVISION = "20260925_0019"
+CURRENT_HEAD_REVISION = "20260926_0020"
 TAILSCALE = {
     "Tailscale-User-Login": "operator@example.test",
     "Origin": "https://dashboard.tailnet.test",
@@ -205,7 +205,13 @@ def test_migrated_0013_database_preserves_legacy_row_through_head(tmp_path: Path
         assert pre_upgrade_tables <= post_upgrade_tables
         assert post_upgrade_tables - pre_upgrade_tables == (
             AUTH_SCHEMA_TABLE_NAMES
-            | {"pair_zone_evaluations", "model_inference_evaluations"}
+            | {
+                "pair_zone_evaluations",
+                "model_inference_evaluations",
+                "research_pipeline_runs",
+                "research_stage_runs",
+                "research_artifacts",
+            }
         )
         assert tuple(row) == (
             "legacy-config-id",
