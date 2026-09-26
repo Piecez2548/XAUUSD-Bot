@@ -21,6 +21,7 @@ from sqlalchemy import Select, desc, func, or_, select
 
 from analytics.service import AnalyticsService, TradeSample
 from api.realtime import RealtimeHub
+from api.research_roadmap import register_research_roadmap_routes
 from api.static_dashboard import DashboardStaticFiles
 from config.csrf_policy import (
     MutationClass,
@@ -407,6 +408,7 @@ def create_app(
     app.state.realtime = realtime
     app.state.control_ipc = control_ipc or ControlIpcClient(PROJECT_ROOT)
     app.state.auth_service = AuthenticationService(db, runtime_settings)
+    register_research_roadmap_routes(app, db)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(runtime_settings.cors_origins),

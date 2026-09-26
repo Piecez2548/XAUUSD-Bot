@@ -85,6 +85,7 @@ REMOTE_ALLOWED_EXACT_PATHS = frozenset(
         "/api/research/compare",
         "/api/research/datasets",
         "/api/research/robustness",
+        "/api/research/roadmap",
         "/api/research/runs",
         "/api/research/strategies",
         "/api/risk/current",
@@ -104,6 +105,8 @@ REMOTE_ALLOWED_EXACT_PATHS = frozenset(
 )
 
 _REMOTE_ALLOWED_PARAMETER_PATHS = (
+    re.compile(r"^/api/research/roadmap/runs/[^/]+$"),
+    re.compile(r"^/api/research/roadmap/runs/[^/]+/timeline$"),
     re.compile(r"^/api/research/runs/[^/]+/curve$"),
     re.compile(r"^/api/trades/[^/]+$"),
     re.compile(r"^/api/trades/[^/]+/events$"),
