@@ -164,7 +164,10 @@ ALERT_SCORE_THRESHOLD = INTELLIGENCE_CONTRACT.alert_score_threshold
 ALERT_COOLDOWN = timedelta(minutes=INTELLIGENCE_CONTRACT.alert_cooldown_minutes)
 PIVOT_LEFT_BARS = INTELLIGENCE_CONTRACT.pivot_left_bars
 PIVOT_RIGHT_BARS = INTELLIGENCE_CONTRACT.pivot_right_bars
-MIN_HISTORY = {Timeframe.M15: 8, Timeframe.M5: 20}
+# M15 readiness requires the complete ATR window consumed by extract_features;
+# structure is then checked independently from the same newest segment.
+M15_ATR_PERIOD = 14
+MIN_HISTORY = {Timeframe.M15: M15_ATR_PERIOD, Timeframe.M5: 20}
 EXPECTED_INTERVAL = {Timeframe.M15: timedelta(minutes=15), Timeframe.M5: timedelta(minutes=5)}
 
 
@@ -247,12 +250,24 @@ class MarketContextEngine:
         values = tuple(candle for candle in candles if candle.timestamp <= as_of)
         if not candles_are_closed and values:
             values = values[:-1]
-        if len(values) < MIN_HISTORY[timeframe]:
-            raise FeatureValidationError(f"INSUFFICIENT_HISTORY_{timeframe.value}")
         timestamps = [candle.timestamp for candle in values]
         if any(left >= right for left, right in zip(timestamps, timestamps[1:], strict=False)):
             raise FeatureValidationError(f"UNSORTED_OR_DUPLICATE_{timeframe.value}")
         expected = EXPECTED_INTERVAL[timeframe]
+        if timeframe == Timeframe.M15:
+            # A discontinuity makes everything before it unknown.  The newest
+            # segment is the only history that may contribute to M15 context;
+            # no recurrence, wall-clock, or session inference is involved.
+            segment_start = 0
+            for index, (left, right) in enumerate(zip(timestamps, timestamps[1:], strict=False)):
+                if right - left != expected:
+                    segment_start = index + 1
+            values = values[segment_start:]
+            if len(values) < MIN_HISTORY[timeframe]:
+                raise FeatureValidationError("INSUFFICIENT_CONTINUOUS_HISTORY_M15")
+            return values
+        if len(values) < MIN_HISTORY[timeframe]:
+            raise FeatureValidationError(f"INSUFFICIENT_HISTORY_{timeframe.value}")
         if any((right - left) != expected for left, right in zip(timestamps, timestamps[1:], strict=False)):
             raise FeatureValidationError(f"TIMEFRAME_GAP_{timeframe.value}")
         return values
@@ -330,6 +345,13 @@ class MarketContextEngine:
         m5_points = self._swings(m5)
         m15_structure, m15_trend = self._structure(m15_points)
         m5_structure, m5_trend = self._structure(m5_points)
+        if m15_structure == "INSUFFICIENT":
+            return MarketContext(
+                symbol=snapshot.symbol.name, as_of=as_of, version=self.version,
+                data_status=DataQualityStatus.INSUFFICIENT_DATA,
+                data_reasons=("INSUFFICIENT_STRUCTURE_M15",), session=_session(as_of),
+                latest_m15_timestamp=m15[-1].timestamp, latest_m5_timestamp=m5[-1].timestamp,
+            )
         try:
             m15_features = extract_features(m15, timeframe="M15", spread=snapshot.symbol.spread, forming_last=False)
             m5_features = extract_features(m5, timeframe="M5", spread=snapshot.symbol.spread, forming_last=False)

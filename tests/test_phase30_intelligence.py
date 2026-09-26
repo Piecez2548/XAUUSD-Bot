@@ -234,3 +234,158 @@ def test_intelligence_serialization_and_forward_persistence_are_versioned(tmp_pa
         assert stored.forward_session_id is None
         assert len(session.scalars(select(StrategyIntelligenceRecord)).all()) == 1
     database.dispose()
+
+
+def _structured_m15(count: int, start: datetime, *, step: float = 0.3) -> tuple[Candle, ...]:
+    values = [100 + index * step + (1.5 if index % 2 else 0.0) for index in range(count)]
+    return tuple(
+        candle(start + timedelta(minutes=15 * index), value)
+        for index, value in enumerate(values)
+    )
+
+
+def _snapshot_with_m15(m15: tuple[Candle, ...]) -> MarketSnapshot:
+    base = snapshot()
+    return base.model_copy(update={
+        "candles": {**base.candles, Timeframe.M15: m15},
+        "generated_at": m15[-1].timestamp,
+    })
+
+
+def _recent_start() -> datetime:
+    return snapshot().candles[Timeframe.M5][-1].timestamp - timedelta(minutes=15 * 13)
+
+
+def test_m15_exact_fourteen_closed_candles_are_numerically_sufficient():
+    engine = MarketContextEngine()
+    sufficient = _snapshot_with_m15(_structured_m15(14, _recent_start()))
+    context = engine.build(sufficient)
+    assert context.data_status.value == "READY"
+    assert context.m15_atr is not None
+
+    insufficient = _snapshot_with_m15(_structured_m15(13, _recent_start()))
+    context = engine.build(insufficient)
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert "INSUFFICIENT_CONTINUOUS_HISTORY_M15" in context.data_reasons
+
+
+def test_m15_requires_two_confirmed_highs_and_lows_after_numeric_check():
+    values = tuple(
+        candle(_recent_start() + timedelta(minutes=15 * index), 100 + index)
+        for index in range(14)
+    )
+    context = MarketContextEngine().build(_snapshot_with_m15(values))
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert context.data_reasons == ("INSUFFICIENT_STRUCTURE_M15",)
+
+    sufficient = MarketContextEngine().build(
+        _snapshot_with_m15(_structured_m15(14, _recent_start()))
+    )
+    highs = [point for point in sufficient.m15_swing_points if point.kind == "SWING_HIGH"]
+    lows = [point for point in sufficient.m15_swing_points if point.kind == "SWING_LOW"]
+    assert len(highs) >= 2
+    assert len(lows) >= 2
+    assert all(point.left_bars == 1 and point.right_bars == 1 for point in (*highs, *lows))
+    assert all(point.confirmed_at <= sufficient.as_of for point in (*highs, *lows))
+
+
+def test_m15_uses_only_the_newest_continuous_segment_and_does_not_leak_old_data():
+    start = _recent_start()
+    recent = _structured_m15(14, start)
+    old = tuple(
+        candle(start - timedelta(days=2) + timedelta(minutes=15 * index), 10_000 - index * 100)
+        for index in range(8)
+    )
+    segmented = _snapshot_with_m15((*old, *recent))
+    recent_only = _snapshot_with_m15(recent)
+    engine = MarketContextEngine()
+    segmented_context = engine.build(segmented)
+    recent_context = engine.build(recent_only)
+
+    assert segmented_context.data_status.value == "READY"
+    assert segmented_context.latest_m15_timestamp == recent[-1].timestamp
+    assert segmented_context.m15_atr == recent_context.m15_atr
+    assert segmented_context.m15_structure == recent_context.m15_structure
+    assert segmented_context.m15_trend == recent_context.m15_trend
+    assert segmented_context.m15_swing_points == recent_context.m15_swing_points
+
+
+def test_m15_old_gap_is_ignored_only_when_the_new_segment_is_independently_ready():
+    start = _recent_start()
+    old = _structured_m15(20, start - timedelta(days=3))
+    recent = _structured_m15(14, start)
+    context = MarketContextEngine().build(_snapshot_with_m15((*old, *recent)))
+    assert context.data_status.value == "READY"
+    assert context.latest_m15_timestamp == recent[-1].timestamp
+
+    short_recent = _structured_m15(13, start)
+    context = MarketContextEngine().build(_snapshot_with_m15((*old, *short_recent)))
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert "INSUFFICIENT_CONTINUOUS_HISTORY_M15" in context.data_reasons
+
+
+def test_m15_gap_restarts_segment_instead_of_combining_history():
+    start = _recent_start()
+    prior = _structured_m15(14, start - timedelta(days=1))
+    after_gap = _structured_m15(13, start)
+    context = MarketContextEngine().build(_snapshot_with_m15((*prior, *after_gap)))
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert "INSUFFICIENT_CONTINUOUS_HISTORY_M15" in context.data_reasons
+
+
+@pytest.mark.parametrize(
+    "discontinuity",
+    [
+        timedelta(days=1), timedelta(minutes=30), timedelta(minutes=45),
+        timedelta(days=2), timedelta(hours=23),
+    ],
+    ids=("daily", "one_bar", "two_bar", "weekend", "dst_shift"),
+)
+def test_repeated_data_loss_and_calendar_discontinuities_have_no_special_authority(discontinuity):
+    start = _recent_start() - timedelta(days=10)
+    segments = []
+    cursor = start
+    for _ in range(3):
+        segments.extend(_structured_m15(3, cursor))
+        cursor = segments[-1].timestamp + discontinuity
+    segments.extend(_structured_m15(13, cursor))
+    context = MarketContextEngine().build(_snapshot_with_m15(tuple(segments)))
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert "INSUFFICIENT_CONTINUOUS_HISTORY_M15" in context.data_reasons
+
+
+def test_multiple_gaps_select_the_newest_segment_only():
+    start = _recent_start() - timedelta(days=3)
+    first = _structured_m15(20, start)
+    second = _structured_m15(20, start + timedelta(days=1))
+    newest = _structured_m15(14, _recent_start())
+    context = MarketContextEngine().build(_snapshot_with_m15((*first, *second, *newest)))
+    assert context.data_status.value == "READY"
+    assert context.latest_m15_timestamp == newest[-1].timestamp
+    assert all(point.pivot_timestamp >= newest[0].timestamp for point in context.m15_swing_points)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "unordered"])
+def test_m15_duplicate_or_unordered_timestamps_fail_closed(mutation):
+    values = list(_structured_m15(14, _recent_start()))
+    if mutation == "duplicate":
+        values[5] = values[4]
+    else:
+        values[5], values[6] = values[6], values[5]
+    context = MarketContextEngine().build(_snapshot_with_m15(tuple(values)))
+    assert context.data_status.value == "INSUFFICIENT_DATA"
+    assert "UNSORTED_OR_DUPLICATE_M15" in context.data_reasons
+
+
+def test_forming_m15_candle_is_not_used_as_closed_history():
+    start = _recent_start()
+    closed = _structured_m15(14, start)
+    forming = candle(closed[-1].timestamp + timedelta(minutes=15), 500, direction=-1)
+    context = MarketContextEngine().build(
+        _snapshot_with_m15((*closed, forming)), candles_are_closed=False,
+    )
+    closed_context = MarketContextEngine().build(_snapshot_with_m15(closed))
+    assert context.data_status.value == "READY"
+    assert context.latest_m15_timestamp == closed[-1].timestamp
+    assert context.m15_atr == closed_context.m15_atr
+    assert context.m15_swing_points == closed_context.m15_swing_points
