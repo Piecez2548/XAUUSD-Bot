@@ -417,6 +417,125 @@ def update_stage_progress(
         return row
 
 
+def update_stage_evidence(
+    database,
+    stage_run_id: str,
+    *,
+    gate_evidence: tuple[QualityGateEvidenceV1, ...] = (),
+    lineage_references: tuple[EmbeddedReferenceV1, ...] = (),
+    evidence_references: tuple[EmbeddedReferenceV1, ...] | None = None,
+):
+    """Persist bounded evidence while a stage is still executing."""
+
+    with database.session() as session:
+        row = _stage_record(session, stage_run_id)
+        if row.status in {"PASS", "FAILED", "BLOCKED", "SKIPPED", "CANCELLED"}:
+            raise IllegalResearchTransition("stage evidence cannot change after completion")
+        pipeline = session.get(ResearchPipelineRunRecord, row.pipeline_run_id)
+        if pipeline is None:
+            raise ResearchPipelineError("stage pipeline relationship is invalid")
+        current_input = tuple(
+            EmbeddedReferenceV1.model_validate(item)
+            for item in (row.input_references_json or [])
+        )
+        current_evidence = tuple(
+            EmbeddedReferenceV1.model_validate(item)
+            for item in (
+                row.evidence_references_json
+                if evidence_references is None
+                else [item.model_dump(mode="json") for item in evidence_references]
+            )
+        )
+        contract = ResearchStageRun(
+            stage_run_id=row.stage_run_id,
+            pipeline_run_id=pipeline.run_id,
+            stage_key=row.stage_key,
+            stage_version=row.stage_version,
+            attempt_number=row.attempt_number,
+            status=row.status,
+            progress_processed=row.progress_processed,
+            progress_total=row.progress_total,
+            progress_unit=row.progress_unit,
+            blocked_reason_code=row.blocked_reason_code,
+            failure_reason_code=row.failure_reason_code,
+            terminal_reason=row.terminal_reason,
+            input_references=current_input,
+            evidence_references=current_evidence,
+            gate_evidence=gate_evidence,
+            lineage_references=lineage_references,
+            created_at=row.created_at,
+            started_at=row.started_at,
+            completed_at=row.completed_at,
+        )
+        row.evidence_references_json = [
+            item.model_dump(mode="json") for item in contract.evidence_references
+        ]
+        row.gate_evidence_json = [
+            item.model_dump(mode="json") for item in contract.gate_evidence
+        ]
+        row.lineage_references_json = [
+            item.model_dump(mode="json") for item in contract.lineage_references
+        ]
+        return row
+
+
+def mark_artifacts_validated(
+    database, artifact_ids: tuple[str, ...]
+) -> tuple[ResearchArtifactRecord, ...]:
+    """Mark registered artifacts valid only after an external audit succeeds."""
+
+    if not artifact_ids:
+        raise ValueError("at least one artifact is required")
+    with database.session() as session:
+        rows: list[ResearchArtifactRecord] = []
+        now = _utc_now()
+        for artifact_id in artifact_ids:
+            row = session.scalar(
+                select(ResearchArtifactRecord).where(
+                    ResearchArtifactRecord.artifact_id == artifact_id
+                )
+            )
+            if row is None:
+                raise ResearchPipelineError("artifact not found")
+            if row.validation_status == "VALID" and row.publication_status == "PUBLISHED":
+                rows.append(row)
+                continue
+            if row.validation_status != "UNVALIDATED" or row.publication_status != "UNPUBLISHED":
+                raise ResearchPipelineError("artifact cannot be validated from its current state")
+            pipeline = session.get(ResearchPipelineRunRecord, row.pipeline_run_id)
+            stage = session.get(ResearchStageRunRecord, row.producer_stage_run_id)
+            if pipeline is None or stage is None:
+                raise ResearchPipelineError("artifact producer relationship is invalid")
+            ResearchArtifact(
+                artifact_id=row.artifact_id,
+                artifact_kind=row.artifact_kind,
+                content_sha256=row.content_sha256,
+                manifest_sha256=row.manifest_sha256,
+                artifact_format=row.artifact_format,
+                size_bytes=row.size_bytes,
+                logical_locator=row.logical_locator,
+                pipeline_run_id=pipeline.run_id,
+                producer_stage_run_id=stage.stage_run_id,
+                publication_status="PUBLISHED",
+                validation_status="VALID",
+                gate_evidence=tuple(
+                    QualityGateEvidenceV1.model_validate(item)
+                    for item in (row.gate_evidence_json or [])
+                ),
+                lineage_references=tuple(
+                    EmbeddedReferenceV1.model_validate(item)
+                    for item in (row.lineage_references_json or [])
+                ),
+                created_at=row.created_at,
+                published_at=now,
+            )
+            row.validation_status = "VALID"
+            row.publication_status = "PUBLISHED"
+            row.published_at = now
+            rows.append(row)
+        return tuple(rows)
+
+
 def register_artifact(
     database,
     *,

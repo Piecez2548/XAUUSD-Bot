@@ -65,7 +65,9 @@ _SENSITIVE_KEY_PREFIXES = (
 )
 
 
-def _validate_metadata_text(value: str) -> str:
+def _validate_metadata_text(value: str | None) -> str | None:
+    if value is None:
+        return None
     if _UNSAFE_METADATA_VALUE.search(value) or _SECRET_PREFIX_VALUE.search(value):
         raise ValueError("unsafe metadata value")
     return value
