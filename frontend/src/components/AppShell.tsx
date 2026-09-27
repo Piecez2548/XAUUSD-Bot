@@ -21,7 +21,7 @@ import {
   Route,
 } from "lucide-react";
 import { useState } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { Link, Outlet, useLocation } from "react-router-dom";
 
 import { StatusPill } from "./StatusPill";
 import { backendState, stateLabel, thaiDateTime, workerState } from "../lib/runtime";
@@ -32,31 +32,52 @@ import { logoutRequest, PRIVATE_DASHBOARD } from "../lib/api";
 import { useCurrentAuthSession } from "../auth/authSessionContext";
 
 const nav = [
-  ["/", "Overview", LayoutDashboard],
-  ["/trades", "Trades", CandlestickChart],
-  ["/decisions", "AI Decisions", Bot],
-  ["/shadow", "Shadow Trading", Sparkles],
-  ["/research", "Strategy Research", FlaskConical],
-  ["/research/roadmap", "Research Roadmap", Route],
-  ["/forward", "Forward Validation", RadioTower],
-  ["/performance", "Performance", BarChart3],
-  ["/risk", "Risk", ShieldCheck],
-  ["/market", "Market", CircleGauge],
-  ["/news", "News", Newspaper],
-  ["/health", "System Health", HeartPulse],
-  ["/logs", "Logs", FileClock],
-  ["/settings", "Settings", Settings],
-  ["/control", "Operator Control", SlidersHorizontal],
-  ["/security", "Security", Shield],
+  ["/", "Overview", LayoutDashboard, "exact"],
+  ["/trades", "Trades", CandlestickChart, "prefix"],
+  ["/decisions", "AI Decisions", Bot, "prefix"],
+  ["/shadow", "Shadow Trading", Sparkles, "prefix"],
+  ["/research", "Strategy Research", FlaskConical, "exact"],
+  ["/research/roadmap", "Research Roadmap", Route, "prefix"],
+  ["/forward", "Forward Validation", RadioTower, "prefix"],
+  ["/performance", "Performance", BarChart3, "prefix"],
+  ["/risk", "Risk", ShieldCheck, "prefix"],
+  ["/market", "Market", CircleGauge, "prefix"],
+  ["/news", "News", Newspaper, "prefix"],
+  ["/health", "System Health", HeartPulse, "prefix"],
+  ["/logs", "Logs", FileClock, "prefix"],
+  ["/settings", "Settings", Settings, "prefix"],
+  ["/control", "Operator Control", SlidersHorizontal, "prefix"],
+  ["/security", "Security", Shield, "prefix"],
 ] as const;
+
+type NavigationItem = (typeof nav)[number];
+
+function routeVariants(to: string) {
+  return to === "/forward" ? [to, "/forward-validation"] : [to];
+}
+
+function ownsRoute(item: NavigationItem, pathname: string) {
+  const [to, , , match] = item;
+  return routeVariants(to).some((route) =>
+    match === "exact" ? pathname === route : pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
+
+function activeNavigationPath(pathname: string) {
+  return nav
+    .filter((item) => ownsRoute(item, pathname))
+    .sort((left, right) => right[0].length - left[0].length)[0]?.[0] ?? null;
+}
 
 export function AppShell() {
   return <SystemHealthProvider><AppShellContent /></SystemHealthProvider>;
 }
 
 function AppShellContent() {
+  const location = useLocation();
   const authSession = useCurrentAuthSession();
   const owner = authSession?.authenticated === true && authSession.user?.role === "OWNER";
+  const activePath = activeNavigationPath(location.pathname);
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
@@ -85,10 +106,16 @@ function AppShellContent() {
         </div>
         <nav aria-label="Primary navigation">
           {nav.filter(([to]) => to !== "/security" || owner).map(([to, label, Icon]) => (
-            <NavLink key={to} to={to} end={to === "/"} onClick={() => setMobileOpen(false)}>
+            <Link
+              key={to}
+              to={to}
+              className={to === activePath ? "active" : undefined}
+              aria-current={to === activePath ? "page" : undefined}
+              onClick={() => setMobileOpen(false)}
+            >
               <Icon size={17} strokeWidth={1.7} aria-hidden="true" />
               <span>{label}</span>
-            </NavLink>
+            </Link>
           ))}
         </nav>
         <button className="collapse-button" onClick={() => setCompact((value) => !value)} aria-label="Toggle compact navigation">
