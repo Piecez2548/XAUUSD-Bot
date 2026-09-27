@@ -29,6 +29,7 @@ from models.model_inference_dataset import (
     DatasetAuditV1,
     DatasetManifestV1,
     DatasetRowV1,
+    dataset_row_fingerprint,
 )
 from persistence.orm import (
     ForwardSignalRecord,
@@ -448,7 +449,7 @@ class ModelInferenceDatasetBuilder:
             "source_timestamps": _json_value(source_timestamps),
             "row_identity": row_identity,
         }
-        row_fingerprint = _hash(row_payload)
+        row_fingerprint = dataset_row_fingerprint(row_payload)
         return DatasetRowV1(
             **row_payload,
             row_fingerprint=row_fingerprint,
@@ -547,7 +548,7 @@ class ModelInferenceDatasetBuilder:
             "source_timestamps": {"candidate_detected_at": cutoff.isoformat()},
             "row_identity": row_identity,
         }
-        return DatasetRowV1(**row_payload, row_fingerprint=_hash(row_payload))
+        return DatasetRowV1(**row_payload, row_fingerprint=dataset_row_fingerprint(row_payload))
 
     @staticmethod
     def _ordered_swing_points(context: dict[str, Any]) -> bool:

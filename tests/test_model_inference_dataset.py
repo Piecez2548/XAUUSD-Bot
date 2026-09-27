@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event, select
 
+from models.model_inference_dataset import (
+    DatasetRowV1,
+    canonical_dataset_row_fingerprint_payload,
+    dataset_row_fingerprint,
+)
 from persistence.database import Database
 from persistence.orm import (
     ForwardSignalRecord,
@@ -54,6 +61,110 @@ def _context(*, future: datetime | None = None, complete: bool = True) -> dict:
     if future is not None:
         context["latest_m15_timestamp"] = future.isoformat()
     return context
+
+
+def _fingerprint_payload() -> dict:
+    now = datetime(2026, 9, 25, 12, 0, tzinfo=UTC).isoformat()
+    return {
+        "dataset_contract_version": "model_inference_dataset_v1",
+        "feature_contract_version": "model_training_features_v1",
+        "candidate_id": "candidate-fingerprint",
+        "symbol": "XAUUSD",
+        "candidate_timestamp": now,
+        "causal_cutoff_timestamp": now,
+        "state": "OUTCOME_COMPLETED",
+        "training_eligibility": "TRAINABLE",
+        "reason_codes": ("SECOND", "FIRST"),
+        "classification": "SUPPORTIVE",
+        "outcome_label": "TP",
+        "features": {
+            "unicode": "café",
+            "nested": {"flag": True, "count": 3, "ratio": 1.25, "empty": None},
+        },
+        "source_provenance": {"strategy": "exact_pair", "candidate_id": "source-1"},
+        "source_timestamps": {"candidate_detected_at": now},
+        "row_identity": "a" * 64,
+    }
+
+
+def test_row_fingerprint_canonical_contract_and_self_reference_safety():
+    payload = _fingerprint_payload()
+    reordered = {key: payload[key] for key in reversed(tuple(payload))}
+    reordered["features"] = {
+        "nested": {"empty": None, "ratio": 1.25, "count": 3, "flag": True},
+        "unicode": "café",
+    }
+    reordered["source_provenance"] = {
+        "candidate_id": "source-1",
+        "strategy": "exact_pair",
+    }
+
+    assert dataset_row_fingerprint(payload) == dataset_row_fingerprint(reordered)
+    assert dataset_row_fingerprint(payload) == dataset_row_fingerprint(
+        {
+            **payload,
+            "candidate_timestamp": payload["candidate_timestamp"].replace(
+                "+00:00", "Z"
+            ),
+            "causal_cutoff_timestamp": payload["causal_cutoff_timestamp"].replace(
+                "+00:00", "Z"
+            ),
+            "source_timestamps": {"candidate_detected_at": "2026-09-25T12:00:00Z"},
+        }
+    )
+    assert dataset_row_fingerprint(
+        {**payload, "row_fingerprint": "0" * 64}
+    ) == dataset_row_fingerprint({**payload, "row_fingerprint": "f" * 64})
+
+    canonical = canonical_dataset_row_fingerprint_payload(payload)
+    serialized = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    ).encode("utf-8")
+    assert hashlib.sha256(serialized).hexdigest() == dataset_row_fingerprint(payload)
+    assert "row_fingerprint" not in canonical
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("candidate_id", "candidate-other"),
+        ("causal_cutoff_timestamp", "2026-09-25T12:15:00+00:00"),
+        ("outcome_label", "SL"),
+        ("features", {"unicode": "café", "nested": {"flag": False}}),
+        ("source_provenance", {"strategy": "other", "candidate_id": "source-1"}),
+    ],
+)
+def test_semantic_row_changes_change_fingerprint(field, value):
+    payload = _fingerprint_payload()
+    changed = {**payload, field: value}
+    assert dataset_row_fingerprint(changed) != dataset_row_fingerprint(payload)
+
+
+def test_nonsemantic_metadata_is_rejected_and_cannot_affect_fingerprint():
+    payload = _fingerprint_payload()
+    with pytest.raises(ValueError):
+        dataset_row_fingerprint({**payload, "artifact_path": r"C:\private\dataset.jsonl"})
+    with pytest.raises(ValueError):
+        dataset_row_fingerprint({**payload, "build_timestamp": "2026-09-27T00:00:00Z"})
+
+
+def test_fingerprint_contract_rejects_missing_or_extra_semantic_fields():
+    payload = _fingerprint_payload()
+    missing = dict(payload)
+    missing.pop("features")
+    with pytest.raises(ValueError):
+        dataset_row_fingerprint(missing)
+    with pytest.raises(ValueError):
+        dataset_row_fingerprint({**payload, "unexpected": True})
+
+
+def test_fingerprint_representation_is_lowercase_sha256_and_row_validation_is_strict():
+    payload = _fingerprint_payload()
+    fingerprint = dataset_row_fingerprint(payload)
+    assert len(fingerprint) == 64
+    assert fingerprint == fingerprint.lower()
+    with pytest.raises(ValidationError):
+        DatasetRowV1.model_validate({**payload, "row_fingerprint": fingerprint.upper()})
 
 
 def _source(

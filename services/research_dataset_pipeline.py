@@ -17,6 +17,7 @@ from models.model_inference_dataset import (
     FEATURE_CONTRACT_VERSION,
     DatasetManifestV1,
     DatasetRowV1,
+    dataset_row_fingerprint,
 )
 from models.research_dataset_pipeline import (
     ARTIFACT_VERIFY_STAGE,
@@ -476,11 +477,9 @@ def _audit_files(
                 rows.append(row)
                 canonical_line = (_stable(row.model_dump(mode="json")) + "\n").encode("utf-8")
                 canonical_valid = canonical_valid and line == canonical_line
-                payload = row.model_dump(mode="json")
-                actual_fingerprint = payload.pop("row_fingerprint")
-                fingerprints_valid = fingerprints_valid and hashlib.sha256(
-                    _stable(payload).encode("utf-8")
-                ).hexdigest() == actual_fingerprint
+                fingerprints_valid = fingerprints_valid and (
+                    dataset_row_fingerprint(row) == row.row_fingerprint
+                )
                 identity_values.add(row.row_identity)
                 candidate_values.add(row.candidate_id)
                 fingerprint_values.add(row.row_fingerprint)

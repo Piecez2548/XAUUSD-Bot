@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import hashlib
+import json
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -51,6 +54,80 @@ class DatasetRowV1(BaseModel):
     source_timestamps: dict[str, datetime | None] = Field(default_factory=dict)
     row_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     row_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+_DATASET_ROW_FINGERPRINT_FIELDS = frozenset(DatasetRowV1.model_fields) - {
+    "row_fingerprint"
+}
+
+
+def _canonical_fingerprint_value(value: Any, *, timestamp: bool = False) -> Any:
+    """Normalize supported values before canonical JSON serialization."""
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("dataset row timestamps must be timezone-aware")
+        return value.astimezone(UTC).isoformat()
+    if isinstance(value, str) and timestamp:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("dataset row timestamps must be valid ISO-8601 values") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("dataset row timestamps must be timezone-aware")
+        return parsed.astimezone(UTC).isoformat()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_fingerprint_value(item, timestamp=timestamp)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_canonical_fingerprint_value(item, timestamp=timestamp) for item in value]
+    return value
+
+
+def canonical_dataset_row_fingerprint_payload(
+    row: DatasetRowV1 | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact semantic object used for row fingerprinting.
+
+    The optional ``row_fingerprint`` field is removed before canonicalization,
+    so the fingerprint cannot recursively influence itself.  Only the frozen
+    DatasetRowV1 fields are accepted; physical paths, build timestamps, and
+    other metadata therefore cannot enter the fingerprint contract.
+    """
+
+    if isinstance(row, DatasetRowV1):
+        payload = row.model_dump(mode="python")
+    elif isinstance(row, Mapping):
+        payload = dict(row)
+    else:
+        raise TypeError("dataset row fingerprint input must be a DatasetRowV1 or mapping")
+    payload.pop("row_fingerprint", None)
+    fields = set(payload)
+    extra = fields - _DATASET_ROW_FINGERPRINT_FIELDS
+    missing = _DATASET_ROW_FINGERPRINT_FIELDS - fields
+    if extra or missing:
+        raise ValueError("dataset row fingerprint payload fields do not match DatasetRowV1")
+    timestamp_fields = {"candidate_timestamp", "causal_cutoff_timestamp", "source_timestamps"}
+    return {
+        key: _canonical_fingerprint_value(value, timestamp=key in timestamp_fields)
+        for key, value in payload.items()
+    }
+
+
+def dataset_row_fingerprint(row: DatasetRowV1 | Mapping[str, Any]) -> str:
+    """Hash the canonical semantic DatasetRowV1 payload with SHA-256."""
+
+    payload = canonical_dataset_row_fingerprint_payload(row)
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 class DatasetAuditV1(BaseModel):

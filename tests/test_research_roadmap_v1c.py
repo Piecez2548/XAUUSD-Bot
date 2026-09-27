@@ -11,14 +11,13 @@ from sqlalchemy import event, select
 from api.app import create_app
 from config.remote_read_only_policy import is_remote_path_allowed
 from config.settings import Settings
-from models.model_inference_dataset import DatasetRowV1
+from models.model_inference_dataset import DatasetRowV1, dataset_row_fingerprint
 from persistence.database import Database
 from persistence.orm import (
     ResearchArtifactRecord,
     ResearchPipelineRunRecord,
     ResearchStageRunRecord,
 )
-from services.model_inference_dataset import _stable
 from services.research_dataset_pipeline import (
     retry_model_inference_dataset_pipeline,
     run_model_inference_dataset_pipeline,
@@ -65,13 +64,7 @@ def _row(candidate_id: str) -> DatasetRowV1:
         row_identity=hashlib.sha256(candidate_id.encode()).hexdigest(),
         row_fingerprint="0" * 64,
     )
-    payload = candidate.model_dump(mode="json")
-    payload.pop("row_fingerprint")
-    return candidate.model_copy(
-        update={
-            "row_fingerprint": hashlib.sha256(_stable(payload).encode()).hexdigest()
-        }
-    )
+    return candidate.model_copy(update={"row_fingerprint": dataset_row_fingerprint(candidate)})
 
 
 def _run(database, tmp_path: Path, key: str, *, builder=None, total=None):

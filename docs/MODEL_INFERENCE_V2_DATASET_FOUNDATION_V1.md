@@ -39,6 +39,16 @@ Dataset identity includes the contract versions, builder semantics version,
 content-affecting parameters, and ordered row identities/fingerprints; it
 does not include build time or filesystem path.
 
+Each row fingerprint uses the single `dataset_row_fingerprint` contract from
+`models.model_inference_dataset`: the frozen `DatasetRowV1` semantic fields
+are normalized to UTC-aware `+00:00` timestamp strings (so `Z` and
+`+00:00` are equivalent) and canonical JSON
+(`sort_keys=True`, compact separators, ASCII escaping, and disallowed NaN),
+then hashed with SHA-256. The `row_fingerprint` field is removed before
+canonicalization, and unexpected or missing semantic fields are rejected.
+The builder and audit both call this helper; artifact paths, temporary names,
+build timestamps, and database locations are outside the payload.
+
 ## Leakage matrix
 
 | Fixture | Expected result |

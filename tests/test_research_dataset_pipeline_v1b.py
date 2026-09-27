@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import services.research_dataset_pipeline as pipeline_service
-from models.model_inference_dataset import DatasetRowV1
+from models.model_inference_dataset import DatasetRowV1, dataset_row_fingerprint
 from persistence.database import Database
 from services.model_inference_dataset import _stable
 from services.research_dataset_pipeline import (
@@ -60,11 +60,7 @@ def _row(candidate_id: str, *, trainable: bool = False) -> DatasetRowV1:
         "row_identity": hashlib.sha256(candidate_id.encode()).hexdigest(),
     }
     candidate = DatasetRowV1(**payload, row_fingerprint="0" * 64)
-    canonical_payload = candidate.model_dump(mode="json")
-    canonical_payload.pop("row_fingerprint")
-    return candidate.model_copy(
-        update={"row_fingerprint": hashlib.sha256(_stable(canonical_payload).encode()).hexdigest()}
-    )
+    return candidate.model_copy(update={"row_fingerprint": dataset_row_fingerprint(candidate)})
 
 
 def _run(
@@ -132,6 +128,27 @@ def test_non_empty_mixed_rows_and_known_progress_reconcile(tmp_path):
         assert view.summary.non_trainable_rows == 1
         build = view.stages[1]
         assert (build.processed, build.total, build.progress_mode) == (2, 2, "KNOWN")
+    finally:
+        database.dispose()
+
+
+def test_451_row_fixture_passes_builder_and_audit_without_transformation(tmp_path):
+    database = _database(tmp_path)
+    try:
+        rows = tuple(_row(f"candidate-{index}") for index in range(451))
+        view = _run(
+            database,
+            tmp_path,
+            key="four-hundred-fifty-one",
+            builder=_FakeBuilder(rows),
+            total=451,
+        )
+        assert view.status == "PASS"
+        assert view.summary is not None
+        assert view.summary.candidates_inspected == 451
+        assert view.summary.rows_produced == 451
+        assert view.stages[2].status == "PASS"
+        assert view.stages[3].status == "PASS"
     finally:
         database.dispose()
 
@@ -237,11 +254,8 @@ def test_duplicate_identity_and_leakage_are_rejected_by_audit(tmp_path):
 
         leaking = _row("leak")
         leaking = leaking.model_copy(update={"features": {"gross_r": 1.0}})
-        leaking_payload = leaking.model_dump(mode="json")
-        fingerprint = leaking_payload.copy()
-        fingerprint.pop("row_fingerprint")
         leaking = leaking.model_copy(
-            update={"row_fingerprint": hashlib.sha256(_stable(fingerprint).encode()).hexdigest()}
+            update={"row_fingerprint": dataset_row_fingerprint(leaking)}
         )
         rejected = _run(
             database,
@@ -304,6 +318,7 @@ def test_manifest_hash_mismatch_fails_audit(tmp_path, monkeypatch):
         ("duplicate-candidate", (_row("duplicate"), _row("duplicate"))),
         ("duplicate-fingerprint", (_row("fingerprint-a"), _row("fingerprint-b"))),
         ("changed-fingerprint", (_row("changed-fingerprint"),)),
+        ("semantic-corruption", (_row("semantic-corruption"),)),
         ("canonical-json", (_row("canonical"),)),
         ("contract-version", (_row("contract"),)),
         ("eligibility", (_row("eligibility"),)),
@@ -312,7 +327,10 @@ def test_manifest_hash_mismatch_fails_audit(tmp_path, monkeypatch):
         ("continuity", (_row("continuity"),)),
         ("truncated", (_row("truncated-a"), _row("truncated-b"))),
         ("extra", (_row("extra-base"),)),
+        ("extra-field", (_row("extra-field"),)),
         ("missing", (_row("missing-a"), _row("missing-b"))),
+        ("missing-fingerprint", (_row("missing-fingerprint"),)),
+        ("malformed-fingerprint", (_row("malformed-fingerprint"),)),
     ],
 )
 def test_audit_corruption_matrix_fails_closed(
@@ -347,6 +365,11 @@ def test_audit_corruption_matrix_fails_closed(
             jsonl_path.write_text("".join(f"{_stable(row)}\n" for row in rows))
         elif case == "changed-fingerprint":
             _rewrite_jsonl(jsonl_path, lambda value: {**value, "row_fingerprint": "0" * 64})
+        elif case == "semantic-corruption":
+            _rewrite_jsonl(
+                jsonl_path,
+                lambda value: {**value, "candidate_id": "semantic-corruption-mutated"},
+            )
         elif case == "canonical-json":
             raw = jsonl_path.read_text()
             jsonl_path.write_text(" " + raw)
@@ -383,9 +406,20 @@ def test_audit_corruption_matrix_fails_closed(
             jsonl_path.write_text(
                 jsonl_path.read_text() + f"{_stable(extra)}\n"
             )
+        elif case == "extra-field":
+            _rewrite_jsonl(jsonl_path, lambda value: {**value, "unexpected": True})
         elif case == "missing":
             lines = jsonl_path.read_text().splitlines(keepends=True)
             jsonl_path.write_text("".join(lines[1:]))
+        elif case == "missing-fingerprint":
+            _rewrite_jsonl(
+                jsonl_path,
+                lambda value: {
+                    key: item for key, item in value.items() if key != "row_fingerprint"
+                },
+            )
+        elif case == "malformed-fingerprint":
+            _rewrite_jsonl(jsonl_path, lambda value: {**value, "row_fingerprint": "Z" * 64})
         return original(jsonl_path, manifest_path, **kwargs)
 
     monkeypatch.setattr(pipeline_service, "_audit_files", tamper)
