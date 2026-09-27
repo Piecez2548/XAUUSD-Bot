@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ from services.forward_shadow import (
     EXPECTED_PAIR_ZONE_FILE_SHA256,
     ForwardInput,
     ForwardShadowWorker,
+    pair_zone_file_hash,
     pair_zone_status,
 )
 
@@ -195,6 +197,21 @@ def _persist(worker, snapshot, state, *, reason="TEST_EVALUATION"):
         }},
     )
     worker._persist_pair_zone_evaluation(decision, snapshot)
+
+
+def test_pair_zone_config_hash_is_line_ending_stable(tmp_path):
+    source = Path("config/strategies/pair_zone_v1.yaml").read_bytes()
+    normalized = source.replace(b"\r\n", b"\n")
+    for payload in (normalized, normalized.replace(b"\n", b"\r\n")):
+        config = tmp_path / "pair_zone_v1.yaml"
+        config.write_bytes(payload)
+        assert pair_zone_file_hash(config) == EXPECTED_PAIR_ZONE_FILE_SHA256
+
+    changed = tmp_path / "pair_zone_changed.yaml"
+    changed.write_bytes(
+        normalized.replace(b"zone_max_age_minutes: 360", b"zone_max_age_minutes: 361")
+    )
+    assert pair_zone_file_hash(changed) != EXPECTED_PAIR_ZONE_FILE_SHA256
 
 
 def test_active_zone_and_healthy_no_zone_are_authoritative_and_bounded(tmp_path):

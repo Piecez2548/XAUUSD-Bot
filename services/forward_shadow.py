@@ -75,7 +75,11 @@ class ForwardInput:
 
 def pair_zone_file_hash(path: Path | None = None) -> str:
     target = path or Path(__file__).resolve().parents[1] / "config" / "strategies" / "pair_zone_v1.yaml"
-    return hashlib.sha256(target.read_bytes()).hexdigest()
+    # The accepted digest is defined over the text content, not the checkout's
+    # platform-specific newline encoding.  Keep Windows CRLF checkouts from
+    # appearing as strategy drift while preserving every other config byte.
+    content = target.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(content).hexdigest()
 
 
 def _iso(value: datetime | None) -> str | None:

@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 import services.control as control_module
 from config.settings import Settings
+from mt5.bootstrap import MT5StartupResult
 from persistence.database import Database
 from persistence.orm import ControlAuditRecord, SystemHealthRecord
 from services.control import TelegramControlService
@@ -230,11 +231,21 @@ def test_start_remains_incomplete_until_bounded_verification_succeeds(
                 "live": SimpleNamespace(state="RUNNING"),
             }
 
+    class ReadyMT5Bootstrap:
+        async def ensure_ready(self, _database):
+            return MT5StartupResult(
+                ready=True,
+                launch_state="REUSED",
+                pid=123,
+                checks={"mt5_process": "REUSED", "terminal": "CONNECTED"},
+            )
+
     service = TelegramControlService(
         _settings(),
         tmp_path,
         database=control_database,
         supervisor=FakeSupervisor(),
+        mt5_bootstrap=ReadyMT5Bootstrap(),
     )
     monkeypatch.setattr(control_module, "migrate_database", lambda *_args: None)
 

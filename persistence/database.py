@@ -80,13 +80,21 @@ class Database:
     ) -> Database:
         """Create an explicitly disposable SQLite database for tests only."""
 
+        requested_path = _sqlite_path(database_url)
         resolved_url = resolve_database_url(database_url, project_root)
         if resolved_url == "sqlite:///:memory:":
             disposable = True
         else:
             path = _sqlite_path(resolved_url)
-            if path is None:
+            if path is None or not path.is_absolute():
                 raise AuthSchemaError("Test databases must use disposable SQLite storage")
+            if requested_path is not None and not requested_path.is_absolute() and project_root:
+                try:
+                    path.resolve().relative_to(project_root.resolve())
+                except ValueError as exc:
+                    raise AuthSchemaError(
+                        "Test database path must remain under the explicit project root"
+                    ) from exc
             try:
                 path.resolve().relative_to(Path(gettempdir()).resolve())
                 disposable = True
