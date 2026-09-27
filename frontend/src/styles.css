@@ -465,3 +465,111 @@ tbody tr:hover { background: #171e26; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .001ms !important; animation-duration: .001ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* Research Roadmap V1D: read-only presentation of the bounded V1C contract. */
+.roadmap-page { max-width: 1480px; }
+.roadmap-heading-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.roadmap-run-banner { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 16px; margin-bottom: 12px; border: 1px solid #2b4152; border-radius: 9px; background: linear-gradient(115deg, #12212b, #111820 58%); }
+.roadmap-run-banner > div:first-child, .roadmap-run-meta { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+.roadmap-run-banner > div:first-child > span, .roadmap-run-banner > div:first-child > strong { width: 100%; }
+.roadmap-run-banner strong { color: var(--text); font-size: 13px; }
+.roadmap-run-banner code { color: var(--blue); font-size: 10px; }
+.roadmap-run-meta { justify-content: flex-end; color: var(--muted); font-size: 9px; }
+.roadmap-stage-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: stretch; gap: 7px; }
+.roadmap-stage-wrap { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.roadmap-stage { position: relative; min-width: 0; flex: 1; display: grid; grid-template-columns: auto auto 1fr auto; align-items: center; gap: 8px; min-height: 74px; padding: 10px; color: var(--muted); text-align: left; border: 1px solid var(--line); border-radius: 8px; background: #111820; cursor: pointer; }
+.roadmap-stage:hover, .roadmap-stage.selected { border-color: #42627b; background: #142330; }
+.roadmap-stage:focus-visible { box-shadow: 0 0 0 2px var(--canvas), 0 0 0 4px var(--blue); }
+.roadmap-stage-index { align-self: start; color: var(--dim); font: 9px "Cascadia Code", monospace; }
+.roadmap-stage-icon { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 6px; color: var(--blue); background: #1a2a37; }
+.roadmap-stage-copy { min-width: 0; display: grid; gap: 4px; }
+.roadmap-stage-copy strong { color: var(--text); font-size: 10px; white-space: normal; }
+.roadmap-stage-copy small { color: var(--dim); font-size: 8px; letter-spacing: .06em; }
+.roadmap-connector { flex: 0 0 auto; color: #4e6477; }
+.roadmap-two-column { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+.current-stage-summary, .roadmap-artifact-heading, .roadmap-timeline-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.current-stage-summary > strong { color: var(--text); font-size: 16px; }
+.roadmap-detail-grid, .roadmap-contract-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 20px; }
+.roadmap-detail-grid > div, .roadmap-contract-grid > div, .hash-value { min-width: 0; display: grid; gap: 5px; }
+.roadmap-detail-grid span, .roadmap-contract-grid span, .hash-value > span, .roadmap-stat span, .roadmap-artifact-meta span { color: var(--muted); font-size: 9px; }
+.roadmap-detail-grid strong, .roadmap-contract-grid strong, .hash-value code { color: var(--text); font-size: 10px; overflow-wrap: anywhere; }
+.roadmap-detail-wide { grid-column: 1 / -1; }
+.tag-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.tag-list span { padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: #10161d; color: #aeb9c6; font: 8px "Cascadia Code", monospace; }
+.roadmap-stat-grid { display: grid; grid-template-columns: repeat(6, minmax(100px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.roadmap-stat { min-width: 0; display: grid; gap: 7px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: #111820; }
+.roadmap-stat strong { color: var(--text); font: 16px "Cascadia Code", monospace; }
+.roadmap-contract-grid { padding-top: 13px; border-top: 1px solid var(--line); }
+.hash-value > div { min-width: 0; display: flex; align-items: center; gap: 6px; }
+.hash-value code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hash-value .icon-button { width: 26px; height: 26px; flex: 0 0 auto; }
+.roadmap-artifacts { display: grid; gap: 9px; }
+.roadmap-artifact { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: #111820; }
+.roadmap-artifact-heading > div { min-width: 0; display: grid; gap: 4px; }
+.roadmap-artifact-heading strong { color: var(--text); font-size: 11px; }
+.roadmap-artifact-heading span { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
+.roadmap-artifact-states { display: flex !important; align-items: flex-end; gap: 7px; }
+.roadmap-artifact-state { display: grid; gap: 3px; text-align: right; }
+.roadmap-artifact-state span { color: var(--dim); font-size: 7px; text-transform: uppercase; letter-spacing: .06em; }
+.roadmap-artifact-state strong { color: var(--muted); font: 8px "Cascadia Code", monospace; }
+.roadmap-artifact-state.good strong { color: var(--green); }
+.roadmap-artifact-state.warn strong { color: var(--amber); }
+.roadmap-artifact-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.roadmap-artifact-meta > div { min-width: 0; display: grid; gap: 5px; }
+.roadmap-subtle { padding: 20px 8px; color: var(--dim); font-size: 10px; text-align: center; }
+.roadmap-state { min-height: 160px; display: grid; justify-items: center; align-content: center; gap: 8px; padding: 22px; margin-bottom: 12px; border: 1px dashed #314253; border-radius: 9px; color: var(--blue); text-align: center; }
+.roadmap-state strong { color: var(--text); font-size: 12px; }
+.roadmap-state span { max-width: 480px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.roadmap-state .text-button { margin-top: 4px; }
+.roadmap-error { color: var(--red); border-color: #5b3439; background: #1a1215; }
+.progress-note { display: grid; gap: 7px; margin-top: 15px; }
+.progress-label { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font: 9px "Cascadia Code", monospace; }
+.progress-label strong { color: var(--text); }
+.progress-track { height: 7px; overflow: hidden; border-radius: 999px; background: #25313b; }
+.progress-track > span { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
+.progress-track.indeterminate { background: repeating-linear-gradient(90deg, #25313b 0 12px, #334758 12px 20px); }
+.progress-track.indeterminate > span { width: 30%; background: #79b5dc; animation: roadmap-progress 1.4s linear infinite; }
+@keyframes roadmap-progress { from { transform: translateX(-120%); } to { transform: translateX(360%); } }
+.progress-note > span { color: var(--dim); font-size: 9px; }
+.roadmap-attempt-history { display: grid; gap: 6px; margin-top: 15px; padding-top: 12px; border-top: 1px solid var(--line); }
+.roadmap-attempt-history-label { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .07em; }
+.roadmap-attempt { display: grid; grid-template-columns: minmax(120px, 1fr) auto minmax(100px, 1fr); align-items: center; gap: 8px; padding: 7px 8px; border: 1px solid transparent; border-radius: 5px; color: var(--dim); font-size: 9px; }
+.roadmap-attempt.current { border-color: #34536a; background: #111f2a; }
+.roadmap-attempt small { overflow-wrap: anywhere; color: var(--dim); font-size: 8px; text-align: right; }
+.roadmap-timeline { list-style: none; display: grid; gap: 0; padding: 2px 0 0; margin: 0; }
+.roadmap-timeline li { position: relative; display: grid; grid-template-columns: 26px 1fr; gap: 10px; min-height: 66px; }
+.roadmap-timeline li:not(:last-child)::before { content: ""; position: absolute; left: 12px; top: 25px; bottom: 0; width: 1px; background: #2a3a48; }
+.roadmap-timeline-marker { z-index: 1; width: 25px; height: 25px; display: grid; place-items: center; border: 1px solid #34536a; border-radius: 50%; color: var(--blue); background: var(--panel); }
+.roadmap-timeline li > div { min-width: 0; display: grid; align-content: start; gap: 4px; padding-bottom: 15px; }
+.roadmap-timeline-heading strong { color: var(--text); font-size: 10px; }
+.roadmap-timeline-heading time { color: var(--dim); font-size: 8px; }
+.roadmap-timeline li > div > span { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.roadmap-timeline li small { color: var(--dim); font-size: 8px; }
+.roadmap-history { display: grid; gap: 5px; }
+.roadmap-history-row { min-width: 0; display: grid; grid-template-columns: minmax(125px, 1.4fr) auto 90px minmax(130px, .8fr) auto; align-items: center; gap: 14px; padding: 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); text-align: left; cursor: pointer; }
+.roadmap-history-row:hover, .roadmap-history-row.selected { border-color: var(--line); background: #111820; }
+.roadmap-history-row:focus-visible { box-shadow: 0 0 0 2px var(--canvas), 0 0 0 4px var(--blue); }
+.roadmap-history-id { min-width: 0; display: grid; gap: 4px; }
+.roadmap-history-id strong { color: var(--blue); font: 10px "Cascadia Code", monospace; }
+.roadmap-history-id small, .roadmap-history-row > span:not(.status-pill) { color: var(--dim); font-size: 8px; }
+.roadmap-history-row time { color: var(--muted); font-size: 9px; }
+.roadmap-history-row > svg { color: var(--dim); }
+
+@media (max-width: 1050px) {
+  .roadmap-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .roadmap-stage-flow { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .roadmap-connector { display: none; }
+}
+
+@media (max-width: 760px) {
+  .roadmap-heading-actions { width: 100%; justify-content: flex-start; }
+  .roadmap-run-banner { align-items: flex-start; flex-direction: column; }
+  .roadmap-run-meta { justify-content: flex-start; }
+  .roadmap-stage-flow, .roadmap-two-column { grid-template-columns: 1fr; }
+  .roadmap-detail-grid, .roadmap-contract-grid { grid-template-columns: 1fr; }
+  .roadmap-detail-wide { grid-column: auto; }
+  .roadmap-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .roadmap-artifact-meta { grid-template-columns: 1fr; }
+  .roadmap-history-row { grid-template-columns: minmax(110px, 1fr) auto; gap: 8px; }
+  .roadmap-history-row > span:not(.status-pill), .roadmap-history-row time { display: none; }
+}

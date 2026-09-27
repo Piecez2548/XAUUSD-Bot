@@ -18,6 +18,7 @@ import {
   X,
   SlidersHorizontal,
   Shield,
+  Route,
 } from "lucide-react";
 import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -36,6 +37,7 @@ const nav = [
   ["/decisions", "AI Decisions", Bot],
   ["/shadow", "Shadow Trading", Sparkles],
   ["/research", "Strategy Research", FlaskConical],
+  ["/research/roadmap", "Research Roadmap", Route],
   ["/forward", "Forward Validation", RadioTower],
   ["/performance", "Performance", BarChart3],
   ["/risk", "Risk", ShieldCheck],

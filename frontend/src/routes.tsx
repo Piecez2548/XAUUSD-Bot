@@ -17,6 +17,7 @@ import { ResearchPage } from "./pages/ResearchPage";
 import { ForwardValidationPage } from "./pages/ForwardValidationPage";
 import { OperatorControlPage } from "./pages/OperatorControlPage";
 import { SecurityPage } from "./pages/SecurityPage";
+import { ResearchRoadmapPage } from "./pages/ResearchRoadmapPage";
 
 export const dashboardRoutes = [
   {
@@ -28,6 +29,7 @@ export const dashboardRoutes = [
       { path: "/decisions", element: <DecisionsPage /> },
       { path: "/shadow", element: <ShadowPage /> },
       { path: "/research", element: <ResearchPage /> },
+      { path: "/research/roadmap", element: <ResearchRoadmapPage /> },
       { path: "/forward", element: <ForwardValidationPage /> },
       { path: "/forward-validation", element: <ForwardValidationPage /> },
       { path: "/performance", element: <PerformancePage /> },
