@@ -164,6 +164,7 @@ ALERT_SCORE_THRESHOLD = INTELLIGENCE_CONTRACT.alert_score_threshold
 ALERT_COOLDOWN = timedelta(minutes=INTELLIGENCE_CONTRACT.alert_cooldown_minutes)
 PIVOT_LEFT_BARS = INTELLIGENCE_CONTRACT.pivot_left_bars
 PIVOT_RIGHT_BARS = INTELLIGENCE_CONTRACT.pivot_right_bars
+PROVENANCE_CONTRACT_VERSION = "strategy_intelligence_provenance_v2"
 # M15 readiness requires the complete ATR window consumed by extract_features;
 # structure is then checked independently from the same newest segment.
 M15_ATR_PERIOD = 14
@@ -543,16 +544,31 @@ class ExactPairAdapter:
             reference = str(decision.feature_context.get("zone_id", reason))
             strategy_reason = reason
         score, band, components = EvidenceScorer().score(tuple(evidence), blockers=tuple(blockers))
+        availability_candidates = []
+        if context.latest_m15_timestamp is not None:
+            availability_candidates.append(
+                context.latest_m15_timestamp.astimezone(UTC) + EXPECTED_INTERVAL[Timeframe.M15]
+            )
+        if context.latest_m5_timestamp is not None:
+            availability_candidates.append(
+                context.latest_m5_timestamp.astimezone(UTC) + EXPECTED_INTERVAL[Timeframe.M5]
+            )
+        observation_available_at = max(availability_candidates) if availability_candidates else None
         candidate = StrategyCandidate(
             candidate_id=_candidate_id(self.strategy, snapshot.symbol.name, timestamp, direction, reference),
             symbol=snapshot.symbol.name, strategy=self.strategy,
             strategy_version=self.detector.strategy_version, direction=direction,
-            timeframe="M15/M5", detected_at=timestamp, context_reference=reference,
+            # V2 separates the primary source from its confirmation stream.
+            # The historical overloaded M15/M5 label is never emitted here.
+            timeframe="M15", detected_at=timestamp, context_reference=reference,
             state=state, evidence=tuple(evidence), score=score,
             confidence_band=band, blockers=tuple(dict.fromkeys(blockers)),
             warnings=(strategy_reason,), score_components=components,
             source="ExactPairAdapter", evidence_version=EVIDENCE_VERSION,
             alert_decision=AlertDecision.IGNORE, execution_allowed=False,
+            provenance_contract_version=PROVENANCE_CONTRACT_VERSION,
+            source_timeframe="M15", confirmation_timeframe="M5",
+            observation_available_at=observation_available_at,
         )
         decision = AlertPolicy().decide(candidate, previous)
         return candidate.model_copy(update={"alert_decision": decision})
@@ -641,6 +657,7 @@ def persist_intelligence_record(
     forward_session_id: str | None = None,
     forward_signal_id: str | None = None,
     pair_zone_event_id: str | None = None,
+    pair_zone_decision_evidence_id: str | None = None,
 ) -> Any:
     """Persist one idempotent evidence snapshot without changing strategy history.
 
@@ -666,6 +683,22 @@ def persist_intelligence_record(
                 ("strategy_version", existing.strategy_version, candidate.strategy_version),
                 ("evidence_version", existing.evidence_version, candidate.evidence_version),
                 ("detected_at", existing.detected_at, candidate.detected_at),
+                (
+                    "provenance_contract_version",
+                    existing.provenance_contract_version,
+                    candidate.provenance_contract_version,
+                ),
+                ("source_timeframe", existing.source_timeframe, candidate.source_timeframe),
+                (
+                    "confirmation_timeframe",
+                    existing.confirmation_timeframe,
+                    candidate.confirmation_timeframe,
+                ),
+                (
+                    "observation_available_at",
+                    existing.observation_available_at,
+                    candidate.observation_available_at,
+                ),
             )
             for field_name, current, incoming in immutable:
                 if current != incoming:
@@ -676,9 +709,14 @@ def persist_intelligence_record(
                 ("forward_session_id", forward_session_id),
                 ("forward_signal_id", forward_signal_id),
                 ("pair_zone_event_id", pair_zone_event_id),
+                ("pair_zone_decision_evidence_id", pair_zone_decision_evidence_id),
             ):
                 current = getattr(existing, field_name)
-                if current is not None and incoming is not None and current != incoming:
+                if (
+                    field_name == "pair_zone_decision_evidence_id"
+                    and existing.provenance_contract_version == PROVENANCE_CONTRACT_VERSION
+                    and current != incoming
+                ) or (current is not None and incoming is not None and current != incoming):
                     raise ProvenanceConflictError(
                         f"candidate {candidate.candidate_id} provenance conflict: {field_name}"
                     )
@@ -693,6 +731,10 @@ def persist_intelligence_record(
             evidence_version=candidate.evidence_version,
             detected_at=candidate.detected_at,
             timeframe=candidate.timeframe,
+            provenance_contract_version=candidate.provenance_contract_version,
+            source_timeframe=candidate.source_timeframe,
+            confirmation_timeframe=candidate.confirmation_timeframe,
+            observation_available_at=candidate.observation_available_at,
             direction=candidate.direction.value,
             state=candidate.state.value,
             score=candidate.score,
@@ -705,6 +747,7 @@ def persist_intelligence_record(
             score_components_json=payload["score_components"],
             source=candidate.source,
             pair_zone_event_id=pair_zone_event_id,
+            pair_zone_decision_evidence_id=pair_zone_decision_evidence_id,
             forward_session_id=forward_session_id,
             forward_signal_id=forward_signal_id,
             execution_allowed=False,
@@ -755,6 +798,19 @@ def link_intelligence_forward_provenance(
             raise ProvenanceConflictError("candidate is already linked to a different session")
         if candidate.forward_signal_id not in (None, signal.id):
             raise ProvenanceConflictError("candidate is already linked to a different signal")
+        if candidate.provenance_contract_version == PROVENANCE_CONTRACT_VERSION and (
+            signal.provenance_contract_version != PROVENANCE_CONTRACT_VERSION
+            or signal.source_timeframe != "M15"
+            or signal.confirmation_timeframe != "M5"
+            or signal.symbol != candidate.symbol
+            or signal.timestamp != candidate.detected_at
+            or signal.decision != candidate.direction
+            or signal.zone_id != candidate.pair_zone_event_id
+            or candidate.pair_zone_decision_evidence_id is None
+            or signal.pair_zone_decision_evidence_id
+            != candidate.pair_zone_decision_evidence_id
+        ):
+            raise ProvenanceConflictError("future provenance contract mismatch")
 
         trade = session.scalar(
             select(ForwardTradeRecord).where(ForwardTradeRecord.signal_id == signal.id)

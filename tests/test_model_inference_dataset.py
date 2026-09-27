@@ -9,7 +9,10 @@ from pydantic import ValidationError
 from sqlalchemy import event, select
 
 from models.model_inference_dataset import (
+    DATASET_V2_CONTRACT_VERSION,
+    DatasetManifestV2,
     DatasetRowV1,
+    DatasetRowV2,
     canonical_dataset_row_fingerprint_payload,
     dataset_row_fingerprint,
 )
@@ -176,6 +179,9 @@ def _source(
     signal_id: str | None = None,
     trade_id: str | None = None,
     pair_zone_id: str | None = None,
+    v2: bool = False,
+    observation_available_at: datetime | None = None,
+    pair_zone_decision_evidence_id: str | None = None,
 ) -> StrategyIntelligenceRecord:
     return StrategyIntelligenceRecord(
         candidate_id=candidate_id,
@@ -199,6 +205,15 @@ def _source(
         score_components_json=[],
         source="test",
         pair_zone_event_id=pair_zone_id,
+        provenance_contract_version=(
+            "strategy_intelligence_provenance_v2" if v2 else None
+        ),
+        source_timeframe="M15" if v2 else None,
+        confirmation_timeframe="M5" if v2 else None,
+        observation_available_at=observation_available_at if v2 else None,
+        pair_zone_decision_evidence_id=(
+            pair_zone_decision_evidence_id if v2 else None
+        ),
         forward_session_id=session_id,
         forward_signal_id=signal_id,
         forward_trade_id=trade_id,
@@ -206,7 +221,7 @@ def _source(
     )
 
 
-def _forward_rows(cutoff: datetime, state: str = "TP") -> tuple[
+def _forward_rows(cutoff: datetime, state: str = "TP", *, v2: bool = False) -> tuple[
     ForwardValidationSessionRecord, ForwardSignalRecord, ForwardTradeRecord
 ]:
     session = ForwardValidationSessionRecord(
@@ -229,6 +244,7 @@ def _forward_rows(cutoff: datetime, state: str = "TP") -> tuple[
         signal_id="signal-1",
         session_id="session-1",
         timestamp=cutoff,
+        symbol="XAUUSD",
         decision="BUY",
         zone_id="zone-1",
         entry_price=2000.0,
@@ -243,6 +259,14 @@ def _forward_rows(cutoff: datetime, state: str = "TP") -> tuple[
         market_observation_json={"timestamp": cutoff.isoformat()},
         strategy_hash="a" * 64,
         created_at=cutoff,
+        provenance_contract_version=(
+            "strategy_intelligence_provenance_v2" if v2 else None
+        ),
+        source_timeframe="M15" if v2 else None,
+        confirmation_timeframe="M5" if v2 else None,
+        signal_decision_at=cutoff if v2 else None,
+        decision_available_at=cutoff + timedelta(minutes=5) if v2 else None,
+        pair_zone_decision_evidence_id="event-1" if v2 else None,
         execution_allowed=False,
     )
     trade = ForwardTradeRecord(
@@ -258,6 +282,7 @@ def _forward_rows(cutoff: datetime, state: str = "TP") -> tuple[
         take_profit=2020.0,
         risk_distance=10.0,
         terminal_timestamp=None if state == "OPEN" else cutoff + timedelta(minutes=30),
+        outcome_available_at=None if state == "OPEN" else cutoff + timedelta(minutes=35),
         mark_price=None,
         gross_r=None if state in {"OPEN", "AMBIGUOUS"} else 2.0,
         net_r=None if state in {"OPEN", "AMBIGUOUS"} else 1.8,
@@ -306,6 +331,236 @@ def test_pre_signal_observation_is_not_a_losing_label(database):
     assert row.state == "PRE_SIGNAL_OBSERVATION"
     assert row.outcome_label == "NOT_ELIGIBLE"
     assert row.training_eligibility == "NON_TRAINABLE"
+
+
+def test_v2_uses_immutable_signal_provenance_not_mutable_latest_pair_zone(database):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    available = detected + timedelta(minutes=5)
+    session, signal, trade = _forward_rows(detected, "TP", v2=True)
+    source = _source(
+        detected,
+        candidate_id="v2-trainable",
+        session_id=session.id,
+        signal_id=signal.id,
+        trade_id=trade.id,
+        pair_zone_id="zone-1",
+        v2=True,
+        observation_available_at=available,
+        pair_zone_decision_evidence_id="event-1",
+    )
+    mutable_latest = PairZoneEvaluationRecord(
+        forward_session_id=session.id,
+        runtime_generation_id="later-generation",
+        evaluation_at=detected + timedelta(hours=4),
+        evaluated_m5_timestamp=detected + timedelta(hours=4),
+        evaluated_m15_timestamp=detected + timedelta(hours=4),
+        strategy_id="exact_pair",
+        strategy_version="pair-v1",
+        config_hash="a" * 64,
+        state="ACTIVE_ZONE",
+        reason="later-observation",
+        direction="BUY",
+        zone_id="different-latest-zone",
+        zone_lower=1.0,
+        zone_upper=2.0,
+    )
+    _insert(database, session, signal, trade, source, mutable_latest)
+
+    row = next(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ).iter_rows()
+    )
+
+    assert isinstance(row, DatasetRowV2)
+    assert row.dataset_contract_version == DATASET_V2_CONTRACT_VERSION
+    assert row.training_eligibility == "TRAINABLE"
+    assert row.causal_cutoff_timestamp == available
+    assert row.pair_zone_decision_evidence_id == "event-1"
+    assert "POST_DECISION_PAIR_ZONE_EVIDENCE" not in row.reason_codes
+    assert "FUTURE_PAIR_ZONE_CANDLE" not in row.reason_codes
+
+
+def _v2_row(database, *, state: str = "TP", terminal_offset: int = 30,
+            outcome_offset: int = 35, evaluated_at: datetime | None = None):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    available = detected + timedelta(minutes=5)
+    session, signal, trade = _forward_rows(detected, state, v2=True)
+    trade.terminal_timestamp = detected + timedelta(minutes=terminal_offset)
+    trade.outcome_available_at = detected + timedelta(minutes=outcome_offset)
+    trade.evaluated_at = evaluated_at or detected + timedelta(minutes=31)
+    source = _source(
+        detected,
+        candidate_id=f"v2-{terminal_offset}-{outcome_offset}",
+        session_id=session.id,
+        signal_id=signal.id,
+        trade_id=trade.id,
+        pair_zone_id="zone-1",
+        v2=True,
+        observation_available_at=available,
+        pair_zone_decision_evidence_id="event-1",
+    )
+    _insert(database, session, signal, trade, source)
+    return next(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ).iter_rows()
+    )
+
+
+def test_v2_accepts_first_future_candle_when_outcome_is_available_after_decision(
+    database,
+):
+    row = _v2_row(database, terminal_offset=5, outcome_offset=10)
+    assert row.training_eligibility == "TRAINABLE"
+    assert row.outcome_label == "TP"
+
+
+def test_v2_accepts_first_future_sl_candle_when_outcome_is_available_after_decision(
+    database,
+):
+    row = _v2_row(database, state="SL", terminal_offset=5, outcome_offset=10)
+    assert row.training_eligibility == "TRAINABLE"
+    assert row.outcome_label == "SL"
+
+
+def test_v2_rejects_same_candle_outcome_even_with_later_availability(database):
+    row = _v2_row(database, terminal_offset=0, outcome_offset=5)
+    assert row.training_eligibility == "UNRESOLVED"
+    assert "INCOMPLETE_OUTCOME_PROVENANCE" in row.reason_codes
+
+
+def test_v2_evaluated_at_is_noncausal_processing_metadata(database):
+    row = _v2_row(database, evaluated_at=datetime(2026, 9, 25, 11, 59, tzinfo=UTC))
+    assert row.training_eligibility == "TRAINABLE"
+
+
+def test_v2_signal_created_at_does_not_change_fingerprint(database):
+    first = _v2_row(database)
+    with database.session() as session:
+        signal = session.get(ForwardSignalRecord, "signal-1")
+        assert signal is not None
+        signal.created_at = signal.created_at + timedelta(days=1)
+    second = next(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ).iter_rows()
+    )
+    assert first.row_fingerprint == second.row_fingerprint
+    assert "signal_created_at" not in second.source_timestamps
+
+
+def test_v2_does_not_fallback_to_legacy_pair_zone_event_id(database):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    available = detected + timedelta(minutes=5)
+    session, signal, trade = _forward_rows(detected, "TP", v2=True)
+    signal.pair_zone_decision_evidence_id = None
+    source = _source(
+        detected,
+        candidate_id="missing-v2-evidence",
+        session_id=session.id,
+        signal_id=signal.id,
+        trade_id=trade.id,
+        pair_zone_id="zone-1",
+        v2=True,
+        observation_available_at=available,
+        pair_zone_decision_evidence_id=None,
+    )
+    _insert(database, session, signal, trade, source)
+    row = next(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ).iter_rows()
+    )
+    assert row.training_eligibility == "UNRESOLVED"
+    assert "FORWARD_PROVENANCE_MISMATCH" in row.reason_codes
+
+
+def test_v2_builder_keeps_legacy_rows_unresolved_without_fabricated_provenance(database):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    _insert(database, _source(detected, candidate_id="legacy-row"))
+
+    row = next(
+        ModelInferenceDatasetBuilder(
+            database, dataset_contract_version=DATASET_V2_CONTRACT_VERSION
+        ).iter_rows()
+    )
+
+    assert isinstance(row, DatasetRowV1)
+    assert row.dataset_contract_version == "model_inference_dataset_v1"
+    assert row.training_eligibility == "UNRESOLVED"
+    assert row.outcome_label == "UNRESOLVED"
+    assert "LEGACY_PROVENANCE_CONTRACT" in row.reason_codes
+    assert "observation_available_at" not in DatasetRowV1.model_fields
+
+
+def test_v2_rejects_signal_evidence_after_decision_boundary(database):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    available = detected + timedelta(minutes=5)
+    session, signal, trade = _forward_rows(detected, "TP", v2=True)
+    signal.confirmation_candle_json = {
+        "timestamp": (available + timedelta(minutes=1)).isoformat()
+    }
+    source = _source(
+        detected,
+        candidate_id="v2-future-confirmation",
+        session_id=session.id,
+        signal_id=signal.id,
+        trade_id=trade.id,
+        pair_zone_id="event-1",
+        v2=True,
+        observation_available_at=available,
+    )
+    _insert(database, session, signal, trade, source)
+
+    row = next(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ).iter_rows()
+    )
+
+    assert row.training_eligibility == "UNRESOLVED"
+    assert "POST_DECISION_SIGNAL_EVIDENCE" in row.reason_codes
+
+
+def test_v2_artifact_has_explicit_versioned_manifest(database, tmp_path):
+    detected = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
+    session, signal, trade = _forward_rows(detected, "TP", v2=True)
+    source = _source(
+        detected,
+        candidate_id="v2-artifact",
+        session_id=session.id,
+        signal_id=signal.id,
+        trade_id=trade.id,
+        pair_zone_id="event-1",
+        v2=True,
+        observation_available_at=detected + timedelta(minutes=5),
+    )
+    _insert(database, session, signal, trade, source)
+
+    manifest, artifact = write_dataset_artifact(
+        ModelInferenceDatasetBuilder(
+            database,
+            session_aware_v2_accepted=True,
+            dataset_contract_version=DATASET_V2_CONTRACT_VERSION,
+        ),
+        tmp_path,
+    )
+
+    assert isinstance(manifest, DatasetManifestV2)
+    assert manifest.dataset_contract_version == DATASET_V2_CONTRACT_VERSION
+    assert artifact.name == "model_inference_dataset_v2.jsonl"
+    assert (tmp_path / "model_inference_dataset_v2.manifest.json").exists()
 
 
 def test_signal_without_trade_is_signal_eligible_not_a_loss(database):

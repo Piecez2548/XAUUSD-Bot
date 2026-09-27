@@ -8,9 +8,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DATASET_CONTRACT_VERSION = "model_inference_dataset_v1"
+DATASET_V2_CONTRACT_VERSION = "model_inference_dataset_v2"
 FEATURE_CONTRACT_VERSION = "model_training_features_v1"
 ARTIFACT_CONTRACT_VERSION = "model_inference_artifact_v1"
 
@@ -56,7 +57,41 @@ class DatasetRowV1(BaseModel):
     row_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class DatasetRowV2(DatasetRowV1):
+    """Future-only row with explicit temporal and timeframe provenance.
+
+    V1 rows are deliberately not upgraded in place.  V2 makes the source
+    and confirmation streams, availability boundary, and immutable Pair Zone
+    event part of the row contract and therefore its fingerprint.
+    """
+
+    dataset_contract_version: Literal["model_inference_dataset_v2"] = (
+        DATASET_V2_CONTRACT_VERSION
+    )
+    source_timeframe: Literal["M15"] | None = None
+    confirmation_timeframe: Literal["M5"] | None = None
+    provenance_contract_version: Literal["strategy_intelligence_provenance_v2"] | None = None
+    observation_available_at: datetime | None = None
+    signal_decision_at: datetime | None = None
+    decision_available_at: datetime | None = None
+    pair_zone_decision_evidence_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_explicit_provenance_for_training(self) -> DatasetRowV2:
+        if self.training_eligibility == "TRAINABLE" and (
+            self.source_timeframe is None
+            or self.confirmation_timeframe is None
+            or self.provenance_contract_version is None
+            or self.observation_available_at is None
+        ):
+            raise ValueError("trainable V2 rows require explicit temporal provenance")
+        return self
+
+
 _DATASET_ROW_FINGERPRINT_FIELDS = frozenset(DatasetRowV1.model_fields) - {
+    "row_fingerprint"
+}
+_DATASET_V2_ROW_FINGERPRINT_FIELDS = frozenset(DatasetRowV2.model_fields) - {
     "row_fingerprint"
 }
 
@@ -87,7 +122,7 @@ def _canonical_fingerprint_value(value: Any, *, timestamp: bool = False) -> Any:
 
 
 def canonical_dataset_row_fingerprint_payload(
-    row: DatasetRowV1 | Mapping[str, Any],
+    row: DatasetRowV1 | DatasetRowV2 | Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the exact semantic object used for row fingerprinting.
 
@@ -97,7 +132,7 @@ def canonical_dataset_row_fingerprint_payload(
     other metadata therefore cannot enter the fingerprint contract.
     """
 
-    if isinstance(row, DatasetRowV1):
+    if isinstance(row, (DatasetRowV1, DatasetRowV2)):
         payload = row.model_dump(mode="python")
     elif isinstance(row, Mapping):
         payload = dict(row)
@@ -105,19 +140,28 @@ def canonical_dataset_row_fingerprint_payload(
         raise TypeError("dataset row fingerprint input must be a DatasetRowV1 or mapping")
     payload.pop("row_fingerprint", None)
     fields = set(payload)
-    extra = fields - _DATASET_ROW_FINGERPRINT_FIELDS
-    missing = _DATASET_ROW_FINGERPRINT_FIELDS - fields
+    contract_version = payload.get("dataset_contract_version")
+    expected_fields = (
+        _DATASET_V2_ROW_FINGERPRINT_FIELDS
+        if contract_version == DATASET_V2_CONTRACT_VERSION
+        else _DATASET_ROW_FINGERPRINT_FIELDS
+    )
+    extra = fields - expected_fields
+    missing = expected_fields - fields
     if extra or missing:
-        raise ValueError("dataset row fingerprint payload fields do not match DatasetRowV1")
-    timestamp_fields = {"candidate_timestamp", "causal_cutoff_timestamp", "source_timestamps"}
+        raise ValueError("dataset row fingerprint payload fields do not match its dataset contract")
+    timestamp_fields = {
+        "candidate_timestamp", "causal_cutoff_timestamp", "source_timestamps",
+        "observation_available_at", "signal_decision_at", "decision_available_at",
+    }
     return {
         key: _canonical_fingerprint_value(value, timestamp=key in timestamp_fields)
         for key, value in payload.items()
     }
 
 
-def dataset_row_fingerprint(row: DatasetRowV1 | Mapping[str, Any]) -> str:
-    """Hash the canonical semantic DatasetRowV1 payload with SHA-256."""
+def dataset_row_fingerprint(row: DatasetRowV1 | DatasetRowV2 | Mapping[str, Any]) -> str:
+    """Hash the canonical semantic V1 or V2 payload with SHA-256."""
 
     payload = canonical_dataset_row_fingerprint_payload(row)
     serialized = json.dumps(
@@ -177,3 +221,11 @@ class DatasetManifestV1(BaseModel):
     bounded_page_size: int = Field(gt=0, le=500)
     session_aware_v2_accepted: bool
     manifest_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DatasetManifestV2(DatasetManifestV1):
+    """Manifest for the explicit future-only V2 dataset contract."""
+
+    dataset_contract_version: Literal["model_inference_dataset_v2"] = (
+        DATASET_V2_CONTRACT_VERSION
+    )

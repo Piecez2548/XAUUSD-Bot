@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from config.settings import Settings
 from persistence.database import Database
@@ -13,13 +15,19 @@ from persistence.orm import (
     ForwardSignalRecord,
     ForwardTradeRecord,
     ForwardValidationSessionRecord,
+    ImmutableProvenanceError,
     StrategyIntelligenceRecord,
 )
 from research.intelligence_evaluation import (
     evaluate_records,
     observations_from_persisted_rows,
 )
-from services.forward_shadow import ForwardInput, ForwardShadowWorker
+from services.forward_shadow import (
+    ForwardInput,
+    ForwardShadowWorker,
+    ForwardSignalConflictError,
+    pair_zone_event_identity,
+)
 from services.intelligence import (
     ProvenanceConflictError,
     link_intelligence_forward_provenance,
@@ -326,14 +334,167 @@ def test_forward_shadow_propagates_pair_zone_id_without_changing_decision(
     asyncio.run(
         worker._process(ForwardInput(snapshot=snapshot, market_snapshot_id="market", risk=None))
     )
-    assert calls["persist"] == {
-        "forward_session_id": "session-id",
-        "pair_zone_event_id": "pz-canonical-1",
-    }
+    assert calls["persist"]["forward_session_id"] == "session-id"
+    assert calls["persist"]["pair_zone_event_id"] == "pz-canonical-1"
+    assert calls["persist"]["pair_zone_decision_evidence_id"].startswith(
+        "pair-zone-evidence-"
+    )
     assert calls["link"] == {
         "candidate_id": "candidate-1",
         "forward_session_id": "session-id",
         "forward_signal_id": "signal-id",
     }
     assert decision.decision.value == "BUY"
+    db.dispose()
+
+
+def test_v2_pair_zone_evidence_identity_scopes_symbol_and_decision() -> None:
+    timestamp = OBSERVED_AT
+    common = {
+        "contract_version": "strategy_intelligence_provenance_v2",
+        "session_id": "session-1",
+        "zone_id": "zone-1",
+        "confirmation_timestamp": timestamp,
+        "pair_first_timestamp": timestamp - timedelta(minutes=30),
+        "pair_second_timestamp": timestamp - timedelta(minutes=15),
+        "zone_created_at": timestamp - timedelta(minutes=45),
+        "strategy_hash": "a" * 64,
+    }
+    first = pair_zone_event_identity(symbol="XAUUSD", decision="BUY", **common)
+    symbol_changed = pair_zone_event_identity(symbol="XAUUSDm", decision="BUY", **common)
+    direction_changed = pair_zone_event_identity(symbol="XAUUSD", decision="SELL", **common)
+    assert first != symbol_changed
+    assert first != direction_changed
+    assert len(first.removeprefix("pair-zone-evidence-")) == 64
+
+
+def test_v2_signal_immutable_provenance_rejects_update(tmp_path) -> None:
+    db = database(tmp_path)
+    with db.session() as session:
+        forward_session = ForwardValidationSessionRecord(
+            session_id="v2-session",
+            strategy_id="pair_zone_v1",
+            strategy_version="1.0.0",
+            strategy_config_hash="a" * 64,
+            started_at=OBSERVED_AT - timedelta(hours=1),
+            source_identity="fixture",
+            symbol="XAUUSD",
+            timeframes_json=["M5", "M15"],
+            rr=2.0,
+            cost_policy_json={},
+            status="ACTIVE",
+            execution_allowed=False,
+        )
+        session.add(forward_session)
+        session.flush()
+        signal = ForwardSignalRecord(
+            signal_id="v2-signal",
+            session_id=forward_session.id,
+            timestamp=OBSERVED_AT,
+            symbol="XAUUSD",
+            decision="BUY",
+            zone_id="zone-1",
+            entry_price=2000.0,
+            stop_loss=1990.0,
+            risk_distance=10.0,
+            rr=2.0,
+            take_profit=2020.0,
+            strategy_hash="a" * 64,
+            provenance_contract_version="strategy_intelligence_provenance_v2",
+            source_timeframe="M15",
+            confirmation_timeframe="M5",
+            signal_decision_at=OBSERVED_AT,
+            decision_available_at=OBSERVED_AT + timedelta(minutes=5),
+            pair_zone_decision_evidence_id="pair-zone-evidence-1",
+            execution_allowed=False,
+        )
+        session.add(signal)
+    with pytest.raises(ImmutableProvenanceError), db.session() as session:
+        signal = session.scalar(
+            select(ForwardSignalRecord).where(
+                ForwardSignalRecord.signal_id == "v2-signal"
+            )
+        )
+        assert signal is not None
+        signal.zone_id = "zone-2"
+    db.dispose()
+
+
+def test_forward_signal_idempotency_reuses_equal_and_rejects_conflict(tmp_path) -> None:
+    db = database(tmp_path)
+    session_id, _signal_id, _trade_id = seed_forward_graph(db, session_suffix="idempotent")
+    with db.session() as db_session:
+        worker_session = db_session.get(ForwardValidationSessionRecord, session_id)
+    assert worker_session is not None
+    worker = ForwardShadowWorker(
+        Settings(database_url=f"sqlite:///{(tmp_path / 'phase311.db').as_posix()}"),
+        db,
+        logger=logging.getLogger("phase311-idempotency"),
+    )
+    worker.session = worker_session
+    timestamp = OBSERVED_AT + timedelta(hours=1)
+    decision = SimpleNamespace(
+        decision=SimpleNamespace(value="BUY"),
+        m5_candle_timestamp=timestamp,
+        entry_price=2000.0,
+        stop_loss=1990.0,
+        take_profit=2020.0,
+        market_regime=SimpleNamespace(value="BULLISH"),
+        feature_context={
+            "zone_id": "zone-1",
+            "zone_created_at": (timestamp - timedelta(minutes=45)).isoformat(),
+            "pair_first_timestamp": (timestamp - timedelta(minutes=30)).isoformat(),
+            "pair_second_timestamp": (timestamp - timedelta(minutes=15)).isoformat(),
+        },
+    )
+    snapshot = SimpleNamespace(
+        symbol=SimpleNamespace(
+            name="XAUUSDm",
+            spread=20.0,
+            digits=2,
+            point=0.01,
+            trade_tick_size=0.01,
+            contract_size=100.0,
+            volume_min=0.01,
+            volume_step=0.01,
+        ),
+        tick=SimpleNamespace(bid=2000.0, ask=2000.2),
+        candles={
+            "M5": (
+                SimpleNamespace(
+                    timestamp=timestamp,
+                    open=2000.0,
+                    high=2001.0,
+                    low=1999.0,
+                    close=2000.5,
+                    tick_volume=10,
+                    spread=20,
+                    real_volume=10,
+                ),
+            )
+        },
+    )
+    def persist_from_worker() -> ForwardSignalRecord | None:
+        concurrent_worker = ForwardShadowWorker(
+            Settings(database_url=f"sqlite:///{(tmp_path / 'phase311.db').as_posix()}"),
+            db,
+            logger=logging.getLogger("phase311-idempotency-concurrent"),
+        )
+        concurrent_worker.session = worker_session
+        return concurrent_worker._persist_signal(decision, snapshot)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        concurrent_results = list(executor.map(lambda _index: persist_from_worker(), (1, 2)))
+    assert concurrent_results[0] is not None and concurrent_results[1] is not None
+    assert concurrent_results[0].id == concurrent_results[1].id
+    first = worker._persist_signal(decision, snapshot)
+    second = worker._persist_signal(decision, snapshot)
+    assert first is not None and second is not None
+    assert first.id == second.id
+    decision.decision = SimpleNamespace(value="SELL")
+    with pytest.raises(ForwardSignalConflictError, match="immutable field conflict"):
+        worker._persist_signal(decision, snapshot)
+    with db.session() as db_session:
+        assert db_session.query(ForwardSignalRecord).count() == 2
+        assert db_session.query(ForwardTradeRecord).count() == 2
     db.dispose()

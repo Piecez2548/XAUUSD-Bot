@@ -25,10 +25,13 @@ from sqlalchemy.orm import Session
 
 from models.model_inference_dataset import (
     DATASET_CONTRACT_VERSION,
+    DATASET_V2_CONTRACT_VERSION,
     FEATURE_CONTRACT_VERSION,
     DatasetAuditV1,
     DatasetManifestV1,
+    DatasetManifestV2,
     DatasetRowV1,
+    DatasetRowV2,
     dataset_row_fingerprint,
 )
 from persistence.orm import (
@@ -44,6 +47,8 @@ from services.model_inference import INFERENCE_VERSION
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
 BUILDER_SEMANTICS_VERSION = "model_inference_dataset_builder_v1"
+BUILDER_V2_SEMANTICS_VERSION = "model_inference_dataset_builder_v2"
+PROVENANCE_CONTRACT_VERSION = "strategy_intelligence_provenance_v2"
 COMPLETED_STATES = frozenset({"TP", "SL", "AMBIGUOUS", "EXPIRED"})
 TRAINABLE_LABELS = frozenset({"TP", "SL"})
 
@@ -212,12 +217,20 @@ class ModelInferenceDatasetBuilder:
         *,
         page_size: int = DEFAULT_PAGE_SIZE,
         session_aware_v2_accepted: bool = False,
+        dataset_contract_version: str = DATASET_CONTRACT_VERSION,
     ) -> None:
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
         self.database = database
         self.page_size = page_size
         self.session_aware_v2_accepted = session_aware_v2_accepted
+        if dataset_contract_version not in {DATASET_CONTRACT_VERSION, DATASET_V2_CONTRACT_VERSION}:
+            raise ValueError("unsupported dataset contract version")
+        self.dataset_contract_version = dataset_contract_version
+
+    @property
+    def _is_v2(self) -> bool:
+        return self.dataset_contract_version == DATASET_V2_CONTRACT_VERSION
 
     def _page(self, cursor: _Cursor | None) -> list[tuple[Any, ...]]:
         statement = (
@@ -270,7 +283,7 @@ class ModelInferenceDatasetBuilder:
         with _read_only_session(self.database) as session:
             return list(session.execute(statement).all())
 
-    def iter_rows(self) -> Iterator[DatasetRowV1]:
+    def iter_rows(self) -> Iterator[DatasetRowV1 | DatasetRowV2]:
         cursor: _Cursor | None = None
         while True:
             page = self._page(cursor)
@@ -303,8 +316,14 @@ class ModelInferenceDatasetBuilder:
         evaluation: ModelInferenceEvaluationRecord | None,
         *,
         duplicate: bool,
-    ) -> DatasetRowV1:
-        cutoff = _utc(source.detected_at)
+    ) -> DatasetRowV1 | DatasetRowV2:
+        if self._is_v2 and source.provenance_contract_version != PROVENANCE_CONTRACT_VERSION:
+            return self._unresolved_row(
+                source, "LEGACY_PROVENANCE_CONTRACT", legacy_contract=True
+            )
+        cutoff = self._causal_cutoff(source, signal)
+        if cutoff is None:
+            return self._unresolved_row(source, "MISSING_DECISION_BOUNDARY")
         reasons: list[str] = []
         causal_violation = False
         classification = self._classification(evaluation, source, reasons)
@@ -314,7 +333,7 @@ class ModelInferenceDatasetBuilder:
         context_latest_m5 = _parse_timestamp(context.get("latest_m5_timestamp"))
         context_latest_m15 = _parse_timestamp(context.get("latest_m15_timestamp"))
         source_timestamps: dict[str, datetime | None] = {
-            "candidate_detected_at": cutoff,
+            "candidate_detected_at": _utc(source.detected_at),
             "context_as_of": context_as_of,
             "context_latest_m5_timestamp": context_latest_m5,
             "context_latest_m15_timestamp": context_latest_m15,
@@ -322,7 +341,6 @@ class ModelInferenceDatasetBuilder:
                 None if forward_session is None else _utc(forward_session.started_at)
             ),
             "signal_timestamp": None if signal is None else _utc(signal.timestamp),
-            "signal_created_at": None if signal is None else _utc(signal.created_at),
             "signal_pair_first_timestamp": (
                 None if signal is None or signal.pair_first_timestamp is None
                 else _utc(signal.pair_first_timestamp)
@@ -332,17 +350,62 @@ class ModelInferenceDatasetBuilder:
                 else _utc(signal.pair_second_timestamp)
             ),
             "trade_timestamp": None if trade is None else _utc(trade.timestamp),
-            "pair_zone_evaluation_at": None if pair_zone is None else _utc(pair_zone.evaluation_at),
         }
+        if not self._is_v2:
+            source_timestamps["signal_created_at"] = (
+                None if signal is None else _utc(signal.created_at)
+            )
+            source_timestamps["pair_zone_evaluation_at"] = (
+                None if pair_zone is None else _utc(pair_zone.evaluation_at)
+            )
+        if self._is_v2:
+            source_timestamps.update(
+                {
+                    "observation_available_at": (
+                        None if source.observation_available_at is None
+                        else _utc(source.observation_available_at)
+                    ),
+                    "signal_decision_at": (
+                        None if signal is None or signal.signal_decision_at is None
+                        else _utc(signal.signal_decision_at)
+                    ),
+                    "decision_available_at": (
+                        None if signal is None or signal.decision_available_at is None
+                        else _utc(signal.decision_available_at)
+                    ),
+                    "outcome_available_at": (
+                        None if trade is None or trade.outcome_available_at is None
+                        else _utc(trade.outcome_available_at)
+                    ),
+                }
+            )
         if duplicate:
             reasons.append("DUPLICATE_CANDIDATE_IDENTITY")
         if source.timeframe != "M15":
             reasons.append("UNSUPPORTED_STRATEGY_TIMEFRAME")
+        if self._is_v2 and (
+            source.source_timeframe != "M15" or source.confirmation_timeframe != "M5"
+        ):
+            reasons.append("INVALID_TIMEFRAME_PROVENANCE")
+        if self._is_v2 and source.observation_available_at is None:
+            reasons.append("MISSING_OBSERVATION_BOUNDARY")
         if source.execution_allowed is not False:
             reasons.append("EXECUTION_AUTHORITY_PRESENT")
 
+        persistence_only = {
+            "signal_created_at",
+            "pair_zone_evaluation_at",
+            # This is the future outcome's availability boundary, not a
+            # pre-decision feature timestamp.
+            "outcome_available_at",
+        }
         for name, timestamp in source_timestamps.items():
-            if name != "candidate_detected_at" and timestamp is not None and timestamp > cutoff:
+            if (
+                name != "candidate_detected_at"
+                and name not in persistence_only
+                and timestamp is not None
+                and timestamp > cutoff
+            ):
                 reasons.append("CAUSAL_TIMESTAMP_AFTER_CUTOFF")
                 causal_violation = True
         if (
@@ -378,7 +441,7 @@ class ModelInferenceDatasetBuilder:
                     if timestamp > cutoff:
                         reasons.append("POST_DECISION_SIGNAL_EVIDENCE")
                         causal_violation = True
-        if pair_zone is not None:
+        if pair_zone is not None and not self._is_v2:
             if pair_zone.evaluation_at > cutoff:
                 reasons.append("POST_DECISION_PAIR_ZONE_EVIDENCE")
                 causal_violation = True
@@ -398,7 +461,9 @@ class ModelInferenceDatasetBuilder:
         if not self.session_aware_v2_accepted:
             reasons.append("SESSION_AWARE_V2_NOT_ACCEPTED")
 
-        state, label = self._outcome_state(source, forward_session, signal, trade, reasons, cutoff)
+        state, label = self._outcome_state(
+            source, forward_session, signal, trade, reasons, cutoff, v2=self._is_v2
+        )
         if state == "OUTCOME_COMPLETED" and label in TRAINABLE_LABELS:
             eligibility = "TRAINABLE"
             if missing_features or causal_violation or reasons:
@@ -425,19 +490,22 @@ class ModelInferenceDatasetBuilder:
             "forward_signal_id": source.forward_signal_id,
             "forward_trade_id": source.forward_trade_id,
             "pair_zone_event_id": source.pair_zone_event_id,
+            "pair_zone_decision_evidence_id": source.pair_zone_decision_evidence_id,
             "model_inference_version": None if evaluation is None else evaluation.inference_version,
         }
+        if self._is_v2:
+            provenance["provenance_contract_version"] = source.provenance_contract_version
         identity_payload = {
-            "dataset_contract_version": DATASET_CONTRACT_VERSION,
+            "dataset_contract_version": self.dataset_contract_version,
             "candidate_id": source.candidate_id,
         }
         row_identity = _hash(identity_payload)
         row_payload = {
-            "dataset_contract_version": DATASET_CONTRACT_VERSION,
+            "dataset_contract_version": self.dataset_contract_version,
             "feature_contract_version": FEATURE_CONTRACT_VERSION,
             "candidate_id": source.candidate_id,
             "symbol": source.symbol,
-            "candidate_timestamp": cutoff.isoformat(),
+            "candidate_timestamp": _utc(source.detected_at).isoformat(),
             "causal_cutoff_timestamp": cutoff.isoformat(),
             "state": state,
             "training_eligibility": eligibility,
@@ -449,11 +517,38 @@ class ModelInferenceDatasetBuilder:
             "source_timestamps": _json_value(source_timestamps),
             "row_identity": row_identity,
         }
+        if self._is_v2:
+            row_payload.update(
+                {
+                    "source_timeframe": source.source_timeframe,
+                    "confirmation_timeframe": source.confirmation_timeframe,
+                    "provenance_contract_version": source.provenance_contract_version,
+                    "observation_available_at": _json_value(source.observation_available_at),
+                    "signal_decision_at": source_timestamps["signal_decision_at"],
+                    "decision_available_at": source_timestamps["decision_available_at"],
+                    "pair_zone_decision_evidence_id": (
+                        None
+                        if signal is None
+                        else signal.pair_zone_decision_evidence_id
+                    ),
+                }
+            )
         row_fingerprint = dataset_row_fingerprint(row_payload)
-        return DatasetRowV1(
-            **row_payload,
-            row_fingerprint=row_fingerprint,
-        )
+        row_type = DatasetRowV2 if self._is_v2 else DatasetRowV1
+        return row_type(**row_payload, row_fingerprint=row_fingerprint)
+
+    @staticmethod
+    def _causal_cutoff(
+        source: StrategyIntelligenceRecord,
+        signal: ForwardSignalRecord | None,
+    ) -> datetime | None:
+        if source.provenance_contract_version == PROVENANCE_CONTRACT_VERSION:
+            if signal is not None and signal.decision_available_at is not None:
+                return _utc(signal.decision_available_at)
+            if source.observation_available_at is not None:
+                return _utc(source.observation_available_at)
+            return None
+        return _utc(source.detected_at)
 
     @staticmethod
     def _classification(
@@ -516,9 +611,17 @@ class ModelInferenceDatasetBuilder:
                 missing.add(key)
         return features, missing
 
-    @staticmethod
-    def _unresolved_row(source: StrategyIntelligenceRecord, reason: str) -> DatasetRowV1:
+    def _unresolved_row(
+        self,
+        source: StrategyIntelligenceRecord,
+        reason: str,
+        *,
+        legacy_contract: bool = False,
+    ) -> DatasetRowV1 | DatasetRowV2:
         cutoff = _utc(source.detected_at)
+        contract_version = (
+            DATASET_CONTRACT_VERSION if legacy_contract else self.dataset_contract_version
+        )
         provenance = {
             "strategy_intelligence_record_id": source.id,
             "strategy": source.strategy,
@@ -527,12 +630,12 @@ class ModelInferenceDatasetBuilder:
         }
         row_identity = _hash(
             {
-                "dataset_contract_version": DATASET_CONTRACT_VERSION,
+                "dataset_contract_version": contract_version,
                 "candidate_id": source.candidate_id,
             }
         )
         row_payload = {
-            "dataset_contract_version": DATASET_CONTRACT_VERSION,
+            "dataset_contract_version": contract_version,
             "feature_contract_version": FEATURE_CONTRACT_VERSION,
             "candidate_id": source.candidate_id,
             "symbol": source.symbol,
@@ -548,6 +651,24 @@ class ModelInferenceDatasetBuilder:
             "source_timestamps": {"candidate_detected_at": cutoff.isoformat()},
             "row_identity": row_identity,
         }
+        if self._is_v2 and not legacy_contract:
+            row_payload.update(
+                {
+                    "source_timeframe": source.source_timeframe,
+                    "confirmation_timeframe": source.confirmation_timeframe,
+                    "provenance_contract_version": source.provenance_contract_version,
+                    "observation_available_at": (
+                        None if source.observation_available_at is None
+                        else _json_value(source.observation_available_at)
+                    ),
+                    "signal_decision_at": None,
+                    "decision_available_at": None,
+                    "pair_zone_decision_evidence_id": source.pair_zone_decision_evidence_id,
+                }
+            )
+            return DatasetRowV2(
+                **row_payload, row_fingerprint=dataset_row_fingerprint(row_payload)
+            )
         return DatasetRowV1(**row_payload, row_fingerprint=dataset_row_fingerprint(row_payload))
 
     @staticmethod
@@ -574,6 +695,8 @@ class ModelInferenceDatasetBuilder:
         trade: ForwardTradeRecord | None,
         reasons: list[str],
         cutoff: datetime,
+        *,
+        v2: bool = False,
     ) -> tuple[str, str]:
         if source.forward_signal_id is None and source.forward_trade_id is None:
             return "PRE_SIGNAL_OBSERVATION", "NOT_ELIGIBLE"
@@ -586,7 +709,16 @@ class ModelInferenceDatasetBuilder:
         signal_valid = (
             source.forward_session_id == signal.session_id
             and source.forward_signal_id == signal.id
-            and source.pair_zone_event_id == signal.zone_id
+            and (
+                (
+                    source.pair_zone_event_id == signal.zone_id
+                    and source.pair_zone_decision_evidence_id is not None
+                    and source.pair_zone_decision_evidence_id
+                    == signal.pair_zone_decision_evidence_id
+                )
+                if v2
+                else source.pair_zone_event_id == signal.zone_id
+            )
             and forward_session.strategy_config_hash == signal.strategy_hash
             and signal.decision in {"BUY", "SELL"}
             and source.direction == signal.decision
@@ -596,6 +728,17 @@ class ModelInferenceDatasetBuilder:
             and forward_session.execution_allowed is False
             and signal.execution_allowed is False
         )
+        if v2:
+            signal_valid = signal_valid and (
+                signal.provenance_contract_version == PROVENANCE_CONTRACT_VERSION
+                and signal.source_timeframe == "M15"
+                and signal.confirmation_timeframe == "M5"
+                and signal.signal_decision_at == signal.timestamp
+                and signal.decision_available_at is not None
+                and signal.decision_available_at > signal.signal_decision_at
+                and signal.decision_available_at <= cutoff
+                and signal.symbol == forward_session.symbol
+            )
         if not signal_valid:
             reasons.append("FORWARD_PROVENANCE_MISMATCH")
             return "UNRESOLVED", "UNRESOLVED"
@@ -634,10 +777,10 @@ class ModelInferenceDatasetBuilder:
             return "UNRESOLVED", "UNRESOLVED"
         if (
             trade.terminal_timestamp is None
-            or trade.evaluated_at is None
             or trade.terminal_timestamp <= trade.timestamp
-            or trade.terminal_timestamp <= cutoff
-            or trade.evaluated_at <= trade.timestamp
+            or trade.outcome_available_at is None
+            or trade.outcome_available_at <= trade.terminal_timestamp
+            or trade.outcome_available_at <= cutoff
         ):
             reasons.append("INCOMPLETE_OUTCOME_PROVENANCE")
             return "UNRESOLVED", "UNRESOLVED"
@@ -729,7 +872,7 @@ def write_dataset_artifact(
     *,
     artifact_format: str = "jsonl",
     artifact_name: str = "model_inference_dataset_v1.jsonl",
-) -> tuple[DatasetManifestV1, Path]:
+) -> tuple[DatasetManifestV1 | DatasetManifestV2, Path]:
     """Stream rows into a caller-selected research directory and write a manifest."""
 
     if artifact_format not in {"jsonl", "parquet"}:
@@ -739,8 +882,22 @@ def write_dataset_artifact(
             "Parquet output requires an explicitly installed optional pyarrow dependency; "
             "no dependency was added by this foundation"
         )
+    is_v2 = (
+        getattr(builder, "dataset_contract_version", DATASET_CONTRACT_VERSION)
+        == DATASET_V2_CONTRACT_VERSION
+    )
+    dataset_contract_version = (
+        DATASET_V2_CONTRACT_VERSION if is_v2 else DATASET_CONTRACT_VERSION
+    )
+    if is_v2 and artifact_name == "model_inference_dataset_v1.jsonl":
+        artifact_name = "model_inference_dataset_v2.jsonl"
+    manifest_basename = (
+        "model_inference_dataset_v2.manifest.json"
+        if is_v2
+        else "model_inference_dataset_v1.manifest.json"
+    )
     artifact_path = output_dir / artifact_name
-    manifest_path = output_dir / "model_inference_dataset_v1.manifest.json"
+    manifest_path = output_dir / manifest_basename
     if (
         Path(artifact_name).name != artifact_name
         or Path(artifact_name).is_absolute()
@@ -768,9 +925,11 @@ def write_dataset_artifact(
             dataset_hasher = hashlib.sha256()
             artifact_hasher = hashlib.sha256()
             semantic_header = {
-                "dataset_contract_version": DATASET_CONTRACT_VERSION,
+                "dataset_contract_version": dataset_contract_version,
                 "feature_contract_version": FEATURE_CONTRACT_VERSION,
-                "builder_semantics_version": BUILDER_SEMANTICS_VERSION,
+                "builder_semantics_version": (
+                    BUILDER_V2_SEMANTICS_VERSION if is_v2 else BUILDER_SEMANTICS_VERSION
+                ),
                 "bounded_page_size": builder.page_size,
                 "session_aware_v2_accepted": builder.session_aware_v2_accepted,
                 "artifact_format": artifact_format,
@@ -791,7 +950,7 @@ def write_dataset_artifact(
         audit_model = audit.model()
         manifest_payload = {
             "artifact_contract_version": "model_inference_artifact_v1",
-            "dataset_contract_version": DATASET_CONTRACT_VERSION,
+            "dataset_contract_version": dataset_contract_version,
             "feature_contract_version": FEATURE_CONTRACT_VERSION,
             "artifact_format": artifact_format,
             "artifact_name": artifact_name,
@@ -800,18 +959,20 @@ def write_dataset_artifact(
             "row_count": audit_model.row_count,
             "audit": audit_model.model_dump(mode="json"),
             "causal_cutoff_rule": (
-                "candidate.detected_at in UTC; labels may occur later but never enter features"
+                "signal.decision_available_at or observation_available_at in UTC; "
+                "labels may occur later but never enter features"
+                if is_v2
+                else "candidate.detected_at in UTC; labels may occur later but never enter features"
             ),
             "bounded_page_size": builder.page_size,
             "session_aware_v2_accepted": builder.session_aware_v2_accepted,
         }
         manifest_fingerprint = _hash(manifest_payload)
-        manifest = DatasetManifestV1(
-            **manifest_payload, manifest_fingerprint=manifest_fingerprint
-        )
+        manifest_type = DatasetManifestV2 if is_v2 else DatasetManifestV1
+        manifest = manifest_type(**manifest_payload, manifest_fingerprint=manifest_fingerprint)
         with tempfile.NamedTemporaryFile(
             mode="wb",
-            prefix=".model_inference_dataset_v1.manifest.",
+            prefix=f".{manifest_basename}.",
             suffix=".partial",
             dir=output_dir,
             delete=False,

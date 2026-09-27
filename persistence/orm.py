@@ -20,6 +20,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
+    inspect,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -54,6 +56,10 @@ class UtcDateTime(TypeDecorator[datetime]):
 
 class Base(DeclarativeBase):
     pass
+
+
+class ImmutableProvenanceError(ValueError):
+    """Raised when immutable V2 provenance is changed after insertion."""
 
 
 # These tables are owned exclusively by Alembic auth revisions through 0015.
@@ -984,6 +990,10 @@ class ForwardSignalRecord(IdMixin, Base):
     __tablename__ = "forward_validation_signals"
     __table_args__ = (
         UniqueConstraint("session_id", "timestamp", name="uq_forward_signal_candle"),
+        UniqueConstraint(
+            "pair_zone_decision_evidence_id",
+            name="uq_forward_signal_pair_zone_decision_evidence",
+        ),
         Index("ix_forward_signals_session_time", "session_id", "timestamp"),
     )
 
@@ -992,6 +1002,7 @@ class ForwardSignalRecord(IdMixin, Base):
         ForeignKey("forward_validation_sessions.id"), nullable=False
     )
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(64), index=True)
     decision: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
     zone_id: Mapped[str] = mapped_column(String(100), nullable=False)
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
@@ -1009,6 +1020,14 @@ class ForwardSignalRecord(IdMixin, Base):
         JSON, nullable=False, default=dict
     )
     strategy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    provenance_contract_version: Mapped[str | None] = mapped_column(String(64))
+    source_timeframe: Mapped[str | None] = mapped_column(String(8))
+    confirmation_timeframe: Mapped[str | None] = mapped_column(String(8))
+    signal_decision_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    decision_available_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    pair_zone_decision_evidence_id: Mapped[str | None] = mapped_column(
+        String(128), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now, nullable=False)
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
@@ -1037,6 +1056,7 @@ class ForwardTradeRecord(IdMixin, Base):
     take_profit: Mapped[float] = mapped_column(Float, nullable=False)
     risk_distance: Mapped[float] = mapped_column(Float, nullable=False)
     terminal_timestamp: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    outcome_available_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     mark_price: Mapped[float | None] = mapped_column(Float)
     gross_r: Mapped[float | None] = mapped_column(Float)
     net_r: Mapped[float | None] = mapped_column(Float)
@@ -1150,6 +1170,13 @@ class StrategyIntelligenceRecord(IdMixin, Base):
     score_components_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     pair_zone_event_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    provenance_contract_version: Mapped[str | None] = mapped_column(String(64))
+    source_timeframe: Mapped[str | None] = mapped_column(String(8))
+    confirmation_timeframe: Mapped[str | None] = mapped_column(String(8))
+    observation_available_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    pair_zone_decision_evidence_id: Mapped[str | None] = mapped_column(
+        String(128), index=True
+    )
     forward_session_id: Mapped[str | None] = mapped_column(
         ForeignKey("forward_validation_sessions.id"), index=True
     )
@@ -1197,3 +1224,68 @@ class ModelInferenceEvaluationRecord(IdMixin, Base):
     advisory_classification: Mapped[str] = mapped_column(String(32), nullable=False)
     reason_codes_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     execution_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+_FORWARD_SIGNAL_IMMUTABLE_V2_FIELDS = frozenset(
+    {
+        "signal_id",
+        "session_id",
+        "timestamp",
+        "symbol",
+        "decision",
+        "zone_id",
+        "entry_price",
+        "stop_loss",
+        "risk_distance",
+        "rr",
+        "take_profit",
+        "pair_first_timestamp",
+        "pair_second_timestamp",
+        "h1_context_json",
+        "confirmation_candle_json",
+        "market_observation_json",
+        "strategy_hash",
+        "provenance_contract_version",
+        "source_timeframe",
+        "confirmation_timeframe",
+        "signal_decision_at",
+        "decision_available_at",
+        "pair_zone_decision_evidence_id",
+    }
+)
+_INTELLIGENCE_IMMUTABLE_V2_FIELDS = frozenset(
+    {
+        "provenance_contract_version",
+        "source_timeframe",
+        "confirmation_timeframe",
+        "observation_available_at",
+        "pair_zone_event_id",
+        "pair_zone_decision_evidence_id",
+    }
+)
+
+
+def _guard_v2_immutable_update(target: Any, fields: frozenset[str], label: str) -> None:
+    state = inspect(target)
+    version_history = state.attrs.provenance_contract_version.history
+    current_version = target.provenance_contract_version
+    was_v2 = current_version == "strategy_intelligence_provenance_v2" or (
+        "strategy_intelligence_provenance_v2" in version_history.deleted
+    )
+    if not was_v2:
+        return
+    for field_name in fields:
+        if state.attrs[field_name].history.has_changes():
+            raise ImmutableProvenanceError(
+                f"{label} V2 immutable provenance field cannot be changed: {field_name}"
+            )
+
+
+@event.listens_for(ForwardSignalRecord, "before_update")
+def _guard_forward_signal_v2_update(_mapper: Any, _connection: Any, target: Any) -> None:
+    _guard_v2_immutable_update(target, _FORWARD_SIGNAL_IMMUTABLE_V2_FIELDS, "forward signal")
+
+
+@event.listens_for(StrategyIntelligenceRecord, "before_update")
+def _guard_intelligence_v2_update(_mapper: Any, _connection: Any, target: Any) -> None:
+    _guard_v2_immutable_update(target, _INTELLIGENCE_IMMUTABLE_V2_FIELDS, "strategy intelligence")

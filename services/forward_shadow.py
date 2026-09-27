@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 
 from models.market import MarketSnapshot, Timeframe
 from persistence.orm import (
@@ -65,6 +67,51 @@ FORWARD_COST_POLICY = {
 }
 
 
+class ForwardSignalConflictError(ValueError):
+    """Raised when one signal id is reused with different immutable data."""
+
+
+V2_PROVENANCE_CONTRACT_VERSION = "strategy_intelligence_provenance_v2"
+
+
+def _identity_timestamp(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return normalized.astimezone(UTC).isoformat()
+
+
+def pair_zone_event_identity(
+    *,
+    contract_version: str,
+    symbol: str,
+    session_id: str,
+    zone_id: str,
+    decision: str,
+    confirmation_timestamp: datetime,
+    pair_first_timestamp: datetime | None,
+    pair_second_timestamp: datetime | None,
+    zone_created_at: datetime | None,
+    strategy_hash: str,
+) -> str:
+    """Return a canonical, causal identity for one Pair Zone decision."""
+
+    material = {
+        "contract_version": contract_version,
+        "symbol": symbol,
+        "session_id": session_id,
+        "zone_id": zone_id,
+        "decision": decision,
+        "confirmation_timestamp": _identity_timestamp(confirmation_timestamp),
+        "pair_first_timestamp": _identity_timestamp(pair_first_timestamp),
+        "pair_second_timestamp": _identity_timestamp(pair_second_timestamp),
+        "zone_created_at": _identity_timestamp(zone_created_at),
+        "strategy_hash": strategy_hash,
+    }
+    serialized = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "pair-zone-evidence-" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ForwardInput:
     snapshot: MarketSnapshot
@@ -89,7 +136,21 @@ def _iso(value: datetime | None) -> str | None:
 def _candle_json(candle: Any | None) -> dict[str, Any]:
     if candle is None:
         return {}
-    return {key: getattr(candle, key) for key in ("timestamp", "open", "high", "low", "close", "tick_volume", "spread", "real_volume") if hasattr(candle, key)}
+    result = {}
+    for key in (
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "tick_volume",
+        "spread",
+        "real_volume",
+    ):
+        if hasattr(candle, key):
+            value = getattr(candle, key)
+            result[key] = value.isoformat() if isinstance(value, datetime) else value
+    return result
 
 
 def _feature_candle(snapshot: MarketSnapshot, timestamp: datetime) -> Any | None:
@@ -422,7 +483,24 @@ class ForwardShadowWorker:
             persist_kwargs = {"forward_session_id": self.session.id}
             zone_id = decision.feature_context.get("zone_id") if isinstance(decision.feature_context, dict) else None
             if zone_id:
+                configured_hash = getattr(self.session, "strategy_config_hash", None) or EXPECTED_PAIR_ZONE_FILE_SHA256
+                pair_first = _parse_iso(decision.feature_context.get("pair_first_timestamp"))
+                pair_second = _parse_iso(decision.feature_context.get("pair_second_timestamp"))
+                zone_created = _parse_iso(decision.feature_context.get("zone_created_at"))
+                evidence_id = pair_zone_event_identity(
+                    contract_version=V2_PROVENANCE_CONTRACT_VERSION,
+                    symbol=item.snapshot.symbol.name,
+                    session_id=self.session.id,
+                    zone_id=str(zone_id),
+                    decision=decision.decision.value,
+                    confirmation_timestamp=timestamp,
+                    pair_first_timestamp=pair_first,
+                    pair_second_timestamp=pair_second,
+                    zone_created_at=zone_created,
+                    strategy_hash=configured_hash,
+                )
                 persist_kwargs["pair_zone_event_id"] = str(zone_id)
+                persist_kwargs["pair_zone_decision_evidence_id"] = evidence_id
             intelligence_record = persist_intelligence_record(self.database, intelligence, **persist_kwargs)
         except Exception as exc:
             # Intelligence is advisory metadata. Its failure must not rewrite
@@ -516,36 +594,82 @@ class ForwardShadowWorker:
         }
         first = _parse_iso(context.get("pair_first_timestamp"))
         second = _parse_iso(context.get("pair_second_timestamp"))
+        zone_created = _parse_iso(context.get("zone_created_at"))
         signal_id = f"forward-signal-{self.session.session_id}-{decision.m5_candle_timestamp.isoformat()}"
-        with self.database.session() as session:
-            existing = session.scalar(select(ForwardSignalRecord).where(ForwardSignalRecord.signal_id == signal_id))
-            if existing is not None:
-                return existing
-            row = ForwardSignalRecord(
-                signal_id=signal_id, session_id=self.session.id, timestamp=decision.m5_candle_timestamp,
-                decision=decision.decision.value, zone_id=zone_id, entry_price=entry, stop_loss=stop,
-                risk_distance=_risk_distance(decision.decision.value, entry, stop), rr=float(self.session.rr), take_profit=target,
-                pair_first_timestamp=first, pair_second_timestamp=second,
-                h1_context_json={"direction": decision.market_regime.value, "feature_context": context},
-                confirmation_candle_json=_candle_json(m5), market_observation_json=observation,
-                strategy_hash=EXPECTED_PAIR_ZONE_FILE_SHA256, execution_allowed=False,
+        configured_hash = getattr(self.session, "strategy_config_hash", None) or EXPECTED_PAIR_ZONE_FILE_SHA256
+        pair_evidence_id = (
+            pair_zone_event_identity(
+                contract_version=V2_PROVENANCE_CONTRACT_VERSION,
+                symbol=snapshot.symbol.name,
+                session_id=self.session.id,
+                zone_id=zone_id,
+                decision=decision.decision.value,
+                confirmation_timestamp=decision.m5_candle_timestamp,
+                pair_first_timestamp=first,
+                pair_second_timestamp=second,
+                zone_created_at=zone_created,
+                strategy_hash=configured_hash,
             )
-            session.add(row)
-            session.flush()
-            cost = forward_cost_r(side=row.decision, entry=entry, stop=stop, spread_points=spread,
-                                  point=snapshot.symbol.point, entry_slippage_points=float(FORWARD_COST_POLICY["entry_slippage_points"]),
-                                  exit_slippage_points=float(FORWARD_COST_POLICY["exit_slippage_points"]), commission_r=float(FORWARD_COST_POLICY["commission_r"]))
-            session.add(ForwardTradeRecord(
-                trade_id=f"forward-trade-{row.signal_id}", session_id=self.session.id, signal_id=row.id,
-                timestamp=row.timestamp, side=row.decision, state="OPEN", entry_price=entry,
-                stop_loss=stop, take_profit=target, risk_distance=row.risk_distance,
-                spread_points=spread, spread_observation="ACTUAL" if snapshot.symbol.spread is not None else "ESTIMATED",
-                entry_slippage_points=float(FORWARD_COST_POLICY["entry_slippage_points"]),
-                exit_slippage_points=float(FORWARD_COST_POLICY["exit_slippage_points"]),
-                commission_r=float(FORWARD_COST_POLICY["commission_r"]), total_cost_r=cost,
-                execution_allowed=False,
-            ))
-            return row
+            if zone_id != "unknown"
+            else None
+        )
+        signal_decision_at = decision.m5_candle_timestamp
+        decision_available_at = signal_decision_at + timedelta(minutes=5)
+        expected = {
+            "signal_id": signal_id,
+            "session_id": self.session.id,
+            "timestamp": decision.m5_candle_timestamp,
+            "symbol": snapshot.symbol.name,
+            "decision": decision.decision.value,
+            "zone_id": zone_id,
+            "entry_price": entry,
+            "stop_loss": stop,
+            "risk_distance": _risk_distance(decision.decision.value, entry, stop),
+            "rr": float(self.session.rr),
+            "take_profit": target,
+            "pair_first_timestamp": first,
+            "pair_second_timestamp": second,
+            "h1_context_json": {"direction": decision.market_regime.value, "feature_context": context},
+            "confirmation_candle_json": _candle_json(m5),
+            "market_observation_json": observation,
+            "strategy_hash": configured_hash,
+            "provenance_contract_version": V2_PROVENANCE_CONTRACT_VERSION,
+            "source_timeframe": "M15",
+            "confirmation_timeframe": "M5",
+            "signal_decision_at": signal_decision_at,
+            "decision_available_at": decision_available_at,
+            "pair_zone_decision_evidence_id": pair_evidence_id,
+        }
+        try:
+            with self.database.session() as session:
+                existing = session.scalar(select(ForwardSignalRecord).where(ForwardSignalRecord.signal_id == signal_id))
+                if existing is not None:
+                    _assert_signal_immutable_match(existing, expected)
+                    return existing
+                row = ForwardSignalRecord(**expected, execution_allowed=False)
+                session.add(row)
+                session.flush()
+                cost = forward_cost_r(side=row.decision, entry=entry, stop=stop, spread_points=spread,
+                                      point=snapshot.symbol.point, entry_slippage_points=float(FORWARD_COST_POLICY["entry_slippage_points"]),
+                                      exit_slippage_points=float(FORWARD_COST_POLICY["exit_slippage_points"]), commission_r=float(FORWARD_COST_POLICY["commission_r"]))
+                session.add(ForwardTradeRecord(
+                    trade_id=f"forward-trade-{row.signal_id}", session_id=self.session.id, signal_id=row.id,
+                    timestamp=row.timestamp, side=row.decision, state="OPEN", entry_price=entry,
+                    stop_loss=stop, take_profit=target, risk_distance=row.risk_distance,
+                    spread_points=spread, spread_observation="ACTUAL" if snapshot.symbol.spread is not None else "ESTIMATED",
+                    entry_slippage_points=float(FORWARD_COST_POLICY["entry_slippage_points"]),
+                    exit_slippage_points=float(FORWARD_COST_POLICY["exit_slippage_points"]),
+                    commission_r=float(FORWARD_COST_POLICY["commission_r"]), total_cost_r=cost,
+                    execution_allowed=False,
+                ))
+                return row
+        except IntegrityError:
+            with self.database.session() as session:
+                existing = session.scalar(select(ForwardSignalRecord).where(ForwardSignalRecord.signal_id == signal_id))
+                if existing is None:
+                    raise
+                _assert_signal_immutable_match(existing, expected)
+                return existing
 
     def _persist_pair_zone_evaluation(
         self,
@@ -661,6 +785,11 @@ class ForwardShadowWorker:
                 cost = float(trade.total_cost_r or 0.0)
                 trade.state = state
                 trade.terminal_timestamp = terminal_timestamp
+                trade.outcome_available_at = (
+                    terminal_timestamp + timedelta(minutes=5)
+                    if terminal_timestamp is not None
+                    else None
+                )
                 trade.mark_price = values.get("exit_price") or (candles[-1].close if candles else None)
                 trade.gross_r = float(gross) if gross is not None else None
                 trade.net_r = float(gross) - cost if gross is not None else None
@@ -727,6 +856,16 @@ def _parse_iso(value: Any) -> datetime | None:
         return result if result.tzinfo else result.replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _assert_signal_immutable_match(
+    existing: ForwardSignalRecord, expected: dict[str, Any]
+) -> None:
+    for field_name, incoming in expected.items():
+        if getattr(existing, field_name) != incoming:
+            raise ForwardSignalConflictError(
+                f"forward signal immutable field conflict: {field_name}"
+            )
 
 
 def latest_forward_session(database) -> ForwardValidationSessionRecord | None:

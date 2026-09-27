@@ -141,6 +141,14 @@ class StrategyCandidate(IntelligenceModel):
     source: str = "deterministic"
     evidence_version: str = "evidence_v1"
     execution_allowed: bool = False
+    # ``detected_at`` remains the historical event label.  The explicit
+    # provenance fields below are populated only by the V2 Pair Zone
+    # producer, so legacy observations remain readable without being
+    # reinterpreted as future-only records.
+    provenance_contract_version: str | None = None
+    source_timeframe: str | None = None
+    confirmation_timeframe: str | None = None
+    observation_available_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_safety(self) -> StrategyCandidate:
