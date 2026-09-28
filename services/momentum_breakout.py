@@ -31,6 +31,7 @@ MOMENTUM_CONFIG = {
     "minimum_body_ratio": 0.6,
     "target_rr": 2.0,
     "stop_buffer_ticks": 1,
+    "max_spread_points": 300,
 }
 
 
@@ -92,7 +93,11 @@ class MomentumBreakoutV1:
     def validate_config(self) -> None:
         if self.config["m15_ema_period"] <= 1 or self.config["m5_atr_period"] <= 1:
             raise ValueError("momentum periods must be greater than one")
-        if self.config["target_rr"] <= 0 or self.config["stop_buffer_ticks"] < 0:
+        if (
+            self.config["target_rr"] <= 0
+            or self.config["stop_buffer_ticks"] < 0
+            or self.config["max_spread_points"] < 0
+        ):
             raise ValueError("momentum risk geometry is invalid")
         if not 0 < self.config["minimum_body_ratio"] <= 1:
             raise ValueError("momentum body ratio is invalid")
@@ -133,7 +138,7 @@ class MomentumBreakoutV1:
             return self._no_trade(common, "RISK_STATE_UNKNOWN", "RISK_GATE")
         if not self._ordered_closed(m5):
             return self._no_trade(common, "CANDLE_ORDER_INVALID", "DATA")
-        if snapshot.symbol.spread > self.settings.shadow_max_spread_points:
+        if snapshot.symbol.spread > self.config["max_spread_points"]:
             return self._no_trade(common, "SPREAD_TOO_HIGH", "SPREAD")
         m15 = snapshot.candles.get(Timeframe.M15, ())
         if not self._ordered_closed(m15) or any(

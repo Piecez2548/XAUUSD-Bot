@@ -30,7 +30,9 @@ def _candle(timestamp: datetime, open_: float, high: float, low: float, close: f
     )
 
 
-def _snapshot(*, trigger_close: float = 106.0, forming: bool = False) -> MarketSnapshot:
+def _snapshot(
+    *, trigger_close: float = 106.0, forming: bool = False, spread_points: int = 240
+) -> MarketSnapshot:
     m15 = tuple(
         _candle(
             START - timedelta(hours=8) + timedelta(minutes=15 * index),
@@ -56,7 +58,7 @@ def _snapshot(*, trigger_close: float = 106.0, forming: bool = False) -> MarketS
     trigger_time = START + timedelta(minutes=5 * 29)
     m5.append(_candle(trigger_time, 105.0, max(trigger_close + 0.1, 105.2), 104.7, trigger_close))
     symbol = SymbolSpecification(
-        name="XAUUSDm", bid=105.8, ask=106.0, spread=20, digits=2, point=0.01,
+        name="XAUUSDm", bid=105.8, ask=106.0, spread=spread_points, digits=2, point=0.01,
         trade_tick_size=0.01, trade_tick_value=1.0, trade_tick_value_profit=1.0,
         trade_tick_value_loss=1.0, contract_size=100, volume_min=0.01,
         volume_max=100, volume_step=0.01, trade_mode=4, trade_mode_name="full",
@@ -160,6 +162,25 @@ def test_stale_data_fails_closed() -> None:
     )
     assert decision.decision.value == "NO_TRADE"
     assert decision.reason_codes == ("DATA_STALE",)
+
+
+def test_normal_xauusdm_spread_passes_momentum_gate() -> None:
+    decision = _strategy().evaluate(
+        _snapshot(spread_points=240), risk=_risk(), candles_are_closed=True
+    )
+    assert decision.decision.value == "BUY"
+
+
+def test_momentum_spread_ceiling_boundary_is_deterministic() -> None:
+    at_ceiling = _strategy().evaluate(
+        _snapshot(spread_points=300), risk=_risk(), candles_are_closed=True
+    )
+    above_ceiling = _strategy().evaluate(
+        _snapshot(spread_points=301), risk=_risk(), candles_are_closed=True
+    )
+    assert at_ceiling.decision.value == "BUY"
+    assert above_ceiling.decision.value == "NO_TRADE"
+    assert above_ceiling.reason_codes == ("SPREAD_TOO_HIGH",)
 
 
 def test_future_m15_context_fails_closed() -> None:
