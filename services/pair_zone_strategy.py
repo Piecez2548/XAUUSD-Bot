@@ -62,6 +62,7 @@ class PairZoneV1:
         # Canonical zone IDs bind the M15 pair timestamps and direction. Keep
         # invalidation proof only until that zone's canonical age horizon ends.
         self._invalidated: dict[str, Any] = {}
+        self._invalidation_observations: dict[str, dict[str, Any]] = {}
         self._expired: set[str] = set()
         self._touch_events = 0
         self.validate_config()
@@ -90,6 +91,7 @@ class PairZoneV1:
         self._touch_counts.clear()
         self._confirmed.clear()
         self._invalidated.clear()
+        self._invalidation_observations.clear()
         self._expired.clear()
         self._touch_events = 0
 
@@ -221,6 +223,24 @@ class PairZoneV1:
                 confirms = intersects and candle.close < zone.lower_bound and body > 0 and wick >= body * float(self.config["confirmation_wick_to_body"])
             if invalid:
                 self._invalidated[zone.zone_id] = zone.created_at + max_age
+                reason = (
+                    "M5 close below lower zone boundary"
+                    if zone.direction == ShadowAction.BUY
+                    else "M5 close above upper zone boundary"
+                )
+                self._invalidation_observations.setdefault(
+                    zone.zone_id,
+                    {
+                        "zone_id": zone.zone_id,
+                        "direction": zone.direction.value,
+                        "zone_lower": zone.lower_bound,
+                        "zone_upper": zone.upper_bound,
+                        "m5_candle_timestamp": candle.timestamp,
+                        "m5_close": candle.close,
+                        "reason": reason,
+                        "timestamp": candle.timestamp,
+                    },
+                )
                 return "INVALIDATED", touches, None
             if first_confirmation is None and confirms:
                 first_confirmation = candle
@@ -245,6 +265,12 @@ class PairZoneV1:
         ]
         for zone_id in expired_ids:
             del self._invalidated[zone_id]
+            self._invalidation_observations.pop(zone_id, None)
+
+    def invalidation_observations(self) -> tuple[dict[str, Any], ...]:
+        """Return causal invalidation evidence for operator observability."""
+
+        return tuple(self._invalidation_observations.values())
 
     @staticmethod
     def _has_complete_zone_m5_history(

@@ -56,6 +56,14 @@ class EventType(StrEnum):
     RISK_BACK_WITHIN_BOUNDS = "RISK_BACK_WITHIN_BOUNDS"
     HISTORY_SYNC_FAILED = "HISTORY_SYNC_FAILED"
     HISTORY_SYNC_RECOVERED = "HISTORY_SYNC_RECOVERED"
+    PAIR_ZONE_ACTIVE = "PAIR_ZONE_ACTIVE"
+    ZONE_TOUCHED = "ZONE_TOUCHED"
+    ZONE_INVALIDATED = "ZONE_INVALIDATED"
+    ZONE_REPLACED = "ZONE_REPLACED"
+    CANONICAL_SIGNAL_CREATED = "CANONICAL_SIGNAL_CREATED"
+    DEMO_ORDER_ACCEPTED = "DEMO_ORDER_ACCEPTED"
+    DEMO_ORDER_BLOCKED = "DEMO_ORDER_BLOCKED"
+    DEMO_POSITION_CLOSED = "DEMO_POSITION_CLOSED"
 
 
 class EventSeverity(StrEnum):
@@ -206,6 +214,14 @@ class DomainEvent(BaseModel):
             EventType.STOP_LOSS: (TradeLifecyclePayload,),
             EventType.RISK_LIMIT_REJECTED: (TradeLifecyclePayload,),
             EventType.CANDLE_CLOSED: (CandleClosedPayload,),
+            EventType.PAIR_ZONE_ACTIVE: (SystemStatusPayload,),
+            EventType.ZONE_TOUCHED: (SystemStatusPayload,),
+            EventType.ZONE_INVALIDATED: (SystemStatusPayload,),
+            EventType.ZONE_REPLACED: (SystemStatusPayload,),
+            EventType.CANONICAL_SIGNAL_CREATED: (SystemStatusPayload,),
+            EventType.DEMO_ORDER_ACCEPTED: (SystemStatusPayload,),
+            EventType.DEMO_ORDER_BLOCKED: (SystemStatusPayload,),
+            EventType.DEMO_POSITION_CLOSED: (SystemStatusPayload,),
         }
         allowed = payload_rules.get(self.event_type)
         if allowed and not isinstance(self.payload, allowed):

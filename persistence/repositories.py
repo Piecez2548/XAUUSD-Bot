@@ -690,10 +690,13 @@ class HistoryRepository:
 
     def __init__(self, database: Database) -> None:
         self._database = database
+        self._reconciled_demo_outcomes: list[dict[str, object]] = []
 
     def persist_deals(self, facts: tuple[DealFact, ...], *, scope: str) -> int:
         if not facts:
+            self._reconciled_demo_outcomes = []
             return 0
+        reconciled: list[dict[str, object]] = []
         with self._database.session() as session:
             inserted = 0
             for fact in facts:
@@ -722,7 +725,22 @@ class HistoryRepository:
                         raw_payload=fact.raw_payload,
                     )
                 )
-                self._reconcile_demo_execution(session, fact)
+                row = self._reconcile_demo_execution(session, fact)
+                if row is not None:
+                    reconciled.append(
+                        {
+                            "identity": f"{row.id}:{row.terminal_outcome_at}:{row.terminal_status}",
+                            "symbol": row.symbol,
+                            "direction": row.direction,
+                            "ticket": row.broker_position_ticket or row.broker_deal_ticket,
+                            "entry": row.submitted_entry or row.planned_entry,
+                            "exit": fact.price,
+                            "result": row.terminal_status,
+                            "pnl": fact.profit,
+                            "signal_id": row.forward_signal_id,
+                            "terminal_outcome_at": row.terminal_outcome_at,
+                        }
+                    )
                 inserted += 1
             latest = max(facts, key=lambda item: (item.timestamp, item.deal_ticket))
             cursor = session.scalar(
@@ -733,10 +751,11 @@ class HistoryRepository:
                 session.add(cursor)
             cursor.last_timestamp = latest.timestamp
             cursor.last_identifier = latest.deal_ticket
-            return inserted
+        self._reconciled_demo_outcomes = reconciled
+        return inserted
 
     @staticmethod
-    def _reconcile_demo_execution(session: Session, fact: DealFact) -> None:
+    def _reconcile_demo_execution(session: Session, fact: DealFact) -> DemoExecutionRecord | None:
         """Attach observed broker identities/outcomes without issuing broker calls."""
 
         predicates = [DemoExecutionRecord.broker_deal_ticket == fact.deal_ticket]
@@ -751,7 +770,7 @@ class HistoryRepository:
             )
         )
         if row is None:
-            return
+            return None
         if row.broker_deal_ticket is None:
             row.broker_deal_ticket = fact.deal_ticket
         if row.broker_order_ticket is None:
@@ -763,6 +782,13 @@ class HistoryRepository:
             row.terminal_outcome_at = fact.timestamp
             row.terminal_status = str(fact.reason or "CLOSED")[:32]
             row.status = "CLOSED"
+            return row
+        return None
+
+    def consume_reconciled_demo_outcomes(self) -> tuple[dict[str, object], ...]:
+        outcomes = tuple(self._reconciled_demo_outcomes)
+        self._reconciled_demo_outcomes = []
+        return outcomes
 
     def cursor(self, scope: str):
         with self._database.session() as session:

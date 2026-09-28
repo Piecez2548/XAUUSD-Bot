@@ -27,6 +27,7 @@ from persistence.orm import (
     DemoExecutionRecord,
     ForwardSignalRecord,
 )
+from services.pair_zone_notifications import PairZoneNotificationService
 from services.risk import calculate_risk_snapshot
 from services.shadow_risk_gate import ShadowRiskGate
 
@@ -88,11 +89,20 @@ class DemoExecutionGateError(ValueError):
 class DemoExecutionService:
     """Submit one canonical signal at most once to an MT5 Demo account."""
 
-    def __init__(self, settings: Settings, database: Any, gateway: Any, *, logger: logging.Logger):
+    def __init__(
+        self,
+        settings: Settings,
+        database: Any,
+        gateway: Any,
+        *,
+        logger: logging.Logger,
+        notification_service: PairZoneNotificationService | None = None,
+    ):
         self.settings = settings
         self.database = database
         self.gateway = gateway
         self.logger = logger
+        self.notification_service = notification_service
         self._lock = asyncio.Lock()
 
     async def execute(
@@ -122,15 +132,19 @@ class DemoExecutionService:
                     signal, decision, current_snapshot, current_risk, symbol_info, symbol
                 )
             except DemoExecutionGateError as exc:
-                return self._persist_rejection(signal, intelligence_record, symbol, exc.reason)
+                record = self._persist_rejection(signal, intelligence_record, symbol, exc.reason)
+                await self._notify_result(record)
+                return record
             except Exception as exc:
                 self.logger.exception("Demo execution preflight failed: %s", type(exc).__name__)
-                return self._persist_rejection(
+                record = self._persist_rejection(
                     signal,
                     intelligence_record,
                     symbol,
                     f"PREFLIGHT_ERROR:{type(exc).__name__}",
                 )
+                await self._notify_result(record)
+                return record
 
             pending = self._persist_pending(
                 signal,
@@ -143,11 +157,13 @@ class DemoExecutionService:
             if pending is None:
                 return self._existing(signal.id)
             if not demo_execution_armed(self.database):
-                return self._update(
+                record = self._update(
                     pending.id,
                     status="REJECTED",
                     rejection_reason="KILL_SWITCH_DISABLED_BEFORE_ORDER",
                 )
+                await self._notify_result(record)
+                return record
             try:
                 result = await self.gateway.call(lambda api: api.order_send(request))
             except Exception as exc:
@@ -158,7 +174,17 @@ class DemoExecutionService:
                     rejection_reason=f"ORDER_SEND_ERROR:{type(exc).__name__}",
                     submitted_at=datetime.now(UTC),
                 )
-            return self._record_broker_result(pending.id, result)
+            record = self._record_broker_result(pending.id, result)
+            await self._notify_result(record)
+            return record
+
+    async def _notify_result(self, record: DemoExecutionRecord) -> None:
+        if self.notification_service is None:
+            return
+        try:
+            await self.notification_service.demo_execution_result(record)
+        except Exception:
+            self.logger.exception("Demo execution notification failed")
 
     def _read_current_state(
         self, api: Any, symbol: str, snapshot: MarketSnapshot

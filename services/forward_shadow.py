@@ -37,6 +37,7 @@ from persistence.orm import (
     SystemHealthRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.pair_zone_notifications import PairZoneNotificationService
 from services.pair_zone_strategy import PairZoneV1
 from services.shadow_outcome import (
     AMBIGUOUS,
@@ -246,11 +247,13 @@ class ForwardShadowWorker:
         *,
         logger: logging.Logger,
         execution_handler: Callable[..., Awaitable[Any]] | None = None,
+        notification_service: PairZoneNotificationService | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
         self.logger = logger
         self.execution_handler = execution_handler
+        self.notification_service = notification_service
         self.health = SystemHealthRepository(database)
         self.strategy = PairZoneV1(settings)
         self.runtime_generation_id = str(uuid4())
@@ -452,19 +455,22 @@ class ForwardShadowWorker:
                 risk=item.risk, candles_are_closed=True,
             )
         except Exception:
-            self._persist_pair_zone_evaluation(
+            transition = self._persist_pair_zone_evaluation(
                 None, item.snapshot, reason_override="DETECTOR_EXCEPTION"
             )
+            await self._notify_pair_zone(transition, item.snapshot)
             raise
         timestamp = decision.m5_candle_timestamp
         if timestamp <= self.session.started_at:
-            self._persist_pair_zone_evaluation(
+            transition = self._persist_pair_zone_evaluation(
                 decision, item.snapshot, reason_override="FORWARD_BOUNDARY_NOT_REACHED"
             )
+            await self._notify_pair_zone(transition, item.snapshot)
             await self._evaluate_open_trades()
             self._record_health("CONNECTED", "Historical context warmed; forward boundary not reached", force=True)
             return
-        self._persist_pair_zone_evaluation(decision, item.snapshot)
+        transition = self._persist_pair_zone_evaluation(decision, item.snapshot)
+        await self._notify_pair_zone(transition, item.snapshot)
         # Phase 3 records a separate, versioned evidence snapshot. The
         # existing Pair Zone decision and Forward Shadow history remain the
         # canonical behavior; intelligence is additive and execution-disabled.
@@ -534,6 +540,15 @@ class ForwardShadowWorker:
                             "Strategy intelligence provenance unavailable; preserving Forward Shadow decision: %s",
                             type(exc).__name__,
                         )
+                if self.notification_service is not None:
+                    try:
+                        await self.notification_service.canonical_signal(
+                            session_id=self.session.id,
+                            signal=record,
+                            timestamp=record.timestamp,
+                        )
+                    except Exception:
+                        self.logger.exception("Canonical signal notification failed")
                 if self.execution_handler is not None and provenance_linked:
                     try:
                         await self.execution_handler(
@@ -677,11 +692,11 @@ class ForwardShadowWorker:
         snapshot: MarketSnapshot,
         *,
         reason_override: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Replace the session's single current observation, not per-tick history."""
 
         if self.session is None:
-            return
+            return None
         context = getattr(decision, "feature_context", None)
         observation = context.get("pair_zone_observation") if isinstance(context, dict) else None
         state = "UNKNOWN"
@@ -753,10 +768,13 @@ class ForwardShadowWorker:
             "zone_lower": lower,
             "zone_upper": upper,
         }
+        previous_zone_id: str | None = None
         with self.database.session() as session:
             if session.get(ForwardValidationSessionRecord, self.session.id) is None:
-                return
+                return None
             row = session.get(PairZoneEvaluationRecord, self.session.id)
+            if row is not None:
+                previous_zone_id = row.zone_id
             if row is None:
                 session.add(PairZoneEvaluationRecord(
                     forward_session_id=self.session.id, **values
@@ -764,6 +782,37 @@ class ForwardShadowWorker:
             else:
                 for name, value in values.items():
                     setattr(row, name, value)
+        return {
+            "previous_zone_id": previous_zone_id,
+            "observation": observation,
+            "invalidations": self.strategy.invalidation_observations(),
+            "timestamp": evaluated_m5,
+        }
+
+    async def _notify_pair_zone(
+        self, transition: dict[str, Any] | None, snapshot: MarketSnapshot
+    ) -> None:
+        if self.notification_service is None or transition is None or self.session is None:
+            return
+        try:
+            from services.demo_execution import demo_execution_armed
+
+            await self.notification_service.observe_pair_zone(
+                session_id=self.session.id,
+                symbol=snapshot.symbol.name,
+                previous_zone_id=transition.get("previous_zone_id"),
+                observation=transition.get("observation"),
+                invalidations=tuple(
+                    item
+                    for item in transition.get("invalidations", ())
+                    if item.get("zone_id") == transition.get("previous_zone_id")
+                ),
+                timestamp=transition.get("timestamp"),
+                demo_execution_enabled=bool(self.settings.demo_execution_enabled),
+                demo_kill_switch_armed=demo_execution_armed(self.database),
+            )
+        except Exception:
+            self.logger.exception("Pair Zone transition notification failed")
 
     async def _evaluate_open_trades(self) -> None:
         if self.session is None:

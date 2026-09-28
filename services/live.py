@@ -50,6 +50,7 @@ from services.live_history_diagnostic import (
     LiveHistoryDiagnosticServer,
     execute_history_diagnostic,
 )
+from services.pair_zone_notifications import PairZoneNotificationService
 from services.risk import (
     calculate_risk_snapshot,
     normalize_risk_state,
@@ -98,16 +99,22 @@ class LiveDataEngine:
         self.snapshots = SnapshotRepository(database)
         self.history = HistoryRepository(database)
         self.health = SystemHealthRepository(database)
+        self.notifications = PairZoneNotificationService(database, event_bus, logger=logger)
         self.shadow = ShadowDecisionWorker(settings, database, event_bus, logger=logger)
         self.shadow_outcome = ShadowOutcomeWorker(settings, database, logger=logger)
         self.demo_execution = DemoExecutionService(
-            settings, database, self.gateway, logger=logger
+            settings,
+            database,
+            self.gateway,
+            logger=logger,
+            notification_service=self.notifications,
         )
         self.forward_shadow = ForwardShadowWorker(
             settings,
             database,
             logger=logger,
             execution_handler=self.demo_execution.execute,
+            notification_service=self.notifications,
         )
         self.state = _LiveState()
         self.runtime_state = RuntimeState.STARTING
@@ -669,6 +676,9 @@ class LiveDataEngine:
             )
             persistence_started = perf_counter()
             inserted = self.history.persist_deals(facts, scope=scope)
+            consume_outcomes = getattr(self.history, "consume_reconciled_demo_outcomes", None)
+            for outcome in consume_outcomes() if callable(consume_outcomes) else ():
+                await self.notifications.demo_position_closed(outcome)
             self._tick_diag(
                 "record_timing",
                 "history_persistence",

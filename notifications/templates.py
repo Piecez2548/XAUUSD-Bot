@@ -62,6 +62,14 @@ EVENT_TITLES: dict[EventType, str] = {
     EventType.RISK_BACK_WITHIN_BOUNDS: "✅ RISK BOUNDED",
     EventType.HISTORY_SYNC_FAILED: "⚠️ HISTORY SYNC FAILED",
     EventType.HISTORY_SYNC_RECOVERED: "✅ HISTORY SYNC RECOVERED",
+    EventType.PAIR_ZONE_ACTIVE: "🟡 PAIR ZONE ACTIVE",
+    EventType.ZONE_TOUCHED: "👀 ZONE TOUCHED",
+    EventType.ZONE_INVALIDATED: "❌ PAIR ZONE INVALIDATED",
+    EventType.ZONE_REPLACED: "🔄 PAIR ZONE REPLACED",
+    EventType.CANONICAL_SIGNAL_CREATED: "🟢 CANONICAL SIGNAL",
+    EventType.DEMO_ORDER_ACCEPTED: "📤 DEMO ORDER ACCEPTED",
+    EventType.DEMO_ORDER_BLOCKED: "🛡️ DEMO ORDER BLOCKED",
+    EventType.DEMO_POSITION_CLOSED: "✅ DEMO POSITION CLOSED",
 }
 
 
@@ -71,8 +79,15 @@ def _value(label: str, value: object | None) -> str | None:
 
 def format_telegram_event(event: DomainEvent) -> str:
     title = EVENT_TITLES.get(event.event_type, event.event_type.value)
-    lines: list[str | None] = [title, ""]
     payload = event.payload
+    if (
+        event.event_type is EventType.DEMO_POSITION_CLOSED
+        and isinstance(payload, SystemStatusPayload)
+        and str((payload.diagnostics or {}).get("result", "")).upper()
+        in {"SL", "LOSS", "STOP_LOSS"}
+    ):
+        title = "🔴 DEMO POSITION CLOSED"
+    lines: list[str | None] = [title, ""]
     if isinstance(payload, TradeLifecyclePayload):
         lines.extend(
             [
@@ -158,13 +173,57 @@ def format_telegram_event(event: DomainEvent) -> str:
             ]
         )
     elif isinstance(payload, SystemStatusPayload):
-        lines.extend(
-            [
-                _value("Component", payload.component),
-                _value("Status", payload.status),
-                payload.message,
-            ]
-        )
+        if event.event_type in {
+            EventType.PAIR_ZONE_ACTIVE,
+            EventType.ZONE_TOUCHED,
+            EventType.ZONE_INVALIDATED,
+            EventType.ZONE_REPLACED,
+            EventType.CANONICAL_SIGNAL_CREATED,
+            EventType.DEMO_ORDER_ACCEPTED,
+            EventType.DEMO_ORDER_BLOCKED,
+            EventType.DEMO_POSITION_CLOSED,
+        }:
+            diagnostics = payload.diagnostics or {}
+            labels = {
+                "symbol": "Symbol",
+                "direction": "Direction",
+                "zone_lower": "Zone low",
+                "zone_upper": "Zone high",
+                "zone_id": "Zone ID",
+                "previous_zone_id": "Previous zone ID",
+                "current_zone_id": "Current zone ID",
+                "signal_id": "Signal ID",
+                "forward_signal_id": "Forward signal ID",
+                "status": "Status",
+                "execution": "Execution",
+                "entry": "Entry",
+                "stop_loss": "SL",
+                "take_profit": "TP",
+                "lot": "Lot",
+                "risk_percent": "Risk",
+                "ticket": "MT5 Ticket",
+                "reason": "Reason",
+                "real_money": "REAL MONEY",
+                "m5_candle_timestamp": "M5 candle",
+                "m5_close": "M5 close",
+                "time": "Time",
+            }
+            lines.append(payload.message)
+            if event.event_type is EventType.DEMO_ORDER_BLOCKED:
+                lines.append("No order was submitted.")
+            lines.extend(
+                _value(labels[key], value)
+                for key, value in diagnostics.items()
+                if key in labels and value is not None
+            )
+        else:
+            lines.extend(
+                [
+                    _value("Component", payload.component),
+                    _value("Status", payload.status),
+                    payload.message,
+                ]
+            )
 
     lines.extend(
         [

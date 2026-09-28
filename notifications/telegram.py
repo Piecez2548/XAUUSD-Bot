@@ -65,6 +65,14 @@ class TelegramNotifier:
             EventType.HISTORY_SYNC_FAILED,
             EventType.HISTORY_SYNC_RECOVERED,
             EventType.DATA_STALE,
+            EventType.PAIR_ZONE_ACTIVE,
+            EventType.ZONE_TOUCHED,
+            EventType.ZONE_INVALIDATED,
+            EventType.ZONE_REPLACED,
+            EventType.CANONICAL_SIGNAL_CREATED,
+            EventType.DEMO_ORDER_ACCEPTED,
+            EventType.DEMO_ORDER_BLOCKED,
+            EventType.DEMO_POSITION_CLOSED,
         }
     )
 
