@@ -37,6 +37,7 @@ from persistence.orm import (
     SystemHealthRecord,
 )
 from persistence.repositories import SystemHealthRepository
+from services.momentum_breakout import MOMENTUM_SETUP_TYPE, MomentumBreakoutV1
 from services.pair_zone_notifications import PairZoneNotificationService
 from services.pair_zone_strategy import PairZoneV1
 from services.shadow_outcome import (
@@ -256,6 +257,7 @@ class ForwardShadowWorker:
         self.notification_service = notification_service
         self.health = SystemHealthRepository(database)
         self.strategy = PairZoneV1(settings)
+        self.momentum = MomentumBreakoutV1(settings)
         self.runtime_generation_id = str(uuid4())
         self.policy = EvaluationPolicy(horizon_bars=getattr(settings, "shadow_outcome_horizon_bars", 12))
         self._task: asyncio.Task[None] | None = None
@@ -516,6 +518,21 @@ class ForwardShadowWorker:
                 "Strategy intelligence unavailable; preserving Forward Shadow decision: %s",
                 type(exc).__name__,
             )
+        if item.risk is not None:
+            try:
+                momentum_decision = self.momentum.evaluate(
+                    item.snapshot,
+                    market_snapshot_id=item.market_snapshot_id,
+                    risk=item.risk,
+                    candles_are_closed=True,
+                )
+                if momentum_decision.decision.value in {"BUY", "SELL"}:
+                    await self._process_momentum_signal(momentum_decision, item)
+            except Exception as exc:
+                # The second setup must never interrupt Pair Zone evaluation.
+                self.logger.exception(
+                    "Momentum Breakout evaluation unavailable: %s", type(exc).__name__
+                )
         self._last_success_at = now
         record = None
         if decision.decision.value in {"BUY", "SELL"}:
@@ -592,10 +609,61 @@ class ForwardShadowWorker:
                     "Offline advisory inference unavailable (%s)", type(exc).__name__
                 )
 
-    def _persist_signal(self, decision: Any, snapshot: MarketSnapshot) -> ForwardSignalRecord | None:
+    async def _process_momentum_signal(self, decision: Any, item: ForwardInput) -> None:
+        """Persist and route one independent Momentum signal.
+
+        Momentum does not depend on Strategy Intelligence.  Its deterministic
+        candle evidence is the execution provenance and is validated again by
+        DemoExecutionService before any broker call.
+        """
+
+        signal = self._persist_signal(decision, item.snapshot, setup_type=MOMENTUM_SETUP_TYPE)
+        if signal is None:
+            return
+        if self.notification_service is not None:
+            try:
+                await self.notification_service.momentum_setup(
+                    session_id=self.session.id,
+                    signal=signal,
+                    decision=decision,
+                    timestamp=decision.m5_candle_timestamp,
+                )
+                await self.notification_service.momentum_signal(
+                    session_id=self.session.id,
+                    signal=signal,
+                    decision=decision,
+                    timestamp=decision.m5_candle_timestamp,
+                )
+            except Exception:
+                self.logger.exception("Momentum notification failed")
+        if self.execution_handler is not None:
+            try:
+                await self.execution_handler(
+                    signal=signal,
+                    decision=decision,
+                    snapshot=item.snapshot,
+                    risk=item.risk,
+                    intelligence_record=None,
+                )
+            except Exception as exc:
+                self.logger.exception(
+                    "Momentum Demo execution handler failed: %s", type(exc).__name__
+                )
+
+    def _persist_signal(
+        self,
+        decision: Any,
+        snapshot: MarketSnapshot,
+        *,
+        setup_type: str = "PAIR_ZONE_REJECTION",
+    ) -> ForwardSignalRecord | None:
         assert self.session is not None
         context = decision.feature_context or {}
-        zone_id = str(context.get("zone_id", "unknown"))
+        is_momentum = setup_type == MOMENTUM_SETUP_TYPE
+        zone_id = None if is_momentum else str(context.get("zone_id", "unknown"))
+        setup_event_id = str(
+            context.get("setup_event_id") or context.get("zone_id") or "unknown"
+        )
         entry = float(decision.entry_price)
         stop = float(decision.stop_loss)
         target = float(decision.take_profit)
@@ -610,7 +678,8 @@ class ForwardShadowWorker:
         first = _parse_iso(context.get("pair_first_timestamp"))
         second = _parse_iso(context.get("pair_second_timestamp"))
         zone_created = _parse_iso(context.get("zone_created_at"))
-        signal_id = f"forward-signal-{self.session.session_id}-{decision.m5_candle_timestamp.isoformat()}"
+        signal_prefix = "momentum-signal" if is_momentum else "forward-signal"
+        signal_id = f"{signal_prefix}-{self.session.session_id}-{decision.m5_candle_timestamp.isoformat()}"
         configured_hash = getattr(self.session, "strategy_config_hash", None) or EXPECTED_PAIR_ZONE_FILE_SHA256
         pair_evidence_id = (
             pair_zone_event_identity(
@@ -625,11 +694,14 @@ class ForwardShadowWorker:
                 zone_created_at=zone_created,
                 strategy_hash=configured_hash,
             )
-            if zone_id != "unknown"
+            if not is_momentum and zone_id != "unknown"
             else None
         )
         signal_decision_at = decision.m5_candle_timestamp
         decision_available_at = signal_decision_at + timedelta(minutes=5)
+        intended_rr = float(
+            decision.risk_reward_ratio if is_momentum else self.session.rr
+        )
         expected = {
             "signal_id": signal_id,
             "session_id": self.session.id,
@@ -637,14 +709,21 @@ class ForwardShadowWorker:
             "symbol": snapshot.symbol.name,
             "decision": decision.decision.value,
             "zone_id": zone_id,
+            "setup_type": setup_type,
+            "setup_event_id": setup_event_id,
+            "setup_provenance_json": context,
             "entry_price": entry,
             "stop_loss": stop,
             "risk_distance": _risk_distance(decision.decision.value, entry, stop),
-            "rr": float(self.session.rr),
+            "rr": intended_rr,
             "take_profit": target,
             "pair_first_timestamp": first,
             "pair_second_timestamp": second,
-            "h1_context_json": {"direction": decision.market_regime.value, "feature_context": context},
+            "h1_context_json": {
+                "direction": decision.market_regime.value,
+                "feature_context": context,
+                "setup_type": setup_type,
+            },
             "confirmation_candle_json": _candle_json(m5),
             "market_observation_json": observation,
             "strategy_hash": configured_hash,
@@ -681,9 +760,18 @@ class ForwardShadowWorker:
         except IntegrityError:
             with self.database.session() as session:
                 existing = session.scalar(select(ForwardSignalRecord).where(ForwardSignalRecord.signal_id == signal_id))
+                if existing is None and setup_event_id != "unknown":
+                    existing = session.scalar(
+                        select(ForwardSignalRecord).where(
+                            ForwardSignalRecord.setup_event_id == setup_event_id
+                        )
+                    )
                 if existing is None:
                     raise
-                _assert_signal_immutable_match(existing, expected)
+                if existing.signal_id != signal_id:
+                    _assert_setup_event_immutable_match(existing, expected)
+                else:
+                    _assert_signal_immutable_match(existing, expected)
                 return existing
 
     def _persist_pair_zone_evaluation(
@@ -914,6 +1002,26 @@ def _assert_signal_immutable_match(
         if getattr(existing, field_name) != incoming:
             raise ForwardSignalConflictError(
                 f"forward signal immutable field conflict: {field_name}"
+            )
+
+
+def _assert_setup_event_immutable_match(
+    existing: ForwardSignalRecord, expected: dict[str, Any]
+) -> None:
+    for field_name in (
+        "setup_type",
+        "setup_event_id",
+        "setup_provenance_json",
+        "symbol",
+        "decision",
+        "entry_price",
+        "stop_loss",
+        "take_profit",
+        "rr",
+    ):
+        if getattr(existing, field_name) != expected[field_name]:
+            raise ForwardSignalConflictError(
+                f"forward setup event immutable field conflict: {field_name}"
             )
 
 

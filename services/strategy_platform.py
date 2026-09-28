@@ -225,11 +225,13 @@ def _ema(values: list[float], period: int) -> float:
 
 class StrategyRegistry:
     def __init__(self, settings) -> None:
+        from services.momentum_breakout import MomentumBreakoutV1
         from services.pair_zone_strategy import PairZoneV1
 
         self._strategies: dict[str, Strategy] = {
             "baseline_v1": BaselineV1Adapter(settings),
             "pair_zone_v1": PairZoneV1(settings),
+            "momentum_breakout_v1": MomentumBreakoutV1(settings),
             "trend_pullback_v1": TrendPullbackV1(settings),
         }
 

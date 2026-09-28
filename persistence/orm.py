@@ -989,11 +989,14 @@ class ForwardSignalRecord(IdMixin, Base):
 
     __tablename__ = "forward_validation_signals"
     __table_args__ = (
-        UniqueConstraint("session_id", "timestamp", name="uq_forward_signal_candle"),
+        UniqueConstraint(
+            "session_id", "timestamp", "setup_type", name="uq_forward_signal_setup_candle"
+        ),
         UniqueConstraint(
             "pair_zone_decision_evidence_id",
             name="uq_forward_signal_pair_zone_decision_evidence",
         ),
+        UniqueConstraint("setup_event_id", name="uq_forward_signal_setup_event"),
         Index("ix_forward_signals_session_time", "session_id", "timestamp"),
     )
 
@@ -1004,7 +1007,16 @@ class ForwardSignalRecord(IdMixin, Base):
     timestamp: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False)
     symbol: Mapped[str | None] = mapped_column(String(64), index=True)
     decision: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
-    zone_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Legacy Pair Zone identity.  Momentum signals intentionally leave this
+    # null and use the explicit setup fields below.
+    zone_id: Mapped[str | None] = mapped_column(String(100))
+    setup_type: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="PAIR_ZONE_REJECTION", index=True
+    )
+    setup_event_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    setup_provenance_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     stop_loss: Mapped[float] = mapped_column(Float, nullable=False)
     risk_distance: Mapped[float] = mapped_column(Float, nullable=False)
@@ -1106,7 +1118,12 @@ class DemoExecutionRecord(IdMixin, TimestampMixin, Base):
         ForeignKey("forward_validation_sessions.id"), nullable=False
     )
     intelligence_candidate_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    pair_zone_event_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # Retained for Pair Zone audit compatibility; Momentum uses setup_event_id.
+    pair_zone_event_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    setup_type: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="PAIR_ZONE_REJECTION", index=True
+    )
+    setup_event_id: Mapped[str | None] = mapped_column(String(128), index=True)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     direction: Mapped[str] = mapped_column(String(8), nullable=False)
     execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="DEMO")

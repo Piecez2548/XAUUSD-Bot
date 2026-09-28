@@ -178,6 +178,53 @@ class PairZoneNotificationService:
             timestamp=timestamp or signal.timestamp,
         )
 
+    async def momentum_setup(
+        self, *, session_id: str, signal: Any, decision: Any, timestamp: datetime
+    ) -> None:
+        context = getattr(decision, "feature_context", {}) or {}
+        await self._publish(
+            EventType.MOMENTUM_SETUP,
+            f"{session_id}:{signal.setup_event_id}",
+            message="Deterministic closed-candle Momentum Breakout setup confirmed",
+            diagnostics={
+                "symbol": signal.symbol,
+                "direction": signal.decision,
+                "setup_type": signal.setup_type,
+                "setup_event_id": signal.setup_event_id,
+                "breakout_level": context.get("breakout_level"),
+                "m5_candle_timestamp": timestamp,
+            },
+            timestamp=timestamp,
+        )
+
+    async def momentum_signal(
+        self, *, session_id: str, signal: Any, decision: Any, timestamp: datetime
+    ) -> None:
+        context = getattr(decision, "feature_context", {}) or {}
+        await self._publish(
+            EventType.MOMENTUM_SIGNAL,
+            f"{session_id}:{signal.id}",
+            message=(
+                "Canonical Momentum Breakout signal is being sent to existing "
+                "risk and Demo gates"
+            ),
+            diagnostics={
+                "symbol": signal.symbol,
+                "direction": signal.decision,
+                "setup_type": signal.setup_type,
+                "setup_event_id": signal.setup_event_id,
+                "signal_id": signal.signal_id,
+                "forward_signal_id": signal.id,
+                "entry": signal.entry_price,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "planned_rr": signal.rr,
+                "breakout_level": context.get("breakout_level"),
+                "m5_candle_timestamp": timestamp,
+            },
+            timestamp=timestamp,
+        )
+
     async def demo_execution_result(self, record: Any) -> None:
         if record.status not in {"ACKNOWLEDGED", "REJECTED"}:
             return

@@ -112,6 +112,7 @@ class DemoExecutionService:
         decision: Any,
         snapshot: MarketSnapshot,
         intelligence_record: Any,
+        risk: Any | None = None,
     ) -> DemoExecutionRecord | None:
         """Evaluate and, only when every gate passes, submit one Demo order."""
 
@@ -231,7 +232,8 @@ class DemoExecutionService:
         symbol: str,
     ) -> tuple[dict[str, Any], float]:
         direction = str(signal.decision).upper()
-        if direction not in {"BUY", "SELL"} or signal.zone_id in {"", "unknown", "None"}:
+        setup_identity = getattr(signal, "setup_event_id", None) or signal.zone_id
+        if direction not in {"BUY", "SELL"} or setup_identity in {None, "", "unknown", "None"}:
             raise DemoExecutionGateError("CANONICAL_SIGNAL_INVALID")
         if getattr(decision, "decision", None) is None or str(decision.decision.value) != direction:
             raise DemoExecutionGateError("CANONICAL_DECISION_MISMATCH")
@@ -303,6 +305,28 @@ class DemoExecutionService:
 
     @staticmethod
     def _validate_provenance(signal: ForwardSignalRecord, intelligence_record: Any) -> None:
+        setup_type = getattr(signal, "setup_type", None) or "PAIR_ZONE_REJECTION"
+        if setup_type == "MOMENTUM_BREAKOUT_V1":
+            provenance = getattr(signal, "setup_provenance_json", None)
+            if not getattr(signal, "setup_event_id", None) or not isinstance(provenance, dict):
+                raise DemoExecutionGateError("MOMENTUM_PROVENANCE_MISSING")
+            required = {
+                "setup_type",
+                "setup_event_id",
+                "m15_context",
+                "m5_trigger_candle",
+                "breakout_level",
+                "structural_sl_source",
+            }
+            if (
+                not required.issubset(provenance)
+                or provenance.get("setup_type") != setup_type
+                or provenance.get("setup_event_id") != signal.setup_event_id
+            ):
+                raise DemoExecutionGateError("MOMENTUM_PROVENANCE_INCOMPLETE")
+            return
+        if setup_type != "PAIR_ZONE_REJECTION":
+            raise DemoExecutionGateError("UNKNOWN_SETUP_TYPE")
         if intelligence_record is None:
             raise DemoExecutionGateError("INTELLIGENCE_PROVENANCE_MISSING")
         if not getattr(intelligence_record, "candidate_id", None):
@@ -332,7 +356,11 @@ class DemoExecutionService:
         existing = self._existing(signal.id)
         if existing is not None:
             return existing
-        candidate_id = str(getattr(intelligence_record, "candidate_id", "unavailable"))
+        candidate_id = str(
+            getattr(intelligence_record, "candidate_id", None)
+            or getattr(signal, "setup_event_id", None)
+            or "unavailable"
+        )
         session_id = str(getattr(intelligence_record, "forward_session_id", signal.session_id))
         return self._insert_record(
             signal=signal,
@@ -361,7 +389,11 @@ class DemoExecutionService:
                 signal=signal,
                 symbol=symbol,
                 session_id=signal.session_id,
-                candidate_id=str(intelligence_record.candidate_id),
+                candidate_id=str(
+                    getattr(intelligence_record, "candidate_id", None)
+                    or getattr(signal, "setup_event_id", None)
+                    or "unavailable"
+                ),
                 status="PENDING",
                 rejection_reason=None,
                 gate_reasons=("ALL_PRE_ORDER_GATES_PASSED",),
@@ -387,11 +419,16 @@ class DemoExecutionService:
         risk_percent: float | None,
     ) -> DemoExecutionRecord:
         with self.database.session() as session:
+            setup_type = getattr(signal, "setup_type", None) or "PAIR_ZONE_REJECTION"
             row = DemoExecutionRecord(
                 forward_signal_id=signal.id,
                 forward_session_id=session_id,
                 intelligence_candidate_id=candidate_id,
-                pair_zone_event_id=signal.zone_id,
+                pair_zone_event_id=(
+                    signal.zone_id if setup_type == "PAIR_ZONE_REJECTION" else None
+                ),
+                setup_type=setup_type,
+                setup_event_id=getattr(signal, "setup_event_id", None),
                 symbol=symbol,
                 direction=signal.decision,
                 execution_mode=DEMO_EXECUTION_MODE,

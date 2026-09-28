@@ -64,6 +64,8 @@ class EventType(StrEnum):
     DEMO_ORDER_ACCEPTED = "DEMO_ORDER_ACCEPTED"
     DEMO_ORDER_BLOCKED = "DEMO_ORDER_BLOCKED"
     DEMO_POSITION_CLOSED = "DEMO_POSITION_CLOSED"
+    MOMENTUM_SETUP = "MOMENTUM_SETUP"
+    MOMENTUM_SIGNAL = "MOMENTUM_SIGNAL"
 
 
 class EventSeverity(StrEnum):
@@ -222,6 +224,8 @@ class DomainEvent(BaseModel):
             EventType.DEMO_ORDER_ACCEPTED: (SystemStatusPayload,),
             EventType.DEMO_ORDER_BLOCKED: (SystemStatusPayload,),
             EventType.DEMO_POSITION_CLOSED: (SystemStatusPayload,),
+            EventType.MOMENTUM_SETUP: (SystemStatusPayload,),
+            EventType.MOMENTUM_SIGNAL: (SystemStatusPayload,),
         }
         allowed = payload_rules.get(self.event_type)
         if allowed and not isinstance(self.payload, allowed):

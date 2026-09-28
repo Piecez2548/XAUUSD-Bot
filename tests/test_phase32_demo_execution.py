@@ -307,6 +307,70 @@ async def test_successful_demo_submission_is_persisted_once(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_momentum_signal_uses_existing_demo_service_without_pair_zone_provenance(
+    tmp_path,
+) -> None:
+    database = _database(tmp_path)
+    api = FakeApi()
+    now = datetime.now(UTC)
+    with database.session() as session:
+        forward_session = ForwardValidationSessionRecord(
+            session_id="forward-momentum-test",
+            strategy_id="momentum_breakout_v1",
+            strategy_version="1.0.0",
+            strategy_config_hash="a" * 64,
+            started_at=now - timedelta(minutes=10),
+            source_identity="fixture",
+            symbol="XAUUSDm",
+            timeframes_json=["M5", "M15"],
+            rr=2.0,
+            cost_policy_json={},
+            status="ACTIVE",
+            execution_allowed=False,
+        )
+        session.add(forward_session)
+        session.flush()
+        signal = ForwardSignalRecord(
+            signal_id="momentum-signal-test",
+            session_id=forward_session.id,
+            timestamp=now - timedelta(minutes=1),
+            symbol="XAUUSDm",
+            decision="BUY",
+            zone_id=None,
+            setup_type="MOMENTUM_BREAKOUT_V1",
+            setup_event_id="momentum-event-test",
+            setup_provenance_json={
+                "setup_type": "MOMENTUM_BREAKOUT_V1",
+                "setup_event_id": "momentum-event-test",
+                "m15_context": {"close": 2000.0},
+                "m5_trigger_candle": {"close": 2000.0},
+                "breakout_level": 1999.0,
+                "structural_sl_source": {"low": 1990.0},
+            },
+            entry_price=2000.2,
+            stop_loss=1990.0,
+            risk_distance=10.2,
+            rr=2.0,
+            take_profit=2020.6,
+            strategy_hash="b" * 64,
+            execution_allowed=False,
+        )
+        session.add(signal)
+    result = await _service(database, api).execute(
+        signal=signal,
+        decision=_decision(),
+        snapshot=_snapshot(api),
+        intelligence_record=None,
+    )
+    assert result is not None and result.status == "ACKNOWLEDGED"
+    assert result.setup_type == "MOMENTUM_BREAKOUT_V1"
+    assert result.setup_event_id == "momentum-event-test"
+    assert result.pair_zone_event_id is None
+    assert api.order_calls == 1
+    database.dispose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("case", "mutate"),
     [

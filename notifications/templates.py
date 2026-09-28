@@ -70,6 +70,8 @@ EVENT_TITLES: dict[EventType, str] = {
     EventType.DEMO_ORDER_ACCEPTED: "📤 DEMO ORDER ACCEPTED",
     EventType.DEMO_ORDER_BLOCKED: "🛡️ DEMO ORDER BLOCKED",
     EventType.DEMO_POSITION_CLOSED: "✅ DEMO POSITION CLOSED",
+    EventType.MOMENTUM_SETUP: "⚡ MOMENTUM SETUP",
+    EventType.MOMENTUM_SIGNAL: "🚀 MOMENTUM SIGNAL",
 }
 
 
@@ -182,6 +184,8 @@ def format_telegram_event(event: DomainEvent) -> str:
             EventType.DEMO_ORDER_ACCEPTED,
             EventType.DEMO_ORDER_BLOCKED,
             EventType.DEMO_POSITION_CLOSED,
+            EventType.MOMENTUM_SETUP,
+            EventType.MOMENTUM_SIGNAL,
         }:
             diagnostics = payload.diagnostics or {}
             labels = {
@@ -194,6 +198,10 @@ def format_telegram_event(event: DomainEvent) -> str:
                 "current_zone_id": "Current zone ID",
                 "signal_id": "Signal ID",
                 "forward_signal_id": "Forward signal ID",
+                "setup_type": "Setup",
+                "setup_event_id": "Setup event ID",
+                "breakout_level": "Breakout level",
+                "planned_rr": "Planned R:R",
                 "status": "Status",
                 "execution": "Execution",
                 "entry": "Entry",
