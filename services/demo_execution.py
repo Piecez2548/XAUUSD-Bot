@@ -15,7 +15,7 @@ from hashlib import sha256
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from config.settings import Settings
 from models.market import MarketSnapshot, Timeframe
@@ -84,6 +84,10 @@ class DemoExecutionGateError(ValueError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class DemoExecutionPersistenceError(RuntimeError):
+    """A durable execution audit decision could not be persisted."""
 
 
 class DemoExecutionService:
@@ -362,18 +366,30 @@ class DemoExecutionService:
             or "unavailable"
         )
         session_id = str(getattr(intelligence_record, "forward_session_id", signal.session_id))
-        return self._insert_record(
-            signal=signal,
-            symbol=symbol,
-            session_id=session_id,
-            candidate_id=candidate_id,
-            status="REJECTED",
-            rejection_reason=reason,
-            gate_reasons=(reason,),
-            request={},
-            volume=None,
-            risk_percent=None,
-        )
+        try:
+            return self._insert_record(
+                signal=signal,
+                symbol=symbol,
+                session_id=session_id,
+                candidate_id=candidate_id,
+                status="REJECTED",
+                rejection_reason=reason,
+                gate_reasons=(reason,),
+                request={},
+                volume=None,
+                risk_percent=None,
+            )
+        except IntegrityError as exc:
+            existing = self._existing(signal.id)
+            if existing is not None:
+                return existing
+            raise DemoExecutionPersistenceError(
+                "DEMO_EXECUTION_AUDIT_PERSISTENCE_FAILED"
+            ) from exc
+        except SQLAlchemyError as exc:
+            raise DemoExecutionPersistenceError(
+                "DEMO_EXECUTION_AUDIT_PERSISTENCE_FAILED"
+            ) from exc
 
     def _persist_pending(
         self,
@@ -401,8 +417,20 @@ class DemoExecutionService:
                 volume=float(request["volume"]),
                 risk_percent=risk_percent,
             )
-        except IntegrityError:
-            return self._existing(signal.id)
+        except IntegrityError as exc:
+            existing = self._existing(signal.id)
+            if existing is not None:
+                # Returning None makes execute() return the existing record
+                # before the broker submission branch, preserving idempotency
+                # under a concurrent unique-key race.
+                return None
+            raise DemoExecutionPersistenceError(
+                "DEMO_EXECUTION_AUDIT_PERSISTENCE_FAILED"
+            ) from exc
+        except SQLAlchemyError as exc:
+            raise DemoExecutionPersistenceError(
+                "DEMO_EXECUTION_AUDIT_PERSISTENCE_FAILED"
+            ) from exc
 
     def _insert_record(
         self,

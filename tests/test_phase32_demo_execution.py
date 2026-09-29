@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from config.settings import Settings
 from models.history import DealFact
@@ -20,6 +21,7 @@ from persistence.orm import (
 )
 from persistence.repositories import HistoryRepository
 from services.demo_execution import (
+    DemoExecutionPersistenceError,
     DemoExecutionService,
     set_demo_execution_enabled,
 )
@@ -367,6 +369,95 @@ async def test_momentum_signal_uses_existing_demo_service_without_pair_zone_prov
     assert result.setup_event_id == "momentum-event-test"
     assert result.pair_zone_event_id is None
     assert api.order_calls == 1
+    database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_momentum_rejection_is_persisted_without_pair_zone_provenance(tmp_path) -> None:
+    database = _database(tmp_path)
+    api = FakeApi(trade_mode=2)
+    now = datetime.now(UTC)
+    with database.session() as session:
+        forward_session = ForwardValidationSessionRecord(
+            session_id="forward-momentum-rejection-test",
+            strategy_id="momentum_breakout_v1",
+            strategy_version="1.0.0",
+            strategy_config_hash="a" * 64,
+            started_at=now - timedelta(minutes=10),
+            source_identity="fixture",
+            symbol="XAUUSDm",
+            timeframes_json=["M5", "M15"],
+            rr=2.0,
+            cost_policy_json={},
+            status="ACTIVE",
+            execution_allowed=False,
+        )
+        session.add(forward_session)
+        session.flush()
+        signal = ForwardSignalRecord(
+            signal_id="momentum-rejection-signal-test",
+            session_id=forward_session.id,
+            timestamp=now - timedelta(minutes=1),
+            symbol="XAUUSDm",
+            decision="BUY",
+            zone_id=None,
+            setup_type="MOMENTUM_BREAKOUT_V1",
+            setup_event_id="momentum-rejection-event-test",
+            setup_provenance_json={
+                "setup_type": "MOMENTUM_BREAKOUT_V1",
+                "setup_event_id": "momentum-rejection-event-test",
+                "m15_context": {"close": 2000.0},
+                "m5_trigger_candle": {"close": 2000.0},
+                "breakout_level": 1999.0,
+                "structural_sl_source": {"low": 1990.0},
+            },
+            entry_price=2000.2,
+            stop_loss=1990.0,
+            risk_distance=10.2,
+            rr=2.0,
+            take_profit=2020.6,
+            strategy_hash="b" * 64,
+            execution_allowed=False,
+        )
+        session.add(signal)
+
+    result = await _service(database, api).execute(
+        signal=signal,
+        decision=_decision(),
+        snapshot=_snapshot(api),
+        intelligence_record=None,
+    )
+    assert result is not None and result.status == "REJECTED"
+    assert result.rejection_reason == "ACCOUNT_IS_NOT_DEMO"
+    assert result.pair_zone_event_id is None
+    assert result.setup_event_id == "momentum-rejection-event-test"
+    assert api.order_calls == 0
+    database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_audit_persistence_failure_is_not_treated_as_execution_result(
+    tmp_path, monkeypatch
+) -> None:
+    database = _database(tmp_path)
+    api = FakeApi()
+    signal, intelligence = _graph(database)
+    service = _service(database, api)
+
+    def fail_persistence(*_args, **_kwargs):
+        raise SQLAlchemyError("database unavailable")
+
+    monkeypatch.setattr(service, "_insert_record", fail_persistence)
+    with pytest.raises(DemoExecutionPersistenceError):
+        await service.execute(
+            signal=signal,
+            decision=_decision(),
+            snapshot=_snapshot(api),
+            intelligence_record=intelligence,
+        )
+    assert api.order_calls == 0
+    with database.session() as session:
+        assert session.query(DemoExecutionRecord).count() == 0
     database.dispose()
 
 
