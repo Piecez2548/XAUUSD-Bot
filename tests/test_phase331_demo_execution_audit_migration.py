@@ -2,21 +2,22 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from alembic import command
 from persistence.database import Database
 from persistence.orm import (
-    DemoExecutionRecord,
     ForwardSignalRecord,
     ForwardValidationSessionRecord,
 )
 
 REVISION_0022 = "20260928_0022"
 REVISION_0023 = "20260929_0023"
+REVISION_0024 = "20260929_0024"
 
 
 def _config(database_path: Path) -> Config:
@@ -61,27 +62,49 @@ def _insert_legacy_execution(database: Database) -> str:
         )
         session.add(signal)
         session.flush()
-        record = DemoExecutionRecord(
-            forward_signal_id=signal.id,
-            forward_session_id=forward_session.id,
-            intelligence_candidate_id="candidate-migration-legacy",
-            pair_zone_event_id="pz-migration-legacy",
-            setup_type="PAIR_ZONE_REJECTION",
-            setup_event_id="pair-event-migration-legacy",
-            symbol="XAUUSDm",
-            direction="BUY",
-            execution_mode="DEMO",
-            status="REJECTED",
-            rejection_reason="TEST_LEGACY_ROW",
-            gate_reasons_json=["TEST_LEGACY_ROW"],
-            planned_entry=2000.2,
-            stop_loss=1990.0,
-            take_profit=2020.6,
-            request_json={},
+        record_id = str(uuid4())
+        created_at = now.replace(tzinfo=None)
+        session.execute(
+            text(
+                """
+                INSERT INTO demo_execution_records (
+                    id, forward_signal_id, forward_session_id,
+                    intelligence_candidate_id, pair_zone_event_id, setup_type,
+                    setup_event_id, symbol, direction, execution_mode, status,
+                    rejection_reason, gate_reasons_json, planned_entry,
+                    stop_loss, take_profit, request_json, created_at, updated_at
+                ) VALUES (
+                    :id, :forward_signal_id, :forward_session_id,
+                    :intelligence_candidate_id, :pair_zone_event_id, :setup_type,
+                    :setup_event_id, :symbol, :direction, :execution_mode, :status,
+                    :rejection_reason, :gate_reasons_json, :planned_entry,
+                    :stop_loss, :take_profit, :request_json, :created_at, :updated_at
+                )
+                """
+            ),
+            {
+                "id": record_id,
+                "forward_signal_id": signal.id,
+                "forward_session_id": forward_session.id,
+                "intelligence_candidate_id": "candidate-migration-legacy",
+                "pair_zone_event_id": "pz-migration-legacy",
+                "setup_type": "PAIR_ZONE_REJECTION",
+                "setup_event_id": "pair-event-migration-legacy",
+                "symbol": "XAUUSDm",
+                "direction": "BUY",
+                "execution_mode": "DEMO",
+                "status": "REJECTED",
+                "rejection_reason": "TEST_LEGACY_ROW",
+                "gate_reasons_json": '["TEST_LEGACY_ROW"]',
+                "planned_entry": 2000.2,
+                "stop_loss": 1990.0,
+                "take_profit": 2020.6,
+                "request_json": "{}",
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
         )
-        session.add(record)
-        session.flush()
-        return record.id
+        return record_id
 
 
 def _column(database: Database, name: str) -> dict:
@@ -109,9 +132,14 @@ def test_0023_makes_pair_zone_identity_nullable_and_preserves_legacy_rows(tmp_pa
             for index in inspect(migrated.engine).get_indexes("demo_execution_records")
         }
         assert "ix_demo_execution_records_pair_zone_event_id" in indexes
-        with migrated.session() as session:
-            record = session.get(DemoExecutionRecord, record_id)
-            assert record is not None
+        with migrated.engine.connect() as connection:
+            record = connection.execute(
+                text(
+                    "SELECT pair_zone_event_id, rejection_reason "
+                    "FROM demo_execution_records WHERE id = :id"
+                ),
+                {"id": record_id},
+            ).one()
             assert record.pair_zone_event_id == "pz-migration-legacy"
             assert record.rejection_reason == "TEST_LEGACY_ROW"
     finally:
@@ -121,8 +149,11 @@ def test_0023_makes_pair_zone_identity_nullable_and_preserves_legacy_rows(tmp_pa
     rolled_back = Database(f"sqlite:///{database_path.as_posix()}")
     try:
         assert _column(rolled_back, "pair_zone_event_id")["nullable"] is False
-        with rolled_back.session() as session:
-            assert session.get(DemoExecutionRecord, record_id) is not None
+        with rolled_back.engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT 1 FROM demo_execution_records WHERE id = :id"),
+                {"id": record_id},
+            ).one()
     finally:
         rolled_back.dispose()
 
@@ -169,23 +200,43 @@ def test_0023_downgrade_refuses_null_momentum_records(tmp_path) -> None:
             )
             session.add(momentum_signal)
             session.flush()
-            row = DemoExecutionRecord(
-                forward_signal_id=momentum_signal.id,
-                forward_session_id=signal.session_id,
-                intelligence_candidate_id="momentum-migration-candidate",
-                pair_zone_event_id=None,
-                setup_type="MOMENTUM_BREAKOUT_V1",
-                setup_event_id="momentum-migration-event",
-                symbol="XAUUSDm",
-                direction="SELL",
-                execution_mode="DEMO",
-                status="REJECTED",
-                rejection_reason="TEST_MOMENTUM_ROW",
-                gate_reasons_json=["TEST_MOMENTUM_ROW"],
-                request_json={},
+            session.execute(
+                text(
+                    """
+                    INSERT INTO demo_execution_records (
+                        id, forward_signal_id, forward_session_id,
+                        intelligence_candidate_id, pair_zone_event_id, setup_type,
+                        setup_event_id, symbol, direction, execution_mode, status,
+                        rejection_reason, gate_reasons_json, request_json,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :forward_signal_id, :forward_session_id,
+                        :intelligence_candidate_id, :pair_zone_event_id, :setup_type,
+                        :setup_event_id, :symbol, :direction, :execution_mode, :status,
+                        :rejection_reason, :gate_reasons_json, :request_json,
+                        :created_at, :updated_at
+                    )
+                    """
+                ),
+                {
+                    "id": str(uuid4()),
+                    "forward_signal_id": momentum_signal.id,
+                    "forward_session_id": signal.session_id,
+                    "intelligence_candidate_id": "momentum-migration-candidate",
+                    "pair_zone_event_id": None,
+                    "setup_type": "MOMENTUM_BREAKOUT_V1",
+                    "setup_event_id": "momentum-migration-event",
+                    "symbol": "XAUUSDm",
+                    "direction": "SELL",
+                    "execution_mode": "DEMO",
+                    "status": "REJECTED",
+                    "rejection_reason": "TEST_MOMENTUM_ROW",
+                    "gate_reasons_json": '["TEST_MOMENTUM_ROW"]',
+                    "request_json": "{}",
+                    "created_at": datetime.now(UTC).replace(tzinfo=None),
+                    "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                },
             )
-            session.add(row)
-            session.flush()
     finally:
         migrated.dispose()
 
@@ -197,3 +248,63 @@ def test_0023_downgrade_refuses_null_momentum_records(tmp_path) -> None:
         assert _column(still_current, "pair_zone_event_id")["nullable"] is True
     finally:
         still_current.dispose()
+
+
+def test_0024_adds_nullable_preflight_evidence_and_preserves_rows(tmp_path) -> None:
+    database_path = tmp_path / "demo-execution-preflight.db"
+    config = _config(database_path)
+    command.upgrade(config, REVISION_0023)
+    database = Database(f"sqlite:///{database_path.as_posix()}")
+    record_id = _insert_legacy_execution(database)
+    database.dispose()
+
+    command.upgrade(config, REVISION_0024)
+    migrated = Database(f"sqlite:///{database_path.as_posix()}")
+    try:
+        evidence_columns = {
+            "executable_price",
+            "deviation_price",
+            "deviation_points",
+            "max_deviation_points",
+            "symbol_point",
+            "broker_bid",
+            "broker_ask",
+            "symbol_digits",
+            "broker_tick_time",
+            "preflight_timestamp",
+            "signal_created_at",
+        }
+        columns = {
+            column["name"]: column
+            for column in inspect(migrated.engine).get_columns("demo_execution_records")
+        }
+        assert evidence_columns <= columns.keys()
+        assert all(columns[name]["nullable"] for name in evidence_columns)
+        with migrated.engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT pair_zone_event_id, rejection_reason "
+                    "FROM demo_execution_records WHERE id = :id"
+                ),
+                {"id": record_id},
+            ).one()
+            assert row.pair_zone_event_id == "pz-migration-legacy"
+            assert row.rejection_reason == "TEST_LEGACY_ROW"
+    finally:
+        migrated.dispose()
+
+    command.downgrade(config, REVISION_0023)
+    rolled_back = Database(f"sqlite:///{database_path.as_posix()}")
+    try:
+        columns = {
+            column["name"]
+            for column in inspect(rolled_back.engine).get_columns("demo_execution_records")
+        }
+        assert not evidence_columns & columns
+        with rolled_back.engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT 1 FROM demo_execution_records WHERE id = :id"),
+                {"id": record_id},
+            ).one()
+    finally:
+        rolled_back.dispose()

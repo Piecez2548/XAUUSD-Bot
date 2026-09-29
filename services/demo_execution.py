@@ -81,8 +81,11 @@ def set_demo_execution_enabled(
 class DemoExecutionGateError(ValueError):
     """A required Demo execution safety invariant could not be proven."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self, reason: str, *, preflight_evidence: dict[str, Any] | None = None
+    ) -> None:
         self.reason = reason
+        self.preflight_evidence = preflight_evidence
         super().__init__(reason)
 
 
@@ -127,17 +130,24 @@ class DemoExecutionService:
             if existing is not None:
                 return existing
             symbol = str(getattr(intelligence_record, "symbol", snapshot.symbol.name))
+            preflight_evidence: dict[str, Any] | None = None
             try:
                 self._validate_provenance(signal, intelligence_record)
                 current = await self.gateway.call(
-                    lambda api: self._read_current_state(api, symbol, snapshot)
+                    lambda api: self._read_current_state(api, symbol, snapshot, signal)
                 )
                 current_snapshot, current_risk, symbol_info = current
-                request, risk_percent = self._build_request(
+                request, risk_percent, preflight_evidence = self._build_request(
                     signal, decision, current_snapshot, current_risk, symbol_info, symbol
                 )
             except DemoExecutionGateError as exc:
-                record = self._persist_rejection(signal, intelligence_record, symbol, exc.reason)
+                record = self._persist_rejection(
+                    signal,
+                    intelligence_record,
+                    symbol,
+                    exc.reason,
+                    preflight_evidence=exc.preflight_evidence,
+                )
                 await self._notify_result(record)
                 return record
             except Exception as exc:
@@ -147,6 +157,7 @@ class DemoExecutionService:
                     intelligence_record,
                     symbol,
                     f"PREFLIGHT_ERROR:{type(exc).__name__}",
+                    preflight_evidence=preflight_evidence,
                 )
                 await self._notify_result(record)
                 return record
@@ -158,6 +169,7 @@ class DemoExecutionService:
                 current_snapshot,
                 request,
                 risk_percent,
+                preflight_evidence,
             )
             if pending is None:
                 return self._existing(signal.id)
@@ -192,7 +204,11 @@ class DemoExecutionService:
             self.logger.exception("Demo execution notification failed")
 
     def _read_current_state(
-        self, api: Any, symbol: str, snapshot: MarketSnapshot
+        self,
+        api: Any,
+        symbol: str,
+        snapshot: MarketSnapshot,
+        signal: ForwardSignalRecord,
     ) -> tuple[MarketSnapshot, Any, Any]:
         symbol_info = api.symbol_info(symbol)
         if symbol_info is None:
@@ -202,14 +218,27 @@ class DemoExecutionService:
         current_account = read_account_state(api)
         current_positions = read_open_positions(api, symbol)
         now = datetime.now(UTC)
+        pricing_snapshot = snapshot.model_copy(
+            update={"symbol": current_symbol, "tick": current_tick, "generated_at": now}
+        )
+        try:
+            preflight_evidence = self._preflight_evidence(signal, pricing_snapshot)
+        except (TypeError, ValueError, ZeroDivisionError):
+            preflight_evidence = None
         if current_account.trade_mode != 0 or current_account.trade_mode_name != "demo":
-            raise DemoExecutionGateError("ACCOUNT_IS_NOT_DEMO")
+            raise DemoExecutionGateError(
+                "ACCOUNT_IS_NOT_DEMO", preflight_evidence=preflight_evidence
+            )
         age = (now - current_tick.timestamp).total_seconds()
         if age < 0 or age > self.settings.demo_execution_max_tick_age_seconds:
-            raise DemoExecutionGateError("MARKET_DATA_STALE")
+            raise DemoExecutionGateError(
+                "MARKET_DATA_STALE", preflight_evidence=preflight_evidence
+            )
         latest_m5 = snapshot.candles.get(Timeframe.M5, ())
         if not latest_m5 or latest_m5[-1].timestamp > now:
-            raise DemoExecutionGateError("CANDLE_STATE_INVALID")
+            raise DemoExecutionGateError(
+                "CANDLE_STATE_INVALID", preflight_evidence=preflight_evidence
+            )
         current_snapshot = snapshot.model_copy(
             update={
                 "account": current_account,
@@ -234,62 +263,94 @@ class DemoExecutionService:
         risk: Any,
         symbol_info: Any,
         symbol: str,
-    ) -> tuple[dict[str, Any], float]:
+    ) -> tuple[dict[str, Any], float, dict[str, Any]]:
         direction = str(signal.decision).upper()
+        preflight_evidence = self._preflight_evidence(signal, snapshot)
         setup_identity = getattr(signal, "setup_event_id", None) or signal.zone_id
         if direction not in {"BUY", "SELL"} or setup_identity in {None, "", "unknown", "None"}:
-            raise DemoExecutionGateError("CANONICAL_SIGNAL_INVALID")
+            raise DemoExecutionGateError(
+                "CANONICAL_SIGNAL_INVALID", preflight_evidence=preflight_evidence
+            )
         if getattr(decision, "decision", None) is None or str(decision.decision.value) != direction:
-            raise DemoExecutionGateError("CANONICAL_DECISION_MISMATCH")
+            raise DemoExecutionGateError(
+                "CANONICAL_DECISION_MISMATCH", preflight_evidence=preflight_evidence
+            )
         if not all(
             value is not None
             for value in (signal.entry_price, signal.stop_loss, signal.take_profit)
         ):
-            raise DemoExecutionGateError("TRADE_LEVEL_MISSING")
+            raise DemoExecutionGateError(
+                "TRADE_LEVEL_MISSING", preflight_evidence=preflight_evidence
+            )
         if snapshot.symbol.name != symbol:
-            raise DemoExecutionGateError("SYMBOL_MISMATCH")
+            raise DemoExecutionGateError(
+                "SYMBOL_MISMATCH", preflight_evidence=preflight_evidence
+            )
         if snapshot.symbol.trade_mode_name not in {"full", "long_only", "short_only"}:
-            raise DemoExecutionGateError("SYMBOL_TRADE_MODE_UNAVAILABLE")
+            raise DemoExecutionGateError(
+                "SYMBOL_TRADE_MODE_UNAVAILABLE", preflight_evidence=preflight_evidence
+            )
         if direction == "BUY" and snapshot.symbol.trade_mode_name == "short_only":
-            raise DemoExecutionGateError("BUY_NOT_ALLOWED_BY_SYMBOL")
+            raise DemoExecutionGateError(
+                "BUY_NOT_ALLOWED_BY_SYMBOL", preflight_evidence=preflight_evidence
+            )
         if direction == "SELL" and snapshot.symbol.trade_mode_name == "long_only":
-            raise DemoExecutionGateError("SELL_NOT_ALLOWED_BY_SYMBOL")
+            raise DemoExecutionGateError(
+                "SELL_NOT_ALLOWED_BY_SYMBOL", preflight_evidence=preflight_evidence
+            )
         entry = snapshot.tick.ask if direction == "BUY" else snapshot.tick.bid
         point = snapshot.symbol.point
         if (
             abs(entry - float(signal.entry_price)) / point
             > self.settings.demo_execution_max_entry_deviation_points
         ):
-            raise DemoExecutionGateError("ENTRY_DEVIATION_EXCEEDED")
+            raise DemoExecutionGateError(
+                "ENTRY_DEVIATION_EXCEEDED", preflight_evidence=preflight_evidence
+            )
         stop = float(signal.stop_loss)
         target = float(signal.take_profit)
         if direction == "BUY" and not (stop < entry < target):
-            raise DemoExecutionGateError("SL_TP_INVALID_FOR_BUY")
+            raise DemoExecutionGateError(
+                "SL_TP_INVALID_FOR_BUY", preflight_evidence=preflight_evidence
+            )
         if direction == "SELL" and not (target < entry < stop):
-            raise DemoExecutionGateError("SL_TP_INVALID_FOR_SELL")
+            raise DemoExecutionGateError(
+                "SL_TP_INVALID_FOR_SELL", preflight_evidence=preflight_evidence
+            )
         if abs(entry - stop) < snapshot.symbol.trade_tick_size:
-            raise DemoExecutionGateError("SL_DISTANCE_INVALID")
+            raise DemoExecutionGateError(
+                "SL_DISTANCE_INVALID", preflight_evidence=preflight_evidence
+            )
         if abs(target - entry) < snapshot.symbol.trade_tick_size:
-            raise DemoExecutionGateError("TP_DISTANCE_INVALID")
+            raise DemoExecutionGateError(
+                "TP_DISTANCE_INVALID", preflight_evidence=preflight_evidence
+            )
         gate, volume = ShadowRiskGate(
             max_trade_risk_percent=self.settings.max_trade_risk_percent,
             max_aggregate_risk_percent=self.settings.max_aggregate_risk_percent,
         ).evaluate(snapshot, risk, entry=entry, stop=stop)
         if not gate.approved or volume is None:
             raise DemoExecutionGateError(
-                gate.reason_codes[0] if gate.reason_codes else "RISK_REJECTED"
+                gate.reason_codes[0] if gate.reason_codes else "RISK_REJECTED",
+                preflight_evidence=preflight_evidence,
             )
         api_constants = getattr(self.gateway, "api", None)
         if api_constants is None:
-            raise DemoExecutionGateError("MT5_API_UNAVAILABLE")
+            raise DemoExecutionGateError(
+                "MT5_API_UNAVAILABLE", preflight_evidence=preflight_evidence
+            )
         filling = _filling_mode(symbol_info, api_constants)
         if filling is None:
-            raise DemoExecutionGateError("FILLING_MODE_UNKNOWN")
+            raise DemoExecutionGateError(
+                "FILLING_MODE_UNKNOWN", preflight_evidence=preflight_evidence
+            )
         action = getattr(api_constants, "TRADE_ACTION_DEAL", None)
         order_type = getattr(api_constants, f"ORDER_TYPE_{direction}", None)
         order_time = getattr(api_constants, "ORDER_TIME_GTC", None)
         if None in (action, order_type, order_time):
-            raise DemoExecutionGateError("MT5_ORDER_CONSTANTS_UNAVAILABLE")
+            raise DemoExecutionGateError(
+                "MT5_ORDER_CONSTANTS_UNAVAILABLE", preflight_evidence=preflight_evidence
+            )
         comment = _order_comment(signal.signal_id)
         request = {
             "action": action,
@@ -305,7 +366,45 @@ class DemoExecutionService:
             "type_time": order_time,
             "type_filling": filling,
         }
-        return request, float(gate.proposed_risk_percent or 0.0)
+        return request, float(gate.proposed_risk_percent or 0.0), preflight_evidence
+
+    def _preflight_evidence(
+        self, signal: ForwardSignalRecord, snapshot: MarketSnapshot
+    ) -> dict[str, Any]:
+        direction = str(signal.decision).upper()
+        entry = (
+            snapshot.tick.ask
+            if direction == "BUY"
+            else snapshot.tick.bid
+            if direction == "SELL"
+            else None
+        )
+        planned_entry = _float_or_none(signal.entry_price)
+        point = _float_or_none(snapshot.symbol.point)
+        deviation_price = (
+            abs(float(entry) - planned_entry)
+            if entry is not None and planned_entry is not None
+            else None
+        )
+        return {
+            "executable_price": float(entry) if entry is not None else None,
+            "deviation_price": deviation_price,
+            "deviation_points": (
+                deviation_price / point
+                if deviation_price is not None and point not in {None, 0.0}
+                else None
+            ),
+            "max_deviation_points": float(
+                self.settings.demo_execution_max_entry_deviation_points
+            ),
+            "symbol_point": point,
+            "broker_tick_time": snapshot.tick.timestamp,
+            "preflight_timestamp": snapshot.generated_at,
+            "signal_created_at": getattr(signal, "created_at", None),
+            "broker_bid": float(snapshot.tick.bid),
+            "broker_ask": float(snapshot.tick.ask),
+            "symbol_digits": int(snapshot.symbol.digits),
+        }
 
     @staticmethod
     def _validate_provenance(signal: ForwardSignalRecord, intelligence_record: Any) -> None:
@@ -356,6 +455,8 @@ class DemoExecutionService:
         intelligence_record: Any,
         symbol: str,
         reason: str,
+        *,
+        preflight_evidence: dict[str, Any] | None = None,
     ) -> DemoExecutionRecord:
         existing = self._existing(signal.id)
         if existing is not None:
@@ -378,6 +479,7 @@ class DemoExecutionService:
                 request={},
                 volume=None,
                 risk_percent=None,
+                preflight_evidence=preflight_evidence,
             )
         except IntegrityError as exc:
             existing = self._existing(signal.id)
@@ -399,6 +501,7 @@ class DemoExecutionService:
         snapshot: MarketSnapshot,
         request: dict[str, Any],
         risk_percent: float,
+        preflight_evidence: dict[str, Any],
     ) -> DemoExecutionRecord | None:
         try:
             return self._insert_record(
@@ -416,6 +519,7 @@ class DemoExecutionService:
                 request=request,
                 volume=float(request["volume"]),
                 risk_percent=risk_percent,
+                preflight_evidence=preflight_evidence,
             )
         except IntegrityError as exc:
             existing = self._existing(signal.id)
@@ -445,6 +549,7 @@ class DemoExecutionService:
         request: dict[str, Any],
         volume: float | None,
         risk_percent: float | None,
+        preflight_evidence: dict[str, Any] | None,
     ) -> DemoExecutionRecord:
         with self.database.session() as session:
             setup_type = getattr(signal, "setup_type", None) or "PAIR_ZONE_REJECTION"
@@ -469,6 +574,19 @@ class DemoExecutionService:
                 take_profit=_float_or_none(signal.take_profit),
                 volume=volume,
                 risk_percent=risk_percent,
+                executable_price=_evidence_value(preflight_evidence, "executable_price"),
+                deviation_price=_evidence_value(preflight_evidence, "deviation_price"),
+                deviation_points=_evidence_value(preflight_evidence, "deviation_points"),
+                max_deviation_points=_evidence_value(
+                    preflight_evidence, "max_deviation_points"
+                ),
+                symbol_point=_evidence_value(preflight_evidence, "symbol_point"),
+                broker_tick_time=_evidence_value(preflight_evidence, "broker_tick_time"),
+                preflight_timestamp=_evidence_value(preflight_evidence, "preflight_timestamp"),
+                signal_created_at=_evidence_value(preflight_evidence, "signal_created_at"),
+                broker_bid=_evidence_value(preflight_evidence, "broker_bid"),
+                broker_ask=_evidence_value(preflight_evidence, "broker_ask"),
+                symbol_digits=_evidence_value(preflight_evidence, "symbol_digits"),
                 request_json=request,
             )
             session.add(row)
@@ -531,6 +649,10 @@ class DemoExecutionService:
 
 def _order_comment(signal_id: str) -> str:
     return "XAUDEMO-" + sha256(signal_id.encode("utf-8")).hexdigest()[:20]
+
+
+def _evidence_value(evidence: dict[str, Any] | None, key: str) -> Any:
+    return evidence.get(key) if evidence is not None else None
 
 
 def _filling_mode(symbol_info: Any, api: Any) -> int | None:

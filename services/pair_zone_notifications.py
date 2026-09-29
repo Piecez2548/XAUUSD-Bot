@@ -247,6 +247,25 @@ class PairZoneNotificationService:
             "reason": record.rejection_reason,
             "real_money": "DISABLED",
         }
+        if record.rejection_reason == "ENTRY_DEVIATION_EXCEEDED":
+            point = getattr(record, "symbol_point", None)
+            max_points = getattr(record, "max_deviation_points", None)
+            diagnostics["preflight"] = {
+                "planned_entry": getattr(record, "planned_entry", None),
+                "executable_price": getattr(record, "executable_price", None),
+                "deviation_price": getattr(record, "deviation_price", None),
+                "deviation_points": getattr(record, "deviation_points", None),
+                "max_deviation_points": max_points,
+                "max_deviation_price": (
+                    float(max_points) * float(point)
+                    if max_points is not None and point is not None
+                    else None
+                ),
+                "broker_bid": getattr(record, "broker_bid", None),
+                "broker_ask": getattr(record, "broker_ask", None),
+                "symbol_point": point,
+                "symbol_digits": getattr(record, "symbol_digits", None),
+            }
         await self._publish(
             event_type,
             f"{record.id}:{record.status}",

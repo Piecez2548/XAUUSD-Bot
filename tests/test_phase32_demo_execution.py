@@ -267,12 +267,18 @@ def _graph(
         return signal, intelligence
 
 
-def _service(database, api: FakeApi, *, enabled: bool = True) -> DemoExecutionService:
+def _service(
+    database,
+    api: FakeApi,
+    *,
+    enabled: bool = True,
+    max_deviation_points: float = 50,
+) -> DemoExecutionService:
     settings = Settings(
         database_url="sqlite:///:memory:",
         demo_execution_enabled=enabled,
         demo_execution_max_tick_age_seconds=10,
-        demo_execution_max_entry_deviation_points=50,
+        demo_execution_max_entry_deviation_points=max_deviation_points,
     )
     return DemoExecutionService(
         settings, database, FakeGateway(api), logger=__import__("logging").getLogger("demo-test")
@@ -305,6 +311,85 @@ async def test_successful_demo_submission_is_persisted_once(tmp_path) -> None:
     assert api.order_calls == 1
     assert result.execution_mode == "DEMO"
     assert result.broker_position_ticket == 303
+    assert result.executable_price == 2000.2
+    assert result.deviation_price == 0.0
+    assert result.deviation_points == 0.0
+    assert result.max_deviation_points == 50.0
+    assert result.symbol_point == 0.01
+    assert result.broker_bid == 2000.0
+    assert result.broker_ask == 2000.2
+    assert result.symbol_digits == 2
+    assert result.broker_tick_time is not None
+    assert result.preflight_timestamp is not None
+    assert result.signal_created_at is not None
+    database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sell_preflight_evidence_uses_broker_bid(tmp_path) -> None:
+    database = _database(tmp_path)
+    api = FakeApi()
+    signal, intelligence = _graph(database, direction="SELL", stop=2010.0, target=1980.0)
+    result = await _service(database, api).execute(
+        signal=signal,
+        decision=_decision("SELL"),
+        snapshot=_snapshot(api),
+        intelligence_record=intelligence,
+    )
+    assert result is not None and result.status == "ACKNOWLEDGED"
+    assert result.executable_price == 2000.0
+    assert result.deviation_price == pytest.approx(0.2)
+    assert result.deviation_points == pytest.approx(20.0)
+    assert result.broker_bid == 2000.0
+    assert result.broker_ask == 2000.2
+    assert api.order_calls == 1
+    database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_entry_deviation_evidence_is_persisted_and_blocks_order(tmp_path) -> None:
+    database = _database(tmp_path)
+    api = FakeApi()
+    api.symbol.ask = 2000.4
+    signal, intelligence = _graph(database)
+    service = _service(database, api, max_deviation_points=10)
+    result = await service.execute(
+        signal=signal,
+        decision=_decision(),
+        snapshot=_snapshot(api),
+        intelligence_record=intelligence,
+    )
+    assert result is not None and result.status == "REJECTED"
+    assert result.rejection_reason == "ENTRY_DEVIATION_EXCEEDED"
+    assert result.planned_entry == 2000.2
+    assert result.executable_price == 2000.4
+    assert result.deviation_price == pytest.approx(0.2)
+    assert result.deviation_points == pytest.approx(20.0)
+    assert result.max_deviation_points == 10.0
+    assert result.symbol_point == 0.01
+    assert result.broker_bid == 2000.0
+    assert result.broker_ask == 2000.4
+    assert result.symbol_digits == 2
+    assert result.request_json == {}
+    assert api.order_calls == 0
+    database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_entry_deviation_boundary_is_allowed_when_equal(tmp_path) -> None:
+    database = _database(tmp_path)
+    api = FakeApi()
+    signal, intelligence = _graph(database)
+    service = _service(database, api, max_deviation_points=0)
+    result = await service.execute(
+        signal=signal,
+        decision=_decision(),
+        snapshot=_snapshot(api),
+        intelligence_record=intelligence,
+    )
+    assert result is not None and result.status == "ACKNOWLEDGED"
+    assert result.deviation_points == 0.0
+    assert api.order_calls == 1
     database.dispose()
 
 
@@ -431,6 +516,9 @@ async def test_momentum_rejection_is_persisted_without_pair_zone_provenance(tmp_
     assert result.rejection_reason == "ACCOUNT_IS_NOT_DEMO"
     assert result.pair_zone_event_id is None
     assert result.setup_event_id == "momentum-rejection-event-test"
+    assert result.executable_price == 2000.2
+    assert result.deviation_points == pytest.approx(0.0)
+    assert result.broker_tick_time is not None
     assert api.order_calls == 0
     database.dispose()
 

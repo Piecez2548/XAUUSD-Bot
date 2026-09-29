@@ -172,6 +172,40 @@ async def test_notification_failure_isolated_from_processing(tmp_path) -> None:
         database.dispose()
 
 
+@pytest.mark.asyncio
+async def test_entry_deviation_notification_contains_preflight_evidence(tmp_path) -> None:
+    service, events, database = _service(tmp_path)
+    try:
+        blocked = SimpleNamespace(
+            id="demo-deviation-1", status="REJECTED", symbol="XAUUSDm", direction="BUY",
+            forward_signal_id="signal-deviation-1", submitted_entry=None,
+            planned_entry=4160.808, stop_loss=4147.328, take_profit=4187.768,
+            volume=None, risk_percent=None, broker_position_ticket=None,
+            broker_deal_ticket=None, rejection_reason="ENTRY_DEVIATION_EXCEEDED",
+            submitted_at=datetime(2026, 1, 1, tzinfo=UTC), updated_at=None,
+            executable_price=4161.048, deviation_price=0.240,
+            deviation_points=240.0, max_deviation_points=20.0,
+            symbol_point=0.001, broker_bid=4160.808, broker_ask=4161.048,
+            symbol_digits=3,
+        )
+        await service.demo_execution_result(blocked)
+        diagnostics = events[0].payload.diagnostics
+        assert diagnostics["preflight"] == {
+            "planned_entry": 4160.808,
+            "executable_price": 4161.048,
+            "deviation_price": 0.240,
+            "deviation_points": 240.0,
+            "max_deviation_points": 20.0,
+            "max_deviation_price": 0.02,
+            "broker_bid": 4160.808,
+            "broker_ask": 4161.048,
+            "symbol_point": 0.001,
+            "symbol_digits": 3,
+        }
+    finally:
+        database.dispose()
+
+
 def test_pair_zone_events_are_not_shadow_or_execution_authority() -> None:
     assert EventType.PAIR_ZONE_ACTIVE not in {
         EventType.TRADE_REQUESTED,
